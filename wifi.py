@@ -397,6 +397,16 @@ class AdapterInfo:
     can_ibss: bool = False
     source: str = "iw"  # P6.6: "iw" | "iwconfig"
 
+    # P9.3: Kernel-gemeldete Interface-Kombinationen
+    # (aus "valid interface combinations" in `iw phy <phy> info`)
+    supports_multi_vif: bool = False
+    max_total_interfaces: int = 1
+    max_simultaneous_channels: int = 1
+    interface_combinations: list = field(default_factory=list)
+
+    # P9.3b: Active Monitor Mode (Kernel-gemeldet)
+    supports_active_monitor: bool = False
+
     def fingerprint(self) -> str:
         """P6.2: Stabile Identitaet = Treibername (NICHT iface).
         Gleiche Modelle kollidieren — dann MAC als Tie-Breaker."""
@@ -471,7 +481,10 @@ class AdapterCapabilities:
             return None
         if 2412 <= mhz <= 2484:
             return 14 if mhz == 2484 else (mhz - 2407) // 5
-        if 5000 <= mhz <= 5900:
+        # P8-Fix: 5-GHz-Kanaele beginnen bei 5180 MHz (Kanal 36).
+        # Der 5000-5179-Bereich liefert (mhz-5000)//5 == 0..35 --
+        # Kanal 0 existiert nicht, daher erst ab 5180.
+        if 5180 <= mhz <= 5900:
             return (mhz - 5000) // 5
         return None
 
@@ -565,6 +578,99 @@ class AdapterCapabilities:
             if m:
                 modes.add(m.group("mode").upper())
         return modes
+
+    @staticmethod
+    def _parse_interface_combinations(phy_text: str) -> dict:
+        """P9.3: Parst "interface combinations" aus `iw phy <phy> info`.
+
+        Liefert immer ein dict mit stabilen Keys:
+          supported               : bool
+          combinations            : list[dict] (je Kombination)
+          max_total               : int (max. gleichzeitige Interfaces)
+          max_channels            : int (max. gleichzeitige Kanaele)
+          max_interfaces_by_type  : dict[str, int]
+        """
+        result = {
+            "supported": False,
+            "combinations": [],
+            "max_total": 1,
+            "max_channels": 1,
+            "max_interfaces_by_type": {},
+        }
+        if not isinstance(phy_text, str) or not phy_text:
+            return result
+
+        if "interface combinations are not supported" in phy_text:
+            return result
+
+        lines = phy_text.splitlines()
+        header_idx = None
+        for idx, ln in enumerate(lines):
+            if "valid interface combinations:" in ln:
+                header_idx = idx
+                break
+        if header_idx is None:
+            return result
+
+        result["supported"] = True
+
+        entries = []
+        cur = None
+        for ln in lines[header_idx + 1:]:
+            stripped = ln.strip()
+            if not stripped:
+                if cur:
+                    entries.append(cur)
+                    cur = None
+                continue
+            if stripped.startswith("*"):
+                if cur:
+                    entries.append(cur)
+                cur = [stripped[1:].strip()]
+            elif cur is not None and (ln.startswith(" ") or ln.startswith("\t")):
+                cur.append(stripped)
+            else:
+                if cur:
+                    entries.append(cur)
+                    cur = None
+                break
+        if cur:
+            entries.append(cur)
+
+        import re as _re
+        total_max = 1
+        channels_max = 1
+        type_map: dict[str, int] = {}
+        parsed = []
+        for parts in entries:
+            text = " ".join(parts)
+            combo = {
+                "raw": text,
+                "interfaces": {},
+                "total": 1,
+                "channels": 1,
+            }
+            for m in _re.finditer(r"#\{\s*([^}]+?)\s*\}\s*<=\s*(\d+)", text):
+                types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+                n = int(m.group(2))
+                for t in types:
+                    combo["interfaces"][t] = n
+                    type_map[t] = max(type_map.get(t, 0), n)
+            m_total = _re.search(r"total\s*<=\s*(\d+)", text)
+            if m_total:
+                combo["total"] = int(m_total.group(1))
+            m_ch = _re.search(r"#channels\s*<=\s*(\d+)", text)
+            if m_ch:
+                combo["channels"] = int(m_ch.group(1))
+            total_max = max(total_max, combo["total"])
+            channels_max = max(channels_max, combo["channels"])
+            parsed.append(combo)
+
+        result["combinations"] = parsed
+        result["max_total"] = total_max
+        result["max_channels"] = channels_max
+        result["max_interfaces_by_type"] = type_map
+        return result
 
     @classmethod
     def detect(cls) -> list:
@@ -688,9 +794,31 @@ if _os.geteuid() == 0 and _os.environ.get("SUDO_USER"):
         if _os.path.isdir(_local_bin) and _local_bin not in _os.environ.get("PATH", ""):
             _os.environ["PATH"] = _local_bin + ":" + _os.environ.get("PATH", "")
 
-print("\n" + "=" * 60)
-print("Lade Module...")
-print("=" * 60)
+# 7e-5a/5b: --quiet erkennen, aber pytest-eigene Flags ignorieren.
+# Hintergrund: `pytest tests/ -q` setzt "-q" in sys.argv[1]. Ohne
+# Guard wuerden Tests mit CLI-Ausgabe-Pruefung alle Status-Prints
+# unterdrueckt sehen (5 rote Tests in 7e-5b).
+_QUIET_CLI = (
+    "pytest" not in _sys.modules
+    and any(a in ("-q", "--quiet") for a in _sys.argv)
+)
+
+if _QUIET_CLI:
+    # 7e-5d: Logging global stumm (DebugManager loggt beim Init
+    # eine INFO-Zeile, BEVOR main() Log-Level setzt).
+    logging.disable(logging.INFO)
+
+
+def _banner(*args, **kwargs):
+    """Startup-Banner: nur wenn nicht --quiet/-q (7e-5a)."""
+    if not _QUIET_CLI:
+        print(*args, **kwargs)
+
+_say = _banner  # 7e-5b: quiet-aware CLI-Status-Print (stumm bei --quiet)
+
+_banner("\n" + "=" * 60)
+_banner("Lade Module...")
+_banner("=" * 60)
 
 SCAPY_VERFÜGBAR = False
 NUMPY_VERFÜGBAR = False
@@ -717,7 +845,7 @@ try:
 
     _SCAPY_BASE_OK = True
 except ImportError as e:
-    print(f"⚠️  scapy.all Import fehlgeschlagen: {e}")
+    _banner(f"⚠️  scapy.all Import fehlgeschlagen: {e}")
 
 try:
     from scapy.layers.dot11 import (
@@ -732,7 +860,7 @@ try:
 
     _SCAPY_DOT11_OK = True
 except ImportError as e:
-    print(f"⚠️  scapy.layers.dot11 Import fehlgeschlagen: {e}")
+    _banner(f"⚠️  scapy.layers.dot11 Import fehlgeschlagen: {e}")
 
 try:
     from scapy.layers.dot11 import (
@@ -743,7 +871,7 @@ try:
     )
 
     _SCAPY_DOT11FCS_OK = True
-    print("✓ Scapy Dot11FCS-Support geladen")
+    _banner("✓ Scapy Dot11FCS-Support geladen")
 except ImportError:
     Dot11FCS = None
     Dot11FCSBeacon = None
@@ -761,32 +889,32 @@ except ImportError:
 
         _SCAPY_EAPOL_OK = True
     except ImportError as e:
-        print(f"⚠️  EAPOL Import fehlgeschlagen: {e}")
+        _banner(f"⚠️  EAPOL Import fehlgeschlagen: {e}")
 
 try:
     from scapy.layers.l2 import ARP, Ether
 
     _SCAPY_L2_OK = True
 except ImportError as e:
-    print(f"⚠️  scapy.layers.l2 Import fehlgeschlagen: {e}")
+    _banner(f"⚠️  scapy.layers.l2 Import fehlgeschlagen: {e}")
 
 SCAPY_VERFÜGBAR = (
     _SCAPY_BASE_OK and _SCAPY_DOT11_OK and _SCAPY_EAPOL_OK and _SCAPY_L2_OK
 )
 
 if SCAPY_VERFÜGBAR:
-    print("✓ Scapy imported")
+    _banner("✓ Scapy imported")
 else:
-    print("⚠️  Scapy nur teilweise verfügbar.")
+    _banner("⚠️  Scapy nur teilweise verfügbar.")
 
 # ─── NumPy ────────────────────────────────────────────────────────────
 try:
     import numpy as np
 
     NUMPY_VERFÜGBAR = True
-    print("✓ NumPy imported")
+    _banner("✓ NumPy imported")
 except ImportError:
-    print("⚠️  NumPy not available")
+    _banner("⚠️  NumPy not available")
 
 # ─── Matplotlib ───────────────────────────────────────────────────────
 try:
@@ -799,18 +927,18 @@ try:
     from matplotlib.figure import Figure
 
     MATPLOTLIB_VERFÜGBAR = True
-    print("✓ Matplotlib imported")
+    _banner("✓ Matplotlib imported")
 except ImportError:
-    print("⚠️  Matplotlib not available")
+    _banner("⚠️  Matplotlib not available")
 
 # ─── Netifaces ────────────────────────────────────────────────────────
 try:
     import netifaces
 
     NETIFACES_AVAILABLE = True
-    print("✓ netifaces imported")
+    _banner("✓ netifaces imported")
 except ImportError:
-    print("⚠️  netifaces not available")
+    _banner("⚠️  netifaces not available")
 
 # ─── PySerial ─────────────────────────────────────────────────────────
 try:
@@ -818,18 +946,18 @@ try:
     import serial.tools.list_ports
 
     PYSERIAL_AVAILABLE = True
-    print("✓ pyserial imported")
+    _banner("✓ pyserial imported")
 except ImportError:
-    print("⚠️  pyserial not available")
+    _banner("⚠️  pyserial not available")
 
 # ─── SimpleKML ────────────────────────────────────────────────────────
 try:
     import simplekml
 
     KML_AVAILABLE = True
-    print("✓ simplekml imported")
+    _banner("✓ simplekml imported")
 except ImportError:
-    print("⚠️  simplekml not available")
+    _banner("⚠️  simplekml not available")
 
 # ─── GPXPy ────────────────────────────────────────────────────────────
 try:
@@ -837,36 +965,36 @@ try:
     import gpxpy.gpx
 
     GPX_AVAILABLE = True
-    print("✓ gpxpy imported")
+    _banner("✓ gpxpy imported")
 except ImportError:
-    print("⚠️  gpxpy not available")
+    _banner("⚠️  gpxpy not available")
 
 # ─── Folium ───────────────────────────────────────────────────────────
 try:
     import folium
 
     FOLIUM_AVAILABLE = True
-    print("✓ folium imported")
+    _banner("✓ folium imported")
 except ImportError:
-    print("⚠️  folium not available")
+    _banner("⚠️  folium not available")
 
 # ─── PyYAML ───────────────────────────────────────────────────────────
 try:
     import yaml
 
     YAML_AVAILABLE = True
-    print("✓ yaml imported")
+    _banner("✓ yaml imported")
 except ImportError:
-    print("⚠️  yaml not available (using JSON for config)")
+    _banner("⚠️  yaml not available (using JSON for config)")
 
 # ─── pynmea2 ──────────────────────────────────────────────────────────
 try:
     import pynmea2
 
     PYNMEA2_AVAILABLE = True
-    print("✓ pynmea2 imported")
+    _banner("✓ pynmea2 imported")
 except ImportError:
-    print("⚠️  pynmea2 not available")
+    _banner("⚠️  pynmea2 not available")
 
 # ─── requests ─────────────────────────────────────────────────────────
 try:
@@ -884,9 +1012,9 @@ MATPLOTLIB_AVAILABLE = MATPLOTLIB_VERFÜGBAR
 # ══════════════════════════════════════════════════════════════════════
 # 5. Qt-Imports
 # ══════════════════════════════════════════════════════════════════════
-print("\n" + "=" * 60)
-print("Module geladen. Starte GUI-Imports...")
-print("=" * 60)
+_banner("\n" + "=" * 60)
+_banner("Module geladen. Starte GUI-Imports...")
+_banner("=" * 60)
 
 try:
     from PyQt6.QtCore import (  # noqa: F401
@@ -1034,15 +1162,15 @@ try:
         from PyQt6.QtWebEngineWidgets import QWebEngineView
 
         WEB_AVAILABLE = True
-        print("✓ QtWebEngine imported")
+        _banner("✓ QtWebEngine imported")
     except ImportError:
         WEB_AVAILABLE = False
-        print("⚠️  QtWebEngine not available (map view disabled)")
+        _banner("⚠️  QtWebEngine not available (map view disabled)")
 
-    print("✓ Qt modules loaded successfully")
+    _banner("✓ Qt modules loaded successfully")
 except ImportError as e:
-    print(f"✗ Qt import failed: {e}")
-    print("Install with: pip install PyQt6 PyQt6-WebEngine")
+    _banner(f"✗ Qt import failed: {e}")
+    _banner("Install with: pip install PyQt6 PyQt6-WebEngine")
     sys.exit(1)
 
 # v37-R20: QButtonGroup nachgezogen (fehlte im Hauptimport)
@@ -11173,6 +11301,41 @@ class WLANNetzwerk:
     ai_risk_level: str | None = None
     anomaly_flags: list[str] = field(default_factory=list)
 
+    # ── P9.2: IE-Detailfelder aus IEEE80211IEParser ─────────────
+    # Alle Felder mit Default -> Konstruktor-Aufrufe bleiben kompatibel.
+    bss_load_station_count: int = 0
+    bss_load_utilization_pct: float = 0.0
+    bss_load_admission_capacity: int = 0
+    country_triplets: list = field(default_factory=list)
+    power_constraint_db: int = 0
+    tpc_transmit_power_dbm: int = 0
+    tpc_link_margin_db: int = 0
+    erp_protection: bool = False
+    erp_non_erp_present: bool = False
+    ht_operation_width_mhz: int = 0
+    ht_operation_secondary_offset: int = 0
+    vht_operation_width: int = 0
+    vht_center_freq_seg0: int = 0
+    vht_center_freq_seg1: int = 0
+    rm_neighbor_report: bool = False
+    rm_link_measurement: bool = False
+    mobility_domain_id: str = ""
+    ft_capable: bool = False
+    bss_transition_802_11v: bool = False
+    fils_supported: bool = False
+    sae_h2e_supported: bool = False
+    owe_transition: bool = False
+    twt_supported: bool = False
+    wmm_enabled: bool = False
+    wmm_uapsd: bool = False
+    he_supported: bool = False
+    he_bss_color: int = 0
+    he_co_hosted_bss: bool = False
+    rnr_neighbors: list = field(default_factory=list)
+    decoded_ies: dict = field(default_factory=dict)
+    mcs_indices_supported: list = field(default_factory=list)
+    max_mcs_index: int = -1
+
     def __post_init__(self):
         """Initialisiert abgeleitete Felder."""
         try:
@@ -11225,6 +11388,11 @@ class WLANNetzwerk:
 
         if self.essid_len == 0 and self.ssid:
             self.essid_len = len(self.ssid)
+        if self.decoded_ies:
+            try:
+                self._apply_decoded_ies(self.decoded_ies)
+            except (TypeError, ValueError, AttributeError):
+                pass
 
     def _ermittle_hersteller(self) -> str:
         """Ermittelt den Hersteller anhand der ersten 3 Bytes der BSSID."""
@@ -11497,6 +11665,150 @@ class WLANNetzwerk:
 
     def __hash__(self) -> int:
         return hash(self.bssid)
+    def _apply_decoded_ies(self, decoded):
+        """P9.2: Mappt decoded_ies (IEEE80211IEParser) auf WLANNetzwerk-Felder.
+
+        decoded: dict[int, dict|list] — Ausgabe von _v41_parse_ie_full().
+        Idempotent, defensiv. Bei leerem decoded kein Effekt.
+        """
+        if not isinstance(decoded, dict) or not decoded:
+            return
+        self.decoded_ies = dict(decoded)
+
+        def _first(ie_id):
+            v = decoded.get(ie_id)
+            if v is None:
+                return None
+            if isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        return item
+                return None
+            return v if isinstance(v, dict) else None
+
+        ie = _first(11)  # BSS Load
+        if ie:
+            if "station_count" in ie:
+                self.bss_load_station_count = int(ie["station_count"])
+            if "channel_utilization_pct" in ie:
+                self.bss_load_utilization_pct = float(ie["channel_utilization_pct"])
+            if "admission_capacity" in ie:
+                self.bss_load_admission_capacity = int(ie["admission_capacity"])
+
+        ie = _first(7)  # Country
+        if ie:
+            if not self.country_code and ie.get("country_code"):
+                self.country_code = str(ie["country_code"])
+            if ie.get("channel_triplets"):
+                self.country_triplets = list(ie["channel_triplets"])
+
+        ie = _first(32)  # Power Constraint
+        if ie and "power_constraint_db" in ie:
+            self.power_constraint_db = int(ie["power_constraint_db"])
+
+        ie = _first(35)  # TPC Report
+        if ie:
+            if "transmit_power_dbm" in ie:
+                self.tpc_transmit_power_dbm = int(ie["transmit_power_dbm"])
+            if "link_margin_db" in ie:
+                self.tpc_link_margin_db = int(ie["link_margin_db"])
+
+        ie = _first(42)  # ERP
+        if ie:
+            self.erp_protection = bool(ie.get("use_protection", False))
+            self.erp_non_erp_present = bool(ie.get("non_erp_present", False))
+
+        ie = _first(61)  # HT Operation
+        if ie:
+            if "channel_width_mhz" in ie:
+                self.ht_operation_width_mhz = int(ie["channel_width_mhz"])
+                if not self.channel_width_mhz:
+                    self.channel_width_mhz = self.ht_operation_width_mhz
+            if "secondary_channel_offset" in ie:
+                self.ht_operation_secondary_offset = int(ie["secondary_channel_offset"])
+
+        ie = _first(192)  # VHT Operation
+        if ie:
+            if "channel_width" in ie:
+                self.vht_operation_width = int(ie["channel_width"])
+            if "center_freq_seg0" in ie:
+                self.vht_center_freq_seg0 = int(ie["center_freq_seg0"])
+            if "center_freq_seg1" in ie:
+                self.vht_center_freq_seg1 = int(ie["center_freq_seg1"])
+
+        ie = _first(70)  # RM Enabled
+        if ie:
+            self.rm_neighbor_report = bool(ie.get("neighbor_report", False))
+            self.rm_link_measurement = bool(ie.get("link_measurement", False))
+
+        ie = _first(54)  # Mobility Domain
+        if ie:
+            if ie.get("mdid"):
+                self.mobility_domain_id = str(ie["mdid"])
+            if ie.get("ft_capability"):
+                self.ft_capable = True
+
+        ie = _first(127)  # Extended Capabilities
+        if ie:
+            if ie.get("bss_transition_19"):
+                self.bss_transition_802_11v = True
+            if ie.get("fils_68"):
+                self.fils_supported = True
+            if ie.get("sae_h2e_70"):
+                self.sae_h2e_supported = True
+            if ie.get("twt_75"):
+                self.twt_supported = True
+
+        ie = _first(255)  # Extended IE (ext_id-basiert)
+        if ie:
+            ext_id = ie.get("ext_id")
+            if ext_id == 106:
+                self.owe_transition = True
+            elif ext_id == 107:
+                self.twt_supported = True
+            elif ext_id == 108:
+                self.sae_h2e_supported = True
+            he_cap = ie.get("he_capabilities")
+            if isinstance(he_cap, dict) and he_cap.get("he_support"):
+                self.he_supported = True
+                self.he_capable = True
+            he_op = ie.get("he_operation")
+            if isinstance(he_op, dict):
+                if "bss_color" in he_op:
+                    self.he_bss_color = int(he_op["bss_color"])
+                if he_op.get("co_hosted_bss"):
+                    self.he_co_hosted_bss = True
+
+        # Vendor Specific IE 221 (kann mehrfach vorkommen: WMM, WPS, WPA1)
+        v = decoded.get(221)
+        vendors = v if isinstance(v, list) else ([v] if isinstance(v, dict) else [])
+        for ventry in vendors:
+            if not isinstance(ventry, dict):
+                continue
+            wmm = ventry.get("wmm")
+            if isinstance(wmm, dict):
+                self.wmm_enabled = True
+                self.wmm = True
+                if wmm.get("uapsd"):
+                    self.wmm_uapsd = True
+
+        ie = _first(201)  # RNR
+        if ie and ie.get("neighbors"):
+            self.rnr_neighbors = list(ie["neighbors"])
+
+        ie = _first(45)  # HT Capabilities
+        if ie:
+            if ie.get("mcs_indices_supported"):
+                self.mcs_indices_supported = list(ie["mcs_indices_supported"])
+            if "max_mcs_index" in ie:
+                self.max_mcs_index = int(ie["max_mcs_index"])
+            if ie.get("ht_40"):
+                self.ht_capable = True
+
+        ie = _first(191)  # VHT Capabilities
+        if ie and ie.get("cap_info"):
+            self.vht_capable = True
+
 
 
 @dataclass
@@ -15563,328 +15875,306 @@ class DatenbankManager:
 
 
 class HardwareScanner:
+    """v37-R15: Erkennt WLAN-, Bluetooth-, GPS- und PCI-Hardware.
+
+    Nutzt WiFiAdapterCatalog als Single Source of Truth. Ergaenzt um:
+    - PCI/PCIe-Scan (lspci -nnk)
+    - USB-Descriptor-Analyse (bcdUSB, Speed-Mismatch, Bus-Chain)
+    - Capability-Probing (Interface-Modes, DFS, VIF)
+    - Score via HardwareAdvisor.score_adapter
+    - 30s Cache
+    - DiagContext pro Interface
+    - Export nach JSON/YAML/Text
     """
-    Erkennt alle WLAN-, Bluetooth-, GPS- und USB-Hardware im System.
 
-    Arbeitet mit mehreren Fallbacks — findet Alfa-Adapter auch wenn
-    einzelne sysfs-Pfade fehlen oder Werte leer sind.
-    """
-
-    # ── Alfa-Modelle (USB-ID -> Info) ──────────────────────────────
-    ALFA_MODELS = {
-        "0bda:8812": {
-            "name": "Alfa AWUS036ACH",
-            "chipset": "RTL8812AU",
-            "bands": ["2.4 GHz", "5 GHz"],
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "max_tx_dbm": 30,
-            "note": "Standard-Modell fuer Pentesting",
-        },
-        "0bda:881a": {
-            "name": "Alfa AWUS036ACH v2",
-            "chipset": "RTL8812AU",
-            "bands": ["2.4 GHz", "5 GHz"],
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "max_tx_dbm": 30,
-        },
-        "0bda:881b": {
-            "name": "Alfa AWUS036ACH-C v2",
-            "chipset": "RTL8812AU",
-            "bands": ["2.4 GHz", "5 GHz"],
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "max_tx_dbm": 30,
-            "note": "Kompatibel mit 88XXau-Treiber",
-        },
-        "0e8d:7610": {
-            "name": "Alfa AWUS036ACHM",
-            "chipset": "MT7610U",
-            "bands": ["2.4 GHz", "5 GHz"],
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "max_tx_dbm": 20,
-            "note": "In-Kernel-Treiber (mt76)",
-        },
-        "0e8d:7612": {
-            "name": "Alfa AWUS036ACM",
-            "chipset": "MT7612U",
-            "bands": ["2.4 GHz", "5 GHz"],
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "max_tx_dbm": 20,
-        },
-        "0e8d:7961": {
-            "name": "Alfa AWUS036AXM/AXML",
-            "chipset": "MT7921AU",
-            "bands": ["2.4 GHz", "5 GHz", "6 GHz"],
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "max_tx_dbm": 20,
-            "note": "Wi-Fi 6E, aber Monitor-Bug",
-        },
-    }
-
-    OTHER_MODELS = {
-        "2357:012d": {
-            "name": "TP-Link Archer T3U Plus",
-            "chipset": "RTL8812BU",
-            "antennas": 1,
-        },
-        "0cf3:9271": {
-            "name": "TP-Link TL-WN722N v1",
-            "chipset": "AR9271",
-            "antennas": 1,
-        },
-        "148f:5370": {"name": "Panda PAU06", "chipset": "RT5372", "antennas": 1},
-    }
-
-    # ── Treiber -> Chipsatz-Mapping ────────────────────────────────
     DRIVER_CHIPSET = {
-        "88xxau": "RTL8812AU/8821AU",
-        "8812au": "RTL8812AU",
-        "rtl8812au": "RTL8812AU",
-        "8821au": "RTL8821AU",
-        "8822bu": "RTL8822BU",
-        "mt76x0u": "MT7610U",
-        "mt76x2u": "MT7612U",
-        "mt7921u": "MT7921AU",
-        "mt7925u": "MT7925AU",
-        "ath9k_htc": "AR9271",
-        "ath9k": "AR9xxx",
-        "ath10k": "QCA988x",
-        "rt2800usb": "RT2870/RT5370",
-        "rtl8187": "RTL8187",
-        "r8188eu": "RTL8188EU",
-        "rtl8xxxu": "RTL8xxxU",
-        "iwlwifi": "Intel Wireless",
-        "brcmfmac": "Broadcom",
+        "mt76x0u": ("MT7610U", "mt76"),
+        "mt76x2u": ("MT7612U", "mt76"),
+        "mt7610u": ("MT7610U", "mt76"),
+        "mt7612u": ("MT7612U", "mt76"),
+        "mt7921u": ("MT7921AU", "mt76"),
+        "mt7925u": ("MT7925AU", "mt76"),
+        "mt7601u": ("MT7601U", "mt76"),
+        "88xxau": ("RTL8812AU/8821AU", "rtl88XXau"),
+        "8812au": ("RTL8812AU", "rtl88XXau"),
+        "rtl8812au": ("RTL8812AU", "rtl88XXau"),
+        "rtl8821au": ("RTL8821AU", "rtl8821au"),
+        "8821au": ("RTL8821AU", "rtl8821au"),
+        "8822bu": ("RTL8822BU", "rtl88x2bu"),
+        "rtl88x2bu": ("RTL8812BU/8822BU", "rtl88x2bu"),
+        "rtl8814au": ("RTL8814AU", "rtl8814au"),
+        "rtl8188eu": ("RTL8188EU", "r8188eu"),
+        "r8188eu": ("RTL8188EU", "staging"),
+        "rtl8xxxu": ("RTL8xxxU", "rtl8xxxu"),
+        "rtl8187": ("RTL8187", "rtl8187"),
+        "ath9k_htc": ("AR9271", "ath9k_htc"),
+        "ath9k": ("AR9xxx", "ath9k"),
+        "ath10k": ("QCA988x", "ath10k"),
+        "ath11k": ("QCN9074/QCA6390", "ath11k"),
+        "ath12k": ("QCN9274", "ath12k"),
+        "rt2800usb": ("RT2870/RT5370", "rt2800usb"),
+        "rt73usb": ("RT73", "rt73usb"),
+        "iwlwifi": ("Intel Wireless", "iwlwifi"),
+        "iwlmvm": ("Intel Wireless", "iwlwifi"),
+        "brcmfmac": ("Broadcom FullMAC", "brcmfmac"),
+        "carl9170": ("AR9170", "carl9170"),
+        "p54usb": ("Prism54 USB", "p54usb"),
+        "zd1211rw": ("ZD1211", "zd1211rw"),
     }
 
-    def __init__(self):
-        self.logger = logging.getLogger("wlan_ultimate.HardwareScanner")
+    WLAN_PREFIXES = (
+        "wlan", "wlp", "wlx", "wlo", "wls", "wl",
+        "wifi", "ath", "ra", "mon",
+    )
 
-    # ══════════════════════════════════════════════════════════════
-    # 1. WLAN-Adapter
-    # ══════════════════════════════════════════════════════════════
-    def scan_wlan(self) -> list[dict]:
+    def __init__(self, use_cache: bool = True, cache_ttl: float = 30.0):
+        self.logger = logging.getLogger("wlan_ultimate.HardwareScanner")
+        self._cache: dict = {}
+        self._cache_ttl = cache_ttl
+        self._use_cache = use_cache
+
+    # ------------------------------------------------------------------
+    # Cache
+    # ------------------------------------------------------------------
+    def _cache_get(self, key: str):
+        if not self._use_cache:
+            return None
+        entry = self._cache.get(key)
+        if not entry:
+            return None
+        ts, val = entry
+        if time.time() - ts > self._cache_ttl:
+            return None
+        return val
+
+    def _cache_set(self, key: str, val):
+        if self._use_cache:
+            self._cache[key] = (time.time(), val)
+
+    def clear_cache(self):
+        self._cache.clear()
+
+    # ==================================================================
+    # 1. WLAN
+    # ==================================================================
+    def scan_wlan(self) -> list:
+        cached = self._cache_get("wlan")
+        if cached is not None:
+            return cached
         adapters = []
         try:
             names = self._get_wlan_iface_names()
         except (OSError, subprocess.SubprocessError) as e:
-            self.logger.debug("scan_wlan names: " + str(e))
+            self.logger.debug("scan_wlan names: %s", e)
             return adapters
-
         for iface in names:
             try:
-                info = self._analyze_adapter(iface)
-                if info:
-                    adapters.append(info)
+                with DiagContext(
+                    f"hwscan.wlan.{iface}",
+                    self.logger,
+                    reraise=False,
+                ):
+                    info = self._analyze_adapter(iface)
+                    if info:
+                        adapters.append(info)
             except (
-                OSError,
-                subprocess.SubprocessError,
-                AttributeError,
-                ValueError,
+                OSError, subprocess.SubprocessError,
+                AttributeError, ValueError,
             ) as e:
-                self.logger.debug("scan_wlan " + iface + ": " + str(e))
+                self.logger.debug("scan_wlan %s: %s", iface, e)
+        self._cache_set("wlan", adapters)
         return adapters
 
-    def _get_wlan_iface_names(self) -> list[str]:
-        names = []
+    def _get_wlan_iface_names(self) -> list:
+        names = set()
         net_dir = Path("/sys/class/net")
         if net_dir.exists():
-            for p in net_dir.iterdir():
-                if p.is_dir() and any(
-                    p.name.startswith(pre)
-                    for pre in ("wlan", "wlp", "wlx", "wlo", "wls")
-                ):
-                    names.append(p.name)
-        if not names:
             try:
-                rc, out, _ = CommandRunner.run(
-                    ["iw", "dev"], subsystem="driver", soft_fail=True, timeout=3
-                )
-                for line in out.splitlines():
-                    if "Interface" in line:
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            names.append(parts[1])
-            except (OSError, subprocess.SubprocessError):
+                for p in net_dir.iterdir():
+                    try:
+                        if not p.is_dir():
+                            continue
+                        if (p / "wireless").exists():
+                            names.add(p.name)
+                            continue
+                        if any(
+                            p.name.startswith(pre)
+                            for pre in self.WLAN_PREFIXES
+                        ):
+                            if (p / "device").exists():
+                                names.add(p.name)
+                    except OSError:
+                        continue
+            except OSError:
                 pass
-        return sorted(set(names))
-
-    def _analyze_adapter(self, iface: str) -> dict:
-        info: dict = {
-            "iface": iface,
-            "mac": "",
-            "driver": "",
-            "chipset": "",
-            "usb_id": "",
-            "is_alfa": False,
-            "alfa_model": "",
-            "usb_speed": "",
-            "usb_max_speed": "",
-            "usb_version": "",
-            "supports_monitor": False,
-            "supports_injection": False,
-            "supports_ap": False,
-            "supports_5ghz": False,
-            "supports_6ghz": False,
-            "max_tx_dbm": 0,
-            "current_tx_dbm": 0,
-            "reg_domain": "00",
-            "bands": [],
-            "antennas": 0,
-            "connector": "",
-            "gain_dbi": 0.0,
-            "note": "",
-            "problem": "",
-        }
-
-        # MAC
-        mac_path = Path("/sys/class/net") / iface / "address"
-        try:
-            if mac_path.exists():
-                info["mac"] = mac_path.read_text().strip()
-        except OSError:
-            pass
-
-        # Treiber via ethtool
         try:
             rc, out, _ = CommandRunner.run(
-                ["ethtool", "-i", iface], subsystem="driver", soft_fail=True, timeout=5
+                ["iw", "dev"], subsystem="driver",
+                tag="hwscan-iw-dev", soft_fail=True, timeout=3,
             )
-            for line in out.splitlines():
-                if line.startswith("driver:"):
+            for line in (out or "").splitlines():
+                if "Interface" in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        names.add(parts[1])
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            p = Path("/proc/net/wireless")
+            if p.exists():
+                for line in p.read_text().splitlines()[2:]:
+                    parts = line.split(":")
+                    if parts and parts[0].strip():
+                        names.add(parts[0].strip())
+        except OSError:
+            pass
+        return sorted(names)
+
+    def _analyze_adapter(self, iface: str) -> dict:
+        info = {
+            "iface": iface,
+            "mac": "", "permanent_mac": "",
+            "driver": "", "driver_version": "", "driver_firmware": "",
+            "detected_source": "unknown",  # HW-E1
+            "chipset": "", "chipset_family": "",
+            "usb_id": "", "pci_id": "",
+            "bus": "unknown", "bus_info": "",
+            "is_alfa": False,
+            "catalog_model": "", "catalog_score": 0,
+            "catalog_reliability": "", "catalog_recommendation": "",
+            "usb_speed": "", "usb_max_speed": "", "usb_version": "",
+            "supports_monitor": False,
+            "supports_active_monitor": False,
+            "supports_injection": False,
+            "supports_ap": False,
+            "supports_p2p_go": False,
+            "supports_mesh": False,
+            "supports_ibss": False,
+            "supports_vif": False,
+            "supports_ap_plus_monitor": False,
+            "supports_5ghz": False,
+            "supports_6ghz": False,
+            "supports_dfs": False,
+            "iface_modes": [],
+            "bands": [],
+            "channels_24": 0, "channels_5": 0, "channels_6": 0,
+            "antennas": 0, "connector": "", "gain_dbi": 0.0,
+            "mimo": "",
+            "max_tx_dbm": 0, "current_tx_dbm": 0,
+            "tx_power_offset_dbm": 0,
+            "reg_domain": "", "phy": "",
+            "is_up": False, "is_monitor": False, "state": "",
+            "note": "",
+            "problems": [],
+        }
+        self._fill_mac_state(info, iface)
+        self._fill_driver_via_ethtool(info, iface)
+        self._fill_bus_info(info, iface)
+        self._fill_usb_id(info, iface)
+        self._fill_pci_id(info, iface)
+        self._fill_chipset_from_driver(info)
+        # HW-E1: Tatsaechliche Treiber-Quelle ermitteln
+        try:
+            info["detected_source"] = self._detect_driver_source(
+                info.get("driver", "")
+            )
+        except Exception:
+            info["detected_source"] = "unknown"
+        self._fill_from_catalog(info)
+        self._fill_usb_speed(info, iface)
+        self._fill_antenna_info(info)
+        phy = self._get_phy(iface)
+        info["phy"] = phy
+        if phy:
+            self._fill_capabilities(info, phy)
+        self._fill_reg_domain(info)
+        self._fill_txpower(info, iface)
+        self._fill_score(info)
+        self._detect_problems(info)
+        return info
+
+    def _fill_mac_state(self, info: dict, iface: str) -> None:
+        base = Path("/sys/class/net") / iface
+        for name, key in (
+            ("address", "mac"),
+            ("perm_address", "permanent_mac"),
+            ("operstate", "state"),
+        ):
+            try:
+                p = base / name
+                if p.exists():
+                    info[key] = p.read_text().strip()
+            except OSError:
+                pass
+        try:
+            flags = base / "flags"
+            if flags.exists():
+                info["is_up"] = (
+                    int(flags.read_text().strip(), 16) & 0x1
+                ) != 0
+        except (OSError, ValueError):
+            pass
+
+    def _fill_driver_via_ethtool(self, info: dict, iface: str) -> None:
+        try:
+            rc, out, _ = CommandRunner.run(
+                ["ethtool", "-i", iface], subsystem="driver",
+                tag=f"hwscan-eth-{iface}",
+                soft_fail=True, timeout=5,
+            )
+            for line in (out or "").splitlines():
+                lo = line.lower()
+                if lo.startswith("driver:"):
                     info["driver"] = line.split(":", 1)[1].strip()
-                elif line.startswith("bus-info:"):
+                elif lo.startswith("version:"):
+                    info["driver_version"] = line.split(":", 1)[1].strip()
+                elif lo.startswith("firmware-version:"):
+                    info["driver_firmware"] = (
+                        line.split(":", 1)[1].strip()
+                    )
+                elif lo.startswith("bus-info:"):
                     info["bus_info"] = line.split(":", 1)[1].strip()
         except (OSError, subprocess.SubprocessError):
             pass
 
-        # USB-ID (4 Fallbacks, mit Padding)
+    def _fill_bus_info(self, info: dict, iface: str) -> None:
+        dev = Path("/sys/class/net") / iface / "device"
+        try:
+            if not dev.exists():
+                info["bus"] = "virtual"
+                return
+            s = str(dev.resolve())
+            if "/usb" in s:
+                info["bus"] = "usb"
+            elif "/pci" in s or "pci0" in s:
+                info["bus"] = "pci"
+            elif "/platform" in s:
+                info["bus"] = "platform"
+            else:
+                bi = info.get("bus_info", "")
+                if bi.startswith("usb"):
+                    info["bus"] = "usb"
+                elif ":" in bi:
+                    info["bus"] = "pci"
+        except OSError:
+            pass
+
+    def _fill_usb_id(self, info: dict, iface: str) -> None:
+        if info.get("bus") not in ("usb", "unknown"):
+            return
         info["usb_id"] = self._find_usb_id(iface)
 
-        # Chipset aus Treiber-Map (nicht aus 'version:' = Kernel)
-        drv = (info["driver"] or "").lower()
-        for key, val in self.DRIVER_CHIPSET.items():
-            if key in drv:
-                info["chipset"] = val
-                break
-        if not info["chipset"] and info["driver"]:
-            try:
-                rc, mi, _ = CommandRunner.run(
-                    ["modinfo", "-F", "description", info["driver"]],
-                    subsystem="driver",
-                    soft_fail=True,
-                    timeout=3,
-                )
-                if mi.strip():
-                    info["chipset"] = mi.strip()[:60]
-            except (OSError, subprocess.SubprocessError):
-                pass
-
-        # Modell-Lookup aus DB (überschreibt Hardware-Werte)
-        if info["usb_id"]:
-            model = self.ALFA_MODELS.get(info["usb_id"])
-            if model:
-                info["is_alfa"] = True
-                info["alfa_model"] = model["name"]
-                info["chipset"] = model["chipset"]
-                info["bands"] = list(model.get("bands", []))
-                info["antennas"] = model.get("antennas", 2)
-                info["connector"] = model.get("connector", "")
-                info["gain_dbi"] = model.get("gain_dbi", 5.0)
-                info["max_tx_dbm"] = model.get("max_tx_dbm", 30)
-                info["note"] = model.get("note", "")
-                info["supports_monitor"] = True
-                info["supports_injection"] = True
-                info["supports_ap"] = True
-                info["supports_5ghz"] = True
-            else:
-                other = self.OTHER_MODELS.get(info["usb_id"])
-                if other:
-                    info["chipset"] = other["chipset"]
-                    info["antennas"] = other.get("antennas", 1)
-                    info["note"] = "Bekannt: " + other["name"]
-
-        # USB-Speed-Details
-        info["usb_speed"] = self._get_usb_speed(iface)
-        info["usb_max_speed"] = self._get_usb_max_speed(iface)
-        info["usb_version"] = self._get_usb_bcdusb(iface)
-        if info["usb_speed"] == "480":
-            if info["usb_max_speed"] == "5000":
-                info["problem"] = (
-                    "USB 2.0 aktiv, aber Adapter kann "
-                    "USB 3.0 - Kabel oder VBox-Port pruefen"
-                )
-            else:
-                info["problem"] = "USB 2.0 - Injection langsamer"
-
-        # Fähigkeiten via iw phy (nur ergänzen, nicht überschreiben)
-        phy = self._get_phy(iface)
-        if phy:
-            try:
-                caps = self._parse_phy_capabilities(phy)
-                for key, val in caps.items():
-                    cur = info.get(key)
-                    if cur in (None, "", 0, False, []):
-                        info[key] = val
-            except (OSError, subprocess.SubprocessError, ValueError):
-                pass
-
-        # RegDomain
-        try:
-            rc, out, _ = CommandRunner.run(
-                ["iw", "reg", "get"], subsystem="driver", soft_fail=True, timeout=3
-            )
-            for line in out.splitlines():
-                if line.startswith("country"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        info["reg_domain"] = parts[1].rstrip(":").strip()
-                        break
-        except (OSError, subprocess.SubprocessError):
-            pass
-
-        # TX aktuell
-        try:
-            rc, out, _ = CommandRunner.run(
-                ["iw", "dev", iface, "get", "txpower"],
-                subsystem="driver",
-                soft_fail=True,
-                timeout=3,
-            )
-            m = re.search(r"([\d.]+)\s*dBm", out)
-            if m:
-                info["current_tx_dbm"] = int(float(m.group(1)))
-        except (OSError, subprocess.SubprocessError, re.error):
-            pass
-
-        return info
-
     def _find_usb_id(self, iface: str) -> str:
-        """Ermittelt USB-ID (vendor:product) mit 4 Fallbacks, 4-stellig."""
-
-        def _pad4(s: str) -> str:
-            s = (s or "").strip().lower()
-            if not s:
+        def _pad4(x: str) -> str:
+            x = (x or "").strip().lower()
+            if not x:
                 return ""
             try:
-                return format(int(s, 16), "04x")
+                return format(int(x, 16), "04x")
             except ValueError:
-                return s.zfill(4)
+                return x.zfill(4)
 
         base = Path("/sys/class/net") / iface / "device"
-
-        # 1. sysfs idVendor/idProduct
         for p in (base, base.parent, base.parent.parent):
             try:
                 v = p / "idVendor"
@@ -15896,34 +16186,27 @@ class HardwareScanner:
                         return vid + ":" + pid
             except OSError:
                 continue
-
-        # 2. sysfs uevent
         try:
             uevent = base / "uevent"
             if uevent.exists():
                 txt = uevent.read_text()
-                m = re.search(r"PRODUCT=([0-9a-f]+)/([0-9a-f]+)/", txt, re.IGNORECASE)
+                m = re.search(
+                    r"PRODUCT=([0-9a-f]+)/([0-9a-f]+)/",
+                    txt, re.IGNORECASE,
+                )
                 if m:
                     return _pad4(m.group(1)) + ":" + _pad4(m.group(2))
         except (OSError, re.error):
             pass
-
-        # 3. udevadm
         try:
             rc, out, _ = CommandRunner.run(
-                [
-                    "udevadm",
-                    "info",
-                    "--query=property",
-                    "--path=/sys/class/net/" + iface,
-                ],
-                subsystem="driver",
-                soft_fail=True,
-                timeout=3,
+                ["udevadm", "info", "--query=property",
+                 "--path=/sys/class/net/" + iface],
+                subsystem="driver", tag=f"hwscan-udev-{iface}",
+                soft_fail=True, timeout=3,
             )
-            vid = ""
-            pid = ""
-            for line in out.splitlines():
+            vid = pid = ""
+            for line in (out or "").splitlines():
                 if line.startswith("ID_VENDOR_ID="):
                     vid = line.split("=", 1)[1].strip()
                 elif line.startswith("ID_MODEL_ID="):
@@ -15932,94 +16215,238 @@ class HardwareScanner:
                 return _pad4(vid) + ":" + _pad4(pid)
         except (OSError, subprocess.SubprocessError):
             pass
-
-        # 4. lsusb
         try:
             rc, out, _ = CommandRunner.run(
-                ["lsusb"], subsystem="driver", soft_fail=True, timeout=3
+                ["lsusb"], subsystem="driver",
+                tag="hwscan-lsusb", soft_fail=True, timeout=3,
             )
-            known = list(self.ALFA_MODELS.keys()) + list(self.OTHER_MODELS.keys())
-            for kid in known:
-                if kid in out.lower():
+            low = (out or "").lower()
+            for kid in WiFiAdapterCatalog.KNOWN.keys():
+                if kid in low:
                     return kid
-            # Breite Suche: Realtek/MediaTek/Ralink
-            for line in out.splitlines():
-                m = re.search(r"ID\s+([0-9a-f]{4}):([0-9a-f]{4})", line, re.IGNORECASE)
-                if m:
-                    candidate = _pad4(m.group(1)) + ":" + _pad4(m.group(2))
-                    return candidate
-        except (OSError, subprocess.SubprocessError, re.error):
+        except (OSError, subprocess.SubprocessError):
             pass
-
         return ""
 
-    def _get_usb_speed(self, iface: str) -> str:
-        """Aktueller USB-Speed in Mbps."""
-        for rel in ("speed", "../speed", "../../speed"):
+    def _fill_pci_id(self, info: dict, iface: str) -> None:
+        if info.get("bus") != "pci":
+            return
+        base = Path("/sys/class/net") / iface / "device"
+        parts = []
+        for v in ("vendor", "device"):
             try:
-                p = Path("/sys/class/net") / iface / "device" / rel
+                p = base / v
                 if p.exists():
-                    v = p.read_text().strip()
-                    if v and v != "0":
-                        return v
+                    parts.append(
+                        p.read_text().strip().replace("0x", "")
+                    )
             except OSError:
                 pass
-        return ""
+        info["pci_id"] = ":".join(parts)
 
-    def _get_usb_max_speed(self, iface: str) -> str:
-        """Maximal möglicher USB-Speed des Adapters."""
-        for rel in ("maximum_speed", "../maximum_speed", "../../maximum_speed"):
-            try:
-                p = Path("/sys/class/net") / iface / "device" / rel
-                if p.exists():
-                    v = p.read_text().strip()
-                    if v and v != "0":
-                        return v
-            except OSError:
-                pass
-        # Fallback aus bcdUSB ableiten
-        bcd = self._get_usb_bcdusb(iface)
-        if bcd:
-            major = bcd.split(".")[0]
-            return {"3": "5000", "2": "480"}.get(major, "")
-        return ""
+    @classmethod
+    def _detect_driver_source(cls, driver: str) -> str:
+        """Erkennt die tatsaechliche Herkunft eines geladenen Treibers.
 
-    def _get_usb_bcdusb(self, iface: str) -> str:
-        """USB-Descriptor-Version (2.10 / 3.00 / 3.20)."""
-        usb_id = self._find_usb_id(iface)
-        if not usb_id:
-            return ""
+        Nutzt `modinfo -F filename <driver>` und klassifiziert den Pfad:
+          /updates/dkms/    -> "dkms"
+          /staging/         -> "staging"
+          /kernel/drivers/  -> "in-kernel" wenn mainline-Prefix,
+                               sonst "manual" (vendor/out-of-tree)
+          other             -> "manual"
+
+        Returns: "in-kernel" | "dkms" | "staging" | "manual"
+                 | "unknown"
+        """
+        if not driver:
+            return "unknown"
+        # Erste Spalte des Treiber-Strings (bei "rtl88XXau (aircrack-ng)")
+        drv = driver.split()[0]
+
+        # HW-E1b: Kandidaten durchprobieren.
+        # ethtool liefert manchmal "rtl88XXau", das Modul heisst "88XXau".
+        candidates = [drv]
+        if drv.lower().startswith("rtl"):
+            candidates.append(drv[3:])       # ohne "rtl"-Prefix
+            candidates.append(drv[3:].lower())
+        candidates.append(drv.lower())
+        # Duplikate entfernen, Reihenfolge behalten
+        seen = set()
+        candidates = [
+            c for c in candidates
+            if c and not (c in seen or seen.add(c))
+        ]
+
+        path = ""
+        for cand in candidates:
+            rc, out, _ = HardwareScanner._run_static(
+                ["modinfo", "-F", "filename", cand]
+            )
+            if rc == 0 and out.strip():
+                path = out.strip().splitlines()[0]
+                break
+        if not path:
+            return "unknown"
+
+        if "/updates/dkms/" in path:
+            return "dkms"
+        if "/kernel/drivers/staging/" in path:
+            return "staging"
+
+        # Out-of-tree Manuell-Installation erkennen:
+        # Mainline-Treiber haben konsistente lowercase-Namen
+        # (rtw88_8812au, mt76x2u, rtl8187, ath9k_htc, ...)
+        # Vendor-Patches haben oft gemischte Gross-/Kleinschreibung
+        # (88XXau, 8812au) ODER untypische Namen.
+        name_lower = drv.lower()
+        mainline_prefixes = (
+            "rtw88_", "rtw89_", "rtl8187", "rtl8xxxu",
+            "mt76", "mt7921", "mt7925",
+            "ath9k", "ath10k", "ath11k", "ath12k",
+            "rt2800", "rt73", "rt2500", "iwlwifi", "iwlmvm",
+            "brcmfmac", "carl9170", "p54", "zd1211",
+            "cfg80211", "mac80211",
+        )
+        is_mainline = any(
+            name_lower.startswith(p) for p in mainline_prefixes
+        )
+        # Zusaetzliche Pruefung: Mainline-Module haben keine Grossbuchstaben
+        has_uppercase = any(c.isupper() for c in drv)
+
+        if is_mainline and not has_uppercase:
+            return "in-kernel"
+        # Sonst: manuell installiert (vendor-patched)
+        return "manual"
+
+    @staticmethod
+    def _run_static(cmd, timeout: float = 3.0):
+        """Statische Variante von _run - nutzbar vor __init__."""
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+            return r.returncode, (r.stdout or ""), (r.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            return -1, "", ""
+
+    def _fill_chipset_from_driver(self, info: dict) -> None:
+        drv = (info.get("driver") or "").lower()
+        if not drv:
+            return
+        for key, (chipset, family) in self.DRIVER_CHIPSET.items():
+            if key in drv:
+                info["chipset"] = chipset
+                info["chipset_family"] = family
+                return
         try:
             rc, out, _ = CommandRunner.run(
-                ["lsusb", "-v", "-d", usb_id],
-                subsystem="driver",
-                soft_fail=True,
-                timeout=5,
+                ["modinfo", "-F", "description", info["driver"]],
+                subsystem="driver", tag="hwscan-modinfo",
+                soft_fail=True, timeout=3,
             )
-            m = re.search(r"bcdUSB\s+(\d+\.\d+)", out)
-            if m:
-                return m.group(1)
-        except (OSError, subprocess.SubprocessError, re.error):
+            if out.strip():
+                info["chipset"] = out.strip()[:80]
+        except (OSError, subprocess.SubprocessError):
             pass
-        # Fallback: aus sysfs
-        for rel in ("version", "../version", "../../version"):
+
+    def _fill_from_catalog(self, info: dict) -> None:
+        entry = None
+        if info.get("usb_id"):
+            entry = WiFiAdapterCatalog.lookup(info["usb_id"])
+        if not entry and info.get("chipset"):
+            hits = WiFiAdapterCatalog.find_by_chipset(info["chipset"])
+            if hits:
+                entry = hits[0][1]
+        if not entry:
+            return
+        info["catalog_model"] = entry.get("model", "")
+        info["is_alfa"] = (
+            entry.get("vendor", "").lower() == "alfa"
+        )
+        if not info["chipset"]:
+            info["chipset"] = entry.get("chipset", "")
+        if not info["bands"]:
+            info["bands"] = list(entry.get("bands", []))
+        info["supports_monitor"] = bool(entry.get("monitor"))
+        info["supports_active_monitor"] = bool(
+            entry.get("active_monitor")
+        )
+        info["supports_injection"] = bool(entry.get("injection"))
+        info["supports_ap"] = bool(entry.get("ap_mode"))
+        info["supports_p2p_go"] = bool(entry.get("p2p_go"))
+        info["supports_vif"] = bool(entry.get("vif"))
+        info["supports_ap_plus_monitor"] = bool(
+            entry.get("ap_plus_monitor")
+        )
+        info["supports_5ghz"] = "5" in entry.get("bands", [])
+        info["supports_6ghz"] = "6" in entry.get("bands", [])
+        info["mimo"] = entry.get("mimo", "")
+        if entry.get("tx_max_dbm"):
+            info["max_tx_dbm"] = entry["tx_max_dbm"]
+        info["catalog_reliability"] = entry.get("reliability", "")
+        info["catalog_recommendation"] = entry.get(
+            "buy_recommendation", ""
+        )
+        if entry.get("note"):
+            info["note"] = entry["note"]
+
+    def _fill_usb_speed(self, info: dict, iface: str) -> None:
+        info["usb_speed"] = self._read_sysfs_chain(
+            iface, ("speed", "../speed", "../../speed")
+        )
+        info["usb_max_speed"] = self._read_sysfs_chain(
+            iface,
+            ("maximum_speed", "../maximum_speed",
+             "../../maximum_speed"),
+        )
+        bcd = self._read_sysfs_chain(
+            iface, ("version", "../version", "../../version")
+        )
+        if bcd:
+            info["usb_version"] = bcd
+            if not info["usb_max_speed"]:
+                major = bcd.split(".")[0]
+                info["usb_max_speed"] = {
+                    "3": "5000", "2": "480", "1": "12",
+                }.get(major, "")
+
+    def _read_sysfs_chain(self, iface: str, relatives) -> str:
+        for rel in relatives:
             try:
                 p = Path("/sys/class/net") / iface / "device" / rel
                 if p.exists():
-                    return p.read_text().strip()
+                    v = p.read_text().strip()
+                    if v and v != "0":
+                        return v
             except OSError:
                 pass
         return ""
+
+    def _fill_antenna_info(self, info: dict) -> None:
+        if not info.get("usb_id"):
+            return
+        ant = WiFiAdapterCatalog.get_antenna_info(info["usb_id"])
+        if not ant:
+            return
+        info["antennas"] = ant.get("antennas", 0)
+        info["connector"] = ant.get("connector", "")
+        info["gain_dbi"] = ant.get("gain_dbi", 0.0)
 
     def _get_phy(self, iface: str) -> str:
         try:
+            p = Path("/sys/class/net") / iface / "phy80211"
+            if p.exists():
+                return p.resolve().name
+        except OSError:
+            pass
+        try:
             rc, out, _ = CommandRunner.run(
                 ["iw", "dev", iface, "info"],
-                subsystem="driver",
-                soft_fail=True,
-                timeout=5,
+                subsystem="driver", tag=f"hwscan-iwdev-{iface}",
+                soft_fail=True, timeout=5,
             )
-            for line in out.splitlines():
+            for line in (out or "").splitlines():
                 if "wiphy" in line:
                     parts = line.split()
                     if len(parts) >= 2:
@@ -16028,86 +16455,195 @@ class HardwareScanner:
             pass
         return ""
 
-    def _parse_phy_capabilities(self, phy: str) -> dict:
-        caps = {
-            "supports_monitor": False,
-            "supports_injection": False,
-            "supports_ap": False,
-            "supports_5ghz": False,
-            "supports_6ghz": False,
-            "bands": [],
-        }
+    def _fill_capabilities(self, info: dict, phy: str) -> None:
         try:
             rc, out, _ = CommandRunner.run(
                 ["iw", "phy", phy, "info"],
-                subsystem="driver",
-                soft_fail=True,
-                timeout=8,
+                subsystem="driver", tag=f"hwscan-phy-{phy}",
+                soft_fail=True, timeout=8,
             )
         except (OSError, subprocess.SubprocessError):
-            return caps
-
+            return
+        if not out:
+            return
+        modes_seen = set()
+        bands_seen = set()
         in_modes = False
-        for line in out.splitlines():
-            ls = line.strip()
+        ch_24 = ch_5 = ch_6 = 0
+        for raw in out.splitlines():
+            ls = raw.strip()
             if ls.startswith("Supported interface modes:"):
                 in_modes = True
                 continue
+            if ls.startswith(("Band ", "Frequencies:",
+                              "Supported commands")):
+                in_modes = False
             if in_modes:
                 if ls.startswith("*"):
-                    mode = ls.lstrip("* ").strip().lower()
-                    if mode == "monitor":
-                        caps["supports_monitor"] = True
-                        caps["supports_injection"] = True
-                    elif mode == "ap":
-                        caps["supports_ap"] = True
+                    mode = ls.lstrip("* ").strip()
+                    if mode:
+                        modes_seen.add(mode)
                 elif ls and not ls.startswith("*"):
                     in_modes = False
+            m_band = re.match(r"Band (\d+):", ls)
+            if m_band:
+                bands_seen.add(int(m_band.group(1)))
+            m_freq = re.match(r"\* (\d+(?:\.\d+)?) MHz", ls)
+            if m_freq:
+                try:
+                    mhz = float(m_freq.group(1))
+                except ValueError:
+                    continue
+                if 2400 <= mhz <= 2500:
+                    ch_24 += 1
+                elif 4900 <= mhz <= 5900:
+                    ch_5 += 1
+                elif 5925 <= mhz <= 7125:
+                    ch_6 += 1
+            if "radar detection" in ls.lower():
+                info["supports_dfs"] = True
+        info["iface_modes"] = sorted(modes_seen)
+        mods_low = {m.lower() for m in modes_seen}
+        if "monitor" in mods_low:
+            info["supports_monitor"] = True
+        if "ap" in mods_low:
+            info["supports_ap"] = True
+        if "ibss" in mods_low or "ad-hoc" in mods_low:
+            info["supports_ibss"] = True
+        if "mesh point" in mods_low:
+            info["supports_mesh"] = True
+        if "p2p-go" in mods_low:
+            info["supports_p2p_go"] = True
+        info["channels_24"] = ch_24
+        info["channels_5"] = ch_5
+        info["channels_6"] = ch_6
+        bands = []
+        if 1 in bands_seen or ch_24:
+            bands.append("2.4")
+        if 2 in bands_seen or ch_5:
+            bands.append("5")
+            info["supports_5ghz"] = True
+        if 4 in bands_seen or ch_6:
+            bands.append("6")
+            info["supports_6ghz"] = True
+        if bands:
+            info["bands"] = bands
 
-            if ls.startswith("Band 1:"):
-                if "2.4 GHz" not in caps["bands"]:
-                    caps["bands"].append("2.4 GHz")
-            elif ls.startswith("Band 2:"):
-                caps["supports_5ghz"] = True
-                if "5 GHz" not in caps["bands"]:
-                    caps["bands"].append("5 GHz")
-            elif ls.startswith("Band 4:") or "6 GHz" in ls:
-                caps["supports_6ghz"] = True
-                if "6 GHz" not in caps["bands"]:
-                    caps["bands"].append("6 GHz")
-        return caps
+    def _fill_reg_domain(self, info: dict) -> None:
+        try:
+            rc, out, _ = CommandRunner.run(
+                ["iw", "reg", "get"], subsystem="driver",
+                tag="hwscan-reg", soft_fail=True, timeout=3,
+            )
+            for line in (out or "").splitlines():
+                if line.startswith("country"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        info["reg_domain"] = (
+                            parts[1].rstrip(":").strip()
+                        )
+                        break
+        except (OSError, subprocess.SubprocessError):
+            pass
 
-    # ══════════════════════════════════════════════════════════════
+    def _fill_txpower(self, info: dict, iface: str) -> None:
+        try:
+            rc, out, _ = CommandRunner.run(
+                ["iw", "dev", iface, "get", "txpower"],
+                subsystem="driver", tag=f"hwscan-txp-{iface}",
+                soft_fail=True, timeout=3,
+            )
+            m = re.search(r"([\d.]+)\s*dBm", out or "")
+            if m:
+                info["current_tx_dbm"] = int(float(m.group(1)))
+        except (OSError, subprocess.SubprocessError, re.error):
+            pass
+        if info["max_tx_dbm"] and info["current_tx_dbm"]:
+            info["tx_power_offset_dbm"] = (
+                info["max_tx_dbm"] - info["current_tx_dbm"]
+            )
+
+    def _fill_score(self, info: dict) -> None:
+        if not info.get("usb_id"):
+            return
+        try:
+            sc = HardwareAdvisor.score_adapter(info["usb_id"])
+            info["catalog_score"] = sc.get("score", 0)
+        except Exception:
+            pass
+
+    def _detect_problems(self, info: dict) -> None:
+        probs = info["problems"]
+        sp = info.get("usb_speed", "")
+        mx = info.get("usb_max_speed", "")
+        if sp == "480" and mx == "5000":
+            probs.append(
+                "USB 2.0 aktiv, aber Adapter kann USB 3.0 - "
+                "anderes Kabel oder VBox xHCI pruefen"
+            )
+        elif sp == "480":
+            probs.append("USB 2.0 - Injection langsamer")
+        if not info.get("supports_monitor"):
+            probs.append("Kein Monitor-Mode erkannt")
+        if not info.get("supports_injection"):
+            probs.append("Kein Packet-Injection erkannt")
+        if info.get("catalog_reliability") in ("limited", "broken"):
+            probs.append(
+                f"Zuverlaessigkeit: {info['catalog_reliability']}"
+            )
+        rec = info.get("catalog_recommendation", "")
+        if rec.startswith("NICHT"):
+            probs.append("Kaufempfehlung: NICHT kaufen")
+        if not info.get("phy"):
+            probs.append("phy nicht aufloesbar - iw-Rechte pruefen")
+
+    # ==================================================================
     # 2. Bluetooth
-    # ══════════════════════════════════════════════════════════════
+    # ==================================================================
     def scan_bluetooth(self) -> dict:
         info = {
             "available": False,
             "adapters": [],
             "kernel_support": False,
             "bluez_installed": False,
+            "hci_devices": [],
+            "hcitool_installed": False,
+            "bluetoothctl_installed": False,
             "note": "",
         }
         try:
             rc, out, _ = CommandRunner.run(
-                ["lsmod"], subsystem="driver", soft_fail=True, timeout=3
+                ["lsmod"], subsystem="driver",
+                tag="hwscan-lsmod", soft_fail=True, timeout=3,
             )
-            info["kernel_support"] = "bluetooth" in out.lower()
+            info["kernel_support"] = "bluetooth" in (out or "").lower()
         except (OSError, subprocess.SubprocessError):
             pass
-
         info["bluez_installed"] = bool(shutil.which("bluetoothctl"))
-
+        info["bluetoothctl_installed"] = info["bluez_installed"]
+        info["hcitool_installed"] = bool(shutil.which("hcitool"))
         try:
-            rc, out, _ = CommandRunner.run(
-                ["hciconfig"], subsystem="driver", soft_fail=True, timeout=3
-            )
-            for line in out.splitlines():
-                if line.startswith("hci"):
-                    info["adapters"].append(line.split(":")[0].strip())
-        except (OSError, subprocess.SubprocessError):
+            base = Path("/sys/class/bluetooth")
+            if base.exists():
+                for p in base.iterdir():
+                    if p.name.startswith("hci"):
+                        info["adapters"].append(p.name)
+        except OSError:
             pass
-
+        if not info["adapters"]:
+            try:
+                rc, out, _ = CommandRunner.run(
+                    ["hciconfig"], subsystem="driver",
+                    tag="hwscan-hciconfig",
+                    soft_fail=True, timeout=3,
+                )
+                for line in (out or "").splitlines():
+                    if line.startswith("hci"):
+                        name = line.split(":")[0].strip()
+                        if name:
+                            info["adapters"].append(name)
+            except (OSError, subprocess.SubprocessError):
+                pass
         info["available"] = bool(info["adapters"])
         if not info["available"]:
             if not info["kernel_support"]:
@@ -16118,35 +16654,38 @@ class HardwareScanner:
                 info["note"] = "Kein BT-Adapter angeschlossen"
         return info
 
-    # ══════════════════════════════════════════════════════════════
+    # ==================================================================
     # 3. GPS
-    # ══════════════════════════════════════════════════════════════
+    # ==================================================================
     def scan_gps(self) -> dict:
         info = {
             "available": False,
             "ports": [],
             "gpsd_running": False,
             "gpsd_installed": False,
+            "gpspipe_installed": False,
             "note": "",
         }
         info["gpsd_installed"] = bool(shutil.which("gpsd"))
+        info["gpspipe_installed"] = bool(shutil.which("gpspipe"))
         try:
             rc, out, _ = CommandRunner.run(
-                ["pgrep", "-a", "gpsd"], subsystem="support", soft_fail=True, timeout=2
+                ["pgrep", "-a", "gpsd"], subsystem="support",
+                tag="hwscan-gpsd", soft_fail=True, timeout=2,
             )
-            info["gpsd_running"] = bool(out.strip())
+            info["gpsd_running"] = bool((out or "").strip())
         except (OSError, subprocess.SubprocessError):
             pass
-
-        # Nur USB/ACM (ttyS sind meist keine GPS)
-        for pattern in ("/dev/ttyUSB*", "/dev/ttyACM*"):
-            for p in Path("/").glob(pattern.lstrip("/")):
-                try:
-                    if p.is_char_device():
-                        info["ports"].append(str(p))
-                except (OSError, AttributeError):
-                    pass
-
+        for pattern in ("ttyUSB*", "ttyACM*"):
+            try:
+                for p in Path("/dev").glob(pattern):
+                    try:
+                        if p.is_char_device():
+                            info["ports"].append(str(p))
+                    except (OSError, AttributeError):
+                        pass
+            except OSError:
+                pass
         info["available"] = bool(info["ports"])
         if not info["available"]:
             if not info["gpsd_installed"]:
@@ -16155,188 +16694,386 @@ class HardwareScanner:
                 info["note"] = "Kein GPS (kein USB-Serial)"
         return info
 
-    # ══════════════════════════════════════════════════════════════
-    # 4. Hauptreport
-    # ══════════════════════════════════════════════════════════════
+    # ==================================================================
+    # 4. PCI
+    # ==================================================================
+    def scan_pci_wifi(self) -> list:
+        cached = self._cache_get("pci")
+        if cached is not None:
+            return cached
+        out = []
+        try:
+            rc, txt, _ = CommandRunner.run(
+                ["lspci", "-nnk"], subsystem="driver",
+                tag="hwscan-lspci", soft_fail=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return out
+        current = None
+        for line in (txt or "").splitlines():
+            if re.match(r"^[0-9a-f]{2}:[0-9a-f]{2}\.\d", line):
+                if current:
+                    out.append(current)
+                current = {
+                    "slot": line.split()[0],
+                    "desc": line.split(":", 2)[-1].strip(),
+                    "driver": "",
+                    "modules": [],
+                    "pci_id": "",
+                }
+                m = re.search(
+                    r"\[([0-9a-f]{4}:[0-9a-f]{4})\]", line
+                )
+                if m:
+                    current["pci_id"] = m.group(1)
+            elif current and "Kernel driver in use:" in line:
+                current["driver"] = line.split(":", 1)[1].strip()
+            elif current and "Kernel modules:" in line:
+                mods = line.split(":", 1)[1].strip()
+                current["modules"] = [
+                    m.strip() for m in mods.split(",") if m.strip()
+                ]
+        if current:
+            out.append(current)
+        wifi = [
+            p for p in out
+            if any(
+                kw in p["desc"].lower()
+                for kw in ("wireless", "wifi", "802.11", "wlan",
+                           "network controller")
+            )
+        ]
+        self._cache_set("pci", wifi)
+        return wifi
+
+    # ==================================================================
+    # 5. Gesamtbericht
+    # ==================================================================
     def full_report(self) -> dict:
         report = {
             "wlan_adapters": self.scan_wlan(),
             "bluetooth": self.scan_bluetooth(),
             "gps": self.scan_gps(),
+            "pci_wifi": self.scan_pci_wifi(),
             "recommendations": [],
-            "timestamp": datetime.now().isoformat(),
+            "advisor": {},
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
+        try:
+            report["advisor"] = HardwareAdvisor.audit()
+        except Exception as e:
+            self.logger.debug("HardwareAdvisor.audit: %s", e)
         report["recommendations"] = self._generate_recommendations(report)
         return report
 
-    def _generate_recommendations(self, report: dict) -> list[str]:
+    def _generate_recommendations(self, report: dict) -> list:
         recs = []
         wlan = report["wlan_adapters"]
         bt = report["bluetooth"]
         gps = report["gps"]
-
         if not wlan:
-            recs.append("Kein WLAN-Adapter. Empfohlen: Alfa AWUS036ACH-C.")
-        else:
-            has_5ghz = any(a.get("supports_5ghz") for a in wlan)
-            has_6ghz = any(a.get("supports_6ghz") for a in wlan)
-            has_inj = any(a.get("supports_injection") for a in wlan)
-            usb2_any = any(a.get("problem") for a in wlan)
-
-            if not has_inj:
-                recs.append(
-                    "Adapter ohne Injection. Fuer Pentesting: " "Alfa AWUS036ACH-C."
-                )
-            if not has_5ghz:
-                recs.append(
-                    "Nur 2.4 GHz. Fuer Dual-Band: " "Alfa AWUS036ACM (MT7612U)."
-                )
-            if not has_6ghz:
-                recs.append(
-                    "Kein 6 GHz. Fuer Wi-Fi 6E: " "Alfa AWUS036AXML (MT7921AU) ~70 EUR."
-                )
-            if usb2_any:
-                recs.append(
-                    "USB-2.0-Problem: anderes USB-C-Kabel "
-                    "(USB 3.0-faehig) oder VBox USB 3.0 (xHCI) "
-                    "aktivieren."
-                )
-
+            recs.append(
+                "Kein WLAN-Adapter. Empfohlen: Alfa AWUS036ACHM "
+                "(0e8d:7610, ~59 EUR, In-Kernel)."
+            )
+            return recs
+        has_5ghz = any(a.get("supports_5ghz") for a in wlan)
+        has_6ghz = any(a.get("supports_6ghz") for a in wlan)
+        has_inj = any(a.get("supports_injection") for a in wlan)
+        has_mon = any(a.get("supports_monitor") for a in wlan)
+        has_active = any(
+            a.get("supports_active_monitor") for a in wlan
+        )
+        if not has_mon:
+            recs.append(
+                "Kein Adapter mit Monitor-Mode - Pentest nicht moeglich."
+            )
+        if not has_inj:
+            recs.append(
+                "Kein Adapter mit Injection - Deauth/Capture nicht moeglich."
+            )
+        if not has_active:
+            recs.append(
+                "Kein Active-Monitor - Channel-Hopping eingeschraenkt. "
+                "Empfehlung: Alfa AWUS036ACHM."
+            )
+        if not has_5ghz:
+            recs.append(
+                "Nur 2.4 GHz. Fuer Dual-Band: Alfa AWUS036ACM "
+                "(0e8d:7612, ~45 EUR)."
+            )
+        if not has_6ghz:
+            recs.append(
+                "Kein 6 GHz. Achtung: AWUS036AXML (MT7921AU) hat "
+                "Stand 2025/2026 defekten Monitor-Mode - derzeit "
+                "NICHT empfohlen."
+            )
+        for a in wlan:
+            for p in a.get("problems", []):
+                recs.append(f"{a['iface']}: {p}")
         if not bt["available"]:
             if not bt["bluez_installed"]:
-                recs.append("Fuer Bluetooth: sudo apt install " "bluez bluez-tools")
+                recs.append(
+                    "Fuer Bluetooth: sudo apt install bluez bluez-tools"
+                )
             else:
                 recs.append(
-                    "Fuer BLE-Scans: USB-BT-Adapter " "(CSR 4.0 oder RTL8761B) ~10 EUR."
+                    "Fuer BLE-Scans: USB-BT-Adapter RTL8761B "
+                    "(0bda:8771, ~12 EUR) oder CSR 4.0."
                 )
-
         if not gps["available"]:
             if not gps["gpsd_installed"]:
-                recs.append("Fuer GPS: sudo apt install gpsd gpsd-clients")
+                recs.append(
+                    "Fuer GPS: sudo apt install gpsd gpsd-clients"
+                )
             else:
                 recs.append(
-                    "Fuer GPS: USB-Empfaenger " "(u-blox NEO-6M/7M/8M) ~15-25 EUR."
+                    "Fuer GPS: u-blox NEO-6M USB (~15 EUR), "
+                    "NMEA-Standard."
                 )
-
         return recs
 
-    # ══════════════════════════════════════════════════════════════
-    # 5. Formatierung
-    # ══════════════════════════════════════════════════════════════
+    # ==================================================================
+    # 6. Formatierung
+    # ==================================================================
     def format_report(self, report: dict) -> str:
-        lines = []
-        lines.append("=" * 72)
-        lines.append("  HARDWARE-SCAN")
-        lines.append("=" * 72)
-
+        lines = ["=" * 72, "  HARDWARE-SCAN", "=" * 72]
         lines.append("")
-        lines.append("--- WLAN-Adapter (" + str(len(report["wlan_adapters"])) + ") ---")
-        if not report["wlan_adapters"]:
+        n = len(report["wlan_adapters"])
+        lines.append(f"-- WLAN-Adapter ({n}) --")
+        if n == 0:
             lines.append("  (keine gefunden)")
         for a in report["wlan_adapters"]:
-            tag = " [ALFA]" if a.get("is_alfa") else ""
             lines.append("")
-            lines.append("  " + a["iface"] + tag)
-            if a.get("alfa_model"):
-                lines.append("    Modell:      " + a["alfa_model"])
-            if a.get("chipset"):
-                lines.append("    Chipsatz:    " + a["chipset"])
-            if a.get("driver"):
-                lines.append("    Treiber:     " + a["driver"])
-            if a.get("usb_id"):
-                lines.append("    USB-ID:      " + a["usb_id"])
-            if a.get("usb_speed"):
-                sp = a["usb_speed"]
-                sp_label = (
-                    sp
-                    + " Mbps"
-                    + (
-                        " (USB 3.x)"
-                        if sp == "5000"
-                        else " (USB 2.0)" if sp == "480" else ""
-                    )
+            lines.extend(self._format_adapter(a))
+        if report.get("pci_wifi"):
+            lines.append("")
+            lines.append(
+                f"-- PCI-WLAN ({len(report['pci_wifi'])}) --"
+            )
+            for p in report["pci_wifi"]:
+                lines.append(
+                    f"  {p['slot']}  {p['desc'][:50]}  "
+                    f"[{p['driver'] or '?'}]"
                 )
-                det = []
-                if a.get("usb_version"):
-                    det.append("bcdUSB " + a["usb_version"])
-                mx = a.get("usb_max_speed")
-                if mx and mx != sp:
-                    det.append("max " + mx + " Mbps")
-                if det:
-                    sp_label += " [" + ", ".join(det) + "]"
-                lines.append("    USB-Speed:   " + sp_label)
-            if a.get("mac"):
-                lines.append("    MAC:         " + a["mac"])
-            if a.get("bands"):
-                lines.append("    Baender:     " + ", ".join(a["bands"]))
-            caps = []
-            if a.get("supports_monitor"):
-                caps.append("Monitor")
-            if a.get("supports_injection"):
-                caps.append("Injection")
-            if a.get("supports_ap"):
-                caps.append("AP")
-            if caps:
-                lines.append("    Features:    " + ", ".join(caps))
-            if a.get("max_tx_dbm"):
-                lines.append("    TX max (HW): " + str(a["max_tx_dbm"]) + " dBm")
-            if a.get("current_tx_dbm"):
-                lines.append("    TX aktuell:  " + str(a["current_tx_dbm"]) + " dBm")
-            if a.get("antennas"):
-                al = "    Antennen:    " + str(a["antennas"]) + "x"
-                if a.get("connector"):
-                    al += " " + a["connector"]
-                if a.get("gain_dbi"):
-                    al += " (" + str(a["gain_dbi"]) + " dBi)"
-                lines.append(al)
-            if a.get("reg_domain"):
-                lines.append("    RegDomain:   " + a["reg_domain"])
-            if a.get("note"):
-                lines.append("    Notiz:       " + a["note"])
-            if a.get("problem"):
-                lines.append("    Problem:     " + a["problem"])
-
         lines.append("")
-        lines.append("--- Bluetooth ---")
+        lines.append("-- Bluetooth --")
         bt = report["bluetooth"]
-        lines.append("  Verfuegbar:  " + ("JA" if bt["available"] else "NEIN"))
         lines.append(
-            "  Kernel:      " + ("geladen" if bt["kernel_support"] else "fehlt")
+            f"  Verfuegbar:  {'JA' if bt['available'] else 'NEIN'}"
         )
         lines.append(
-            "  bluez:       " + ("installiert" if bt["bluez_installed"] else "fehlt")
+            f"  Kernel:      "
+            f"{'geladen' if bt['kernel_support'] else 'fehlt'}"
+        )
+        lines.append(
+            f"  bluez:       "
+            f"{'installiert' if bt['bluez_installed'] else 'fehlt'}"
         )
         if bt["adapters"]:
-            lines.append("  Adapter:     " + ", ".join(bt["adapters"]))
-        if bt["note"]:
-            lines.append("  Notiz:       " + bt["note"])
-
-        lines.append("")
-        lines.append("--- GPS ---")
-        gps = report["gps"]
-        lines.append("  Verfuegbar:  " + ("JA" if gps["available"] else "NEIN"))
-        lines.append(
-            "  gpsd:        "
-            + (
-                "laeuft"
-                if gps["gpsd_running"]
-                else "installiert" if gps["gpsd_installed"] else "fehlt"
+            lines.append(
+                f"  Adapter:     {', '.join(bt['adapters'])}"
             )
+        if bt["note"]:
+            lines.append(f"  Notiz:       {bt['note']}")
+        lines.append("")
+        lines.append("-- GPS --")
+        gps = report["gps"]
+        lines.append(
+            f"  Verfuegbar:  {'JA' if gps['available'] else 'NEIN'}"
         )
+        state = (
+            "laeuft" if gps["gpsd_running"]
+            else "installiert" if gps["gpsd_installed"]
+            else "fehlt"
+        )
+        lines.append(f"  gpsd:        {state}")
         if gps["ports"]:
-            lines.append("  Ports:       " + ", ".join(gps["ports"]))
+            lines.append(
+                f"  Ports:       {', '.join(gps['ports'])}"
+            )
         if gps["note"]:
-            lines.append("  Notiz:       " + gps["note"])
-
+            lines.append(f"  Notiz:       {gps['note']}")
         if report["recommendations"]:
             lines.append("")
-            lines.append("--- Empfehlungen ---")
+            lines.append("-- Empfehlungen --")
             for r in report["recommendations"]:
-                lines.append("  - " + r)
-
+                lines.append(f"  - {r}")
         lines.append("")
         lines.append("=" * 72)
         return "\n".join(lines)
+
+    def _format_adapter(self, a: dict) -> list:
+        lines = []
+        tag = " [ALFA]" if a.get("is_alfa") else ""
+        score = a.get("catalog_score", 0)
+        lines.append(f"  > {a['iface']}{tag}  (Score: {score}/100)")
+        if a.get("catalog_model"):
+            lines.append(f"      Modell:      {a['catalog_model']}")
+        if a.get("chipset"):
+            fam = a.get("chipset_family", "")
+            fam_s = f" [{fam}]" if fam else ""
+            lines.append(f"      Chipsatz:    {a['chipset']}{fam_s}")
+        if a.get("driver"):
+            ver = a.get("driver_version", "")
+            ver_s = f" v{ver}" if ver else ""
+            lines.append(f"      Treiber:     {a['driver']}{ver_s}")
+        if a.get("driver_firmware"):
+            lines.append(
+                f"      Firmware:    {a['driver_firmware']}"
+            )
+        if a.get("bus"):
+            bus_id = a.get("usb_id") or a.get("pci_id") or ""
+            lines.append(f"      Bus:         {a['bus']} {bus_id}")
+        if a.get("usb_speed"):
+            sp = a["usb_speed"]
+            label = sp + " Mbps"
+            label += (
+                " (USB 3.x)" if sp == "5000"
+                else " (USB 2.0)" if sp == "480"
+                else ""
+            )
+            det = []
+            if a.get("usb_version"):
+                det.append("bcdUSB " + a["usb_version"])
+            mx = a.get("usb_max_speed")
+            if mx and mx != sp:
+                det.append("max " + mx)
+            if det:
+                label += "  [" + ", ".join(det) + "]"
+            lines.append(f"      USB:         {label}")
+        if a.get("mac"):
+            lines.append(f"      MAC:         {a['mac']}")
+        if a.get("phy"):
+            lines.append(f"      phy:         {a['phy']}")
+        if a.get("bands"):
+            lines.append(
+                f"      Baender:     {', '.join(a['bands'])}"
+            )
+        if a.get("iface_modes"):
+            lines.append(
+                f"      Modi:        {', '.join(a['iface_modes'])}"
+            )
+        caps = []
+        for flag, label in (
+            ("supports_monitor", "Monitor"),
+            ("supports_active_monitor", "Active"),
+            ("supports_injection", "Injection"),
+            ("supports_ap", "AP"),
+            ("supports_vif", "VIF"),
+            ("supports_ap_plus_monitor", "AP+Monitor"),
+            ("supports_dfs", "DFS"),
+            ("supports_mesh", "Mesh"),
+            ("supports_p2p_go", "P2P-GO"),
+        ):
+            if a.get(flag):
+                caps.append(label)
+        if caps:
+            lines.append(f"      Features:    {', '.join(caps)}")
+        ch = []
+        if a.get("channels_24"):
+            ch.append(f"2.4G:{a['channels_24']}")
+        if a.get("channels_5"):
+            ch.append(f"5G:{a['channels_5']}")
+        if a.get("channels_6"):
+            ch.append(f"6G:{a['channels_6']}")
+        if ch:
+            lines.append(f"      Kanaele:     {', '.join(ch)}")
+        if a.get("antennas"):
+            an = f"{a['antennas']}x"
+            if a.get("connector"):
+                an += f" {a['connector']}"
+            if a.get("gain_dbi"):
+                an += f" ({a['gain_dbi']} dBi)"
+            lines.append(f"      Antennen:    {an}")
+        if a.get("mimo"):
+            lines.append(f"      MIMO:        {a['mimo']}")
+        if a.get("max_tx_dbm"):
+            tx = f"max {a['max_tx_dbm']} dBm"
+            if a.get("current_tx_dbm"):
+                tx += f", aktuell {a['current_tx_dbm']} dBm"
+                off = a.get("tx_power_offset_dbm", 0)
+                if off:
+                    tx += f" (D {off:+d})"
+            lines.append(f"      TX-Power:    {tx}")
+        if a.get("reg_domain"):
+            lines.append(
+                f"      RegDomain:   {a['reg_domain']}"
+            )
+        if a.get("catalog_recommendation"):
+            lines.append(
+                f"      > {a['catalog_recommendation']}"
+            )
+        for p in a.get("problems", []):
+            lines.append(f"      ! {p}")
+        return lines
+
+    # ==================================================================
+    # 7. Export
+    # ==================================================================
+    def report_to_json(self, report: dict, indent: int = 2) -> str:
+        def default(o):
+            if isinstance(o, Path):
+                return str(o)
+            if isinstance(o, datetime):
+                return o.isoformat()
+            if isinstance(o, set):
+                return sorted(o)
+            return str(o)
+        try:
+            return json.dumps(
+                report, indent=indent, default=default,
+                ensure_ascii=False,
+            )
+        except (TypeError, ValueError) as e:
+            return f'{{"error": "JSON-Serialisierung: {e}"}}'
+
+    def report_to_yaml(self, report: dict) -> str:
+        try:
+            import yaml as _yaml
+        except ImportError:
+            return "# PyYAML nicht installiert"
+
+        def to_safe(o):
+            if isinstance(o, Path):
+                return str(o)
+            if isinstance(o, datetime):
+                return o.isoformat()
+            if isinstance(o, set):
+                return sorted(o)
+            if isinstance(o, dict):
+                return {k: to_safe(v) for k, v in o.items()}
+            if isinstance(o, (list, tuple)):
+                return [to_safe(x) for x in o]
+            return o
+
+        try:
+            return _yaml.safe_dump(
+                to_safe(report), sort_keys=False, allow_unicode=True,
+            )
+        except Exception as e:
+            return f"# YAML-Fehler: {e}"
+
+    def export_report(self, report: dict, path, fmt: str = "text") -> bool:
+        try:
+            p = Path(path)
+            if fmt == "json":
+                content = self.report_to_json(report)
+            elif fmt == "yaml":
+                content = self.report_to_yaml(report)
+            else:
+                content = self.format_report(report)
+            p.write_text(content, encoding="utf-8")
+            try:
+                os.chmod(p, 0o600)
+            except OSError:
+                pass
+            return True
+        except OSError as e:
+            self.logger.error("Export fehlgeschlagen: %s", e)
+            return False
+
+
 
 
 class InterfaceManager:
@@ -18966,16 +19703,26 @@ class Dot11Helpers:
 
     @staticmethod
     def extract_capabilities(packet) -> int:
-        """Extrahiert das Capabilities-Feld (16 Bit) aus dem Beacon/Probe Response."""
+        """Extrahiert das Capabilities-Feld (16 Bit) aus Beacon/ProbeResp.
+
+        Scapy >= 2.6 nennt das Feld `cap` (FlagsField).
+        Fallback: `capabilities` (aeltere Scapy-Varianten).
+        """
         if not SCAPY_VERFÜGBAR:
             return 0
         try:
-            if packet.haslayer(Dot11Beacon):
-                return packet[Dot11Beacon].capabilities
-            if packet.haslayer(Dot11ProbeResp):
-                return packet[Dot11ProbeResp].capabilities
+            for layer_cls in (Dot11Beacon, Dot11ProbeResp):
+                if packet.haslayer(layer_cls):
+                    layer = packet[layer_cls]
+                    cap = getattr(layer, "cap", None)
+                    if cap is None:
+                        cap = getattr(layer, "capabilities", 0)
+                    try:
+                        return int(cap)
+                    except (TypeError, ValueError):
+                        return 0
             return 0
-        except AttributeError:
+        except (AttributeError, TypeError):
             return 0
 
     @staticmethod
@@ -19487,13 +20234,17 @@ class PacketProcessor:
     - Leistungsoptimierung durch Caching und minimierte Scapy-Aufrufe
     """
 
-    def __init__(self, cache_manager=None, max_history: int = 10000):
+    def __init__(self, cache_manager=None, max_history: int = 10000,
+                 dedupe: bool = True):
         """
         :param cache_manager: Optionaler CacheManager für OUI/Hersteller
         :param max_history: Maximale Anzahl gespeicherter Paket-IDs für Deduplizierung
+        :param dedupe: True (Default) = nach Erstsichtung ignorieren
+                       False = jeder Beacon wird verarbeitet (fuer Signal-Statistik)
         """
         self.cache = cache_manager
         self.max_history = max_history
+        self._dedupe = bool(dedupe)
         self._seen_packets: deque = deque(maxlen=max_history)  # (bssid, ssid, seq_num)
         self._seen_set: set[tuple[str, str, int]] = set()
         self._lock = threading.RLock()
@@ -19625,6 +20376,7 @@ class PacketProcessor:
             "timestamp": time.time(),
             "manufacturer": self._get_manufacturer(bssid),
         }
+        result["decoded_ies"] = IEEE80211IEParser.collect_from_packet(packet)
         return result
 
     # ------------------------------------------------------------
@@ -19651,7 +20403,7 @@ class PacketProcessor:
         self._stats.probe_responses += 1
         self._stats.processed_packets += 1
 
-        return {
+        result = {
             "type": "probe_response",
             "bssid": bssid,
             "ssid": ssid,
@@ -19663,6 +20415,8 @@ class PacketProcessor:
             "timestamp": time.time(),
             "manufacturer": self._get_manufacturer(bssid),
         }
+        result["decoded_ies"] = IEEE80211IEParser.collect_from_packet(packet)
+        return result
 
     # ------------------------------------------------------------
     # Probe Request Verarbeitung (Clients)
@@ -19760,7 +20514,14 @@ class PacketProcessor:
     # Deduplizierung
     # ------------------------------------------------------------
     def _is_duplicate(self, bssid: str, ssid: str, seq_num: int) -> bool:
-        """v3.4: duplicates - seq_num ignoriert (immer neue Beacons erlaubt)."""
+        """v3.4: duplicates - seq_num ignoriert (immer neue Beacons erlaubt).
+
+        Bei self._dedupe=False wird nie dedupliziert — der Aufrufer
+        will jeden einzelnen Beacon sehen (z. B. Signal-Statistik in
+        --scan-once).
+        """
+        if not self._dedupe:
+            return False
         key = (bssid, ssid)  # seq_num weg
         with self._lock:
             if key in self._seen_set:
@@ -19933,12 +20694,27 @@ class PacketProcessor:
 
     @staticmethod
     def _extract_capabilities(packet) -> int:
+        """Liest das Capabilities-Feld aus Beacon/ProbeResp.
+
+        Scapy >= 2.6 nennt das Feld `cap` (FlagsField).
+        Fallback: `capabilities` (aeltere Scapy-Varianten).
+        Defensiv: bei fehlendem Feld wird 0 geliefert.
+        """
         if not SCAPY_VERFÜGBAR:
             return 0
-        if packet.haslayer(Dot11Beacon):
-            return packet[Dot11Beacon].capabilities
-        if packet.haslayer(Dot11ProbeResp):
-            return packet[Dot11ProbeResp].capabilities
+        try:
+            for layer_cls in (Dot11Beacon, Dot11ProbeResp):
+                if packet.haslayer(layer_cls):
+                    layer = packet[layer_cls]
+                    cap = getattr(layer, "cap", None)
+                    if cap is None:
+                        cap = getattr(layer, "capabilities", 0)
+                    try:
+                        return int(cap)
+                    except (TypeError, ValueError):
+                        return 0
+        except (AttributeError, TypeError):
+            pass
         return 0
 
     @staticmethod
@@ -35794,6 +36570,234 @@ class SelfTestReport:
         return "\n".join(lines)
 
 
+
+class HtmlReportGenerator:
+    """Standalone-HTML-Report aus einem SelfTestReport.
+
+    Reine String-Logik, kein GUI-Code. Ausgabe ist ein
+    eigenstaendiges HTML-Dokument ohne externe Ressourcen.
+    """
+
+    _CSS = """body{font-family:monospace;background:#1a1a1a;
+color:#d4d4d4;margin:0;padding:24px;}
+h1{color:#2a82da;margin:0 0 4px 0;}
+h2{color:#2a82da;border-bottom:1px solid #444;padding-bottom:4px;
+margin-top:32px;}
+.meta{color:#7f8c8d;font-size:9pt;margin:8px 0;}
+.kacheln{display:flex;gap:12px;margin:16px 0;flex-wrap:wrap;}
+.kachel{background:#242424;border:1px solid #444;border-radius:6px;
+padding:12px 20px;min-width:80px;text-align:center;}
+.kachel .zahl{font-size:20pt;font-weight:bold;display:block;}
+.kachel .label{font-size:8pt;color:#7f8c8d;text-transform:uppercase;}
+.OK{color:#27ae60;}
+.WARN{color:#f39c12;}
+.FAIL{color:#e74c3c;}
+.SKIP{color:#7f8c8d;}
+table{border-collapse:collapse;width:100%;margin-top:8px;}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid #333;}
+th{background:#242424;color:#2a82da;}
+td.sev{font-weight:bold;width:70px;}
+td.val{color:#7f8c8d;font-size:9pt;}
+tr:hover{background:#242424;}
+.score-box{font-size:28pt;font-weight:bold;color:#2a82da;margin:8px 0;}
+footer{color:#7f8c8d;font-size:8pt;margin-top:32px;
+border-top:1px solid #333;padding-top:8px;}
+"""
+
+    def __init__(self, report: SelfTestReport):
+        self.report = report
+
+    @staticmethod
+    def _esc(value) -> str:
+        """HTML-Escaping fuer Text- und Attributwerte."""
+        if value is None:
+            return ""
+        s = str(value)
+        return (s.replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+                 .replace('"', "&quot;"))
+
+    def _kacheln(self) -> str:
+        c = self.report.severity_counts()
+        parts = ['<div class="kacheln">']
+        for key in ("OK", "WARN", "FAIL", "SKIP"):
+            parts.append(
+                '<div class="kachel">'
+                f'<span class="zahl {key}">{c.get(key, 0)}</span>'
+                f'<span class="label">{key}</span></div>'
+            )
+        parts.append("</div>")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _svg_bar(
+        y: int,
+        width: int,
+        height: int,
+        ratio: float,
+        color: str,
+        label: str,
+        value_text: str,
+    ) -> str:
+        """Eine horizontale SVG-Balkenzeile (Breite 480px)."""
+        ratio = max(0.0, min(1.0, ratio))
+        bar_w = int(width * ratio)
+        return (
+            f'<rect x="120" y="{y}" width="{width}" height="{height}"'
+            ' fill="#242424" stroke="#333"/>'
+            f'<rect x="120" y="{y}" width="{bar_w}" height="{height}"'
+            f' fill="{color}"/>'
+            f'<text x="0" y="{y + height - 4}" fill="#d4d4d4"'
+            ' font-size="11" font-family="monospace">'
+            f'{label}</text>'
+            f'<text x="{130 + width}" y="{y + height - 4}"'
+            ' fill="#7f8c8d" font-size="10" font-family="monospace">'
+            f'{value_text}</text>'
+        )
+
+    def _chart_severities(self) -> str:
+        """Horizontale Balken: Severity-Verteilung."""
+        c = self.report.severity_counts()
+        total = sum(c.values()) or 1
+        colors = {
+            "OK": "#27ae60",
+            "WARN": "#f39c12",
+            "FAIL": "#e74c3c",
+            "SKIP": "#7f8c8d",
+        }
+        parts = [
+            '<svg viewBox="0 0 640 140" width="100%" '
+            'preserveAspectRatio="xMidYMid meet" '
+            'xmlns="http://www.w3.org/2000/svg">'
+        ]
+        y = 10
+        for key in ("OK", "WARN", "FAIL", "SKIP"):
+            v = c.get(key, 0)
+            parts.append(self._svg_bar(
+                y=y, width=440, height=22,
+                ratio=(v / total), color=colors[key],
+                label=key, value_text=f"{v}",
+            ))
+            y += 30
+        parts.append("</svg>")
+        return "\n".join(parts)
+
+    def _chart_category_scores(self) -> str:
+        """Horizontale Balken: Score je Kategorie."""
+        cats = self.report.categories
+        if not cats:
+            return ""
+        colors = {
+            "OK": "#27ae60",
+            "WARN": "#f39c12",
+            "FAIL": "#e74c3c",
+            "SKIP": "#7f8c8d",
+        }
+        height = 10 + 30 * len(cats)
+        parts = [
+            f'<svg viewBox="0 0 640 {height}" width="100%" '
+            'preserveAspectRatio="xMidYMid meet" '
+            'xmlns="http://www.w3.org/2000/svg">'
+        ]
+        y = 10
+        for cat in cats:
+            name = cat.name if len(cat.name) <= 14 else cat.name[:13] + "…"
+            parts.append(self._svg_bar(
+                y=y, width=440, height=22,
+                ratio=(cat.score() / 100.0),
+                color=colors.get(cat.aggregate().value, "#7f8c8d"),
+                label=self._esc(name),
+                value_text=f"{cat.score()}/100",
+            ))
+            y += 30
+        parts.append("</svg>")
+        return "\n".join(parts)
+
+    def _category_table(self, cat: SelfTestCategoryResult) -> str:
+        agg = cat.aggregate().value
+        parts = [
+            f"<h2>{self._esc(cat.name)} "
+            f'<span class="{agg}">[{agg}]</span>'
+            f" &mdash; Score {cat.score()}/100</h2>"
+        ]
+        if cat.description:
+            parts.append(
+                f'<p class="meta">{self._esc(cat.description)}</p>'
+            )
+        parts.append("<table>")
+        parts.append(
+            "<tr><th>Check</th><th>Status</th>"
+            "<th>Wert</th><th>Detail</th></tr>"
+        )
+        for r in cat.results:
+            sev = r.severity.value
+            parts.append(
+                "<tr>"
+                f"<td>{self._esc(r.name)}</td>"
+                f'<td class="sev {sev}">{sev}</td>'
+                f'<td class="val">{self._esc(r.value)}</td>'
+                f"<td>{self._esc(r.detail)}</td>"
+                "</tr>"
+            )
+        parts.append("</table>")
+        return "\n".join(parts)
+
+    def to_html(self) -> str:
+        """Erzeugt das vollstaendige HTML-Dokument als String."""
+        r = self.report
+        agg = r.overall().value
+        parts = [
+            "<!DOCTYPE html>",
+            '<html lang="de">',
+            "<head>",
+            '<meta charset="utf-8">',
+            '<meta name="viewport" '
+            'content="width=device-width,initial-scale=1">',
+            f"<title>SelfTest-Report -- {self._esc(r.timestamp)}</title>",
+            f"<style>{self._CSS}</style>",
+            "</head>",
+            "<body>",
+            f"<h1>SelfTest-Report "
+            f'<span class="{agg}">[{agg}]</span></h1>',
+            f'<div class="meta">Zeitpunkt: {self._esc(r.timestamp)}'
+            f" &middot; Schema v{SELFTEST_SCHEMA_VERSION}</div>",
+            f'<div class="score-box">{r.score()}/100</div>',
+            self._kacheln(),
+        ]
+        if self.report.categories:
+            parts.append(
+                '<h2 style="margin-top:24px">Verteilung</h2>'
+            )
+            parts.append(self._chart_severities())
+            parts.append(
+                '<h2 style="margin-top:24px">Kategorie-Scores</h2>'
+            )
+            parts.append(self._chart_category_scores())
+        if not r.categories:
+            parts.append("<p><em>Keine Kategorien im Report.</em></p>")
+        else:
+            fails = r.failing_categories()
+            if fails:
+                parts.append(
+                    f'<p class="meta">{len(fails)} Kategorie(n) mit '
+                    "WARN oder FAIL &mdash; siehe unten.</p>"
+                )
+            for cat in r.categories:
+                parts.append(self._category_table(cat))
+        parts.append(
+            "<footer>Erzeugt aus SelfTestReport "
+            f"(Schema v{SELFTEST_SCHEMA_VERSION})</footer>"
+        )
+        parts.append("</body>")
+        parts.append("</html>")
+        return "\n".join(parts)
+
+    def to_file(self, path) -> None:
+        """Schreibt den HTML-Report als UTF-8-Datei."""
+        Path(path).write_text(self.to_html(), encoding="utf-8")
+
+
 class SelfTestCategory:
     """Basisklasse für SelfTest-Kategorien."""
     NAME = "Kategorie"
@@ -37194,6 +38198,10 @@ class SelfTestTab(QWidget):
         b_export.clicked.connect(self._export_selftest_report)
         row.addWidget(b_export)
 
+        b_html = QPushButton("🌐 HTML-Report")
+        b_html.clicked.connect(self._export_selftest_html)
+        row.addWidget(b_html)
+
         b_bundle = QPushButton("📤 Diagnose-Bundle")
         b_bundle.clicked.connect(self._export_diagnostic_bundle)
         row.addWidget(b_bundle)
@@ -37647,6 +38655,49 @@ class SelfTestTab(QWidget):
             )
 
     # -- P7.6b: Diagnose-Bundle fuer Bug-Reports ------------------
+
+    def _export_selftest_html(self):
+        """P7-A2: Exportiert den Report als Standalone-HTML."""
+        rep = getattr(self, "_last_report", None)
+        if rep is None:
+            try:
+                rep = run_selftest_categories()
+                self._last_report = rep
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Fehler", f"Report nicht verfuegbar: {e}"
+                )
+                return
+        default_name = (
+            "selftest_"
+            + datetime.now().strftime("%Y%m%d_%H%M%S")
+            + ".html"
+        )
+        path, _filt = QFileDialog.getSaveFileName(
+            self,
+            "HTML-Report speichern",
+            str(Path.home() / default_name),
+            "HTML (*.html);;Alle Dateien (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not path:
+            return
+        try:
+            HtmlReportGenerator(rep).to_file(path)
+            if hasattr(self, "status_label"):
+                self.status_label.setText(
+                    f"HTML-Report gespeichert: {path}"
+                )
+            else:
+                QMessageBox.information(
+                    self, "OK",
+                    f"HTML-Report gespeichert:\n{path}",
+                )
+        except OSError as e:
+            QMessageBox.warning(
+                self, "Fehler",
+                f"Konnte HTML-Report nicht speichern: {e}",
+            )
 
     def _export_diagnostic_bundle(self):
         """Erzeugt ein Bug-Report-Bundle als Textdatei."""
@@ -40325,6 +41376,9 @@ class ScanEngine:
             "vendor_ies": [],
             "capability": 0,
             "max_rate": 0.0,
+            # P9.1: alle IEs, die der neue Dispatcher versteht.
+            # Key = IE-ID (int), Value = dict aus IEEE80211IEParser.
+            "decoded_ies": {},
         }
         if not SCAPY_VERFÜGBAR:
             return info
@@ -40392,6 +41446,25 @@ class ScanEngine:
                         info["wps"] = self._v41_parse_wps(raw)
                 elif ie_id == 255 and raw:  # Extended Capabilities
                     info["extended_cap"] = list(raw)
+
+                # P9.1: Dispatcher fuer neue IE-Typen.
+                # Doppel-Pfad-Bewusstsein: die oben geparsten Felder
+                # (ssid/rates/rsn/...) bleiben der Primaerpfad fuer
+                # bestehende Konsumenten. decoded_ies ist zusaetzlich.
+                if ie_id is not None:
+                    decoded = IEEE80211IEParser.parse_ie(
+                        int(ie_id), raw
+                    )
+                    if decoded is not None:
+                        # Mehrfach vorkommende IDs: Liste anlegen
+                        if ie_id in info["decoded_ies"]:
+                            slot = info["decoded_ies"][ie_id]
+                            if isinstance(slot, list):
+                                slot.append(decoded)
+                            else:
+                                info["decoded_ies"][ie_id] = [slot, decoded]
+                        else:
+                            info["decoded_ies"][ie_id] = decoded
 
                 layer = getattr(layer, "payload", None)
             except (AttributeError, TypeError, ValueError):
@@ -40813,6 +41886,7 @@ class ScanEngine:
             "rsn_cipher": "/".join(sec.get("cipher", [])),
             "rsn_akm": "/".join(sec.get("akm", [])),
             "has_pmkid": False,
+            "decoded_ies": (ie_info.get("decoded_ies") or {}),
             "_v35_source": True,
             "_v41_enhanced": True,
             "_v84_enhanced": True,
@@ -41423,6 +42497,7 @@ class ScanEngine:
                     "mfp_required": bool(result.get("mfp_required", False)),
                     "hidden": bool(result.get("hidden", False)),
                     "manufacturer": result.get("manufacturer", ""),
+                    "decoded_ies": result.get("decoded_ies") or {},
                     "first_seen": now,
                     "last_seen": now,
                     "timestamp": now,
@@ -41474,6 +42549,9 @@ class ScanEngine:
                 ):
                     if result.get(flag):
                         existing[flag] = True
+
+                if result.get("decoded_ies"):
+                    existing["decoded_ies"] = result["decoded_ies"]
 
 
         # ---- Emission -----------------------------------------
@@ -53343,7 +54421,8 @@ class DebugManager:
     # Handler-Setup
     # ==================================================================
     def _setup_console_handler(self, level: int) -> None:
-        console = logging.StreamHandler(sys.stdout)
+        # 7e-5d: Console-Log nach stderr (stdout bleibt fuer JSON frei).
+        console = logging.StreamHandler(sys.stderr)
         console.setFormatter(ColoredFormatter())
         console.setLevel(level)
         console.set_name("console")
@@ -62296,7 +63375,1440 @@ class EvilTwinTab(QWidget):
             QMessageBox.warning(self, "Export", str(exc))
 
 
-class WLANUltimateGUI(QMainWindow):
+class IEEE80211IEParser:
+    """Reine Parser fuer 802.11 Information Elements.
+
+    Statisch, zustandslos, ohne Qt/GUI-Abhaengigkeit.
+    Dispatcher: parse_ie(ie_id, raw) -> dict | None.
+    Alle Methoden sind defensiv: bei zu kurzen Daten wird nicht geworfen,
+    sondern ein Best-Effort-dict geliefert.
+    """
+
+    @staticmethod
+    def _bit(data: bytes, n: int) -> bool:
+        bi, shift = divmod(n, 8)
+        if bi >= len(data):
+            return False
+        return bool(data[bi] & (1 << shift))
+
+    @staticmethod
+    def _bits(data: bytes, start: int, count: int) -> int:
+        v = 0
+        for i in range(count):
+            if IEEE80211IEParser._bit(data, start + i):
+                v |= (1 << i)
+        return v
+
+    @staticmethod
+    def parse_ie(ie_id: int, raw: bytes) -> dict | None:
+        """Dispatcher. None, wenn IE unbekannt/zu kurz."""
+        if not isinstance(raw, (bytes, bytearray)):
+            return None
+        raw = bytes(raw)
+        try:
+            if ie_id == 7 and len(raw) >= 3:
+                return IEEE80211IEParser.parse_country(raw)
+            if ie_id == 11 and len(raw) >= 5:
+                return IEEE80211IEParser.parse_bss_load(raw)
+            if ie_id == 32 and len(raw) >= 1:
+                return IEEE80211IEParser.parse_power_constraint(raw)
+            if ie_id == 35 and len(raw) >= 2:
+                return IEEE80211IEParser.parse_tpc_report(raw)
+            if ie_id == 42 and len(raw) >= 1:
+                return IEEE80211IEParser.parse_erp(raw)
+            if ie_id == 45 and len(raw) >= 26:
+                return IEEE80211IEParser.parse_ht_cap(raw)
+            if ie_id == 54 and len(raw) >= 3:
+                return IEEE80211IEParser.parse_mobility_domain(raw)
+            if ie_id == 55 and len(raw) >= 2:
+                return IEEE80211IEParser.parse_ft_capability(raw)
+            if ie_id == 61 and len(raw) >= 22:
+                return IEEE80211IEParser.parse_ht_operation(raw)
+            if ie_id == 70 and len(raw) >= 5:
+                return IEEE80211IEParser.parse_rm_enabled(raw)
+            if ie_id == 127 and len(raw) >= 1:
+                return IEEE80211IEParser.parse_extended_cap(raw)
+            if ie_id == 191 and len(raw) >= 12:
+                return IEEE80211IEParser.parse_vht_cap(raw)
+            if ie_id == 192 and len(raw) >= 5:
+                return IEEE80211IEParser.parse_vht_operation(raw)
+            if ie_id == 201 and len(raw) >= 1:
+                return IEEE80211IEParser.parse_rnr(raw)
+            if ie_id == 221 and len(raw) >= 4:
+                return IEEE80211IEParser.parse_vendor_specific(raw)
+            if ie_id == 255 and len(raw) >= 1:
+                return IEEE80211IEParser.parse_ext_ie(raw)
+        except (IndexError, ValueError, AttributeError):
+            return None
+        return None
+
+    @staticmethod
+    def parse_bss_load(data: bytes) -> dict:
+        """BSS Load IE (11): Stations, Kanal-Auslastung, Admission."""
+        util_raw = data[2]
+        return {
+            "station_count": int.from_bytes(data[0:2], "little"),
+            "channel_utilization_raw": util_raw,
+            "channel_utilization_pct": round(util_raw / 255 * 100, 2),
+            "admission_capacity": int.from_bytes(data[3:5], "little"),
+        }
+
+    @staticmethod
+    def parse_power_constraint(data: bytes) -> dict:
+        """Power Constraint IE (32): dB-Abzug vom Reg-Limit."""
+        return {"power_constraint_db": data[0]}
+
+    @staticmethod
+    def parse_tpc_report(data: bytes) -> dict:
+        """TPC Report IE (35): Sendeleistung (signed) + Link-Margin."""
+        tx = data[0]
+        if tx > 127:
+            tx -= 256
+        return {"transmit_power_dbm": tx, "link_margin_db": data[1]}
+
+    @staticmethod
+    def parse_erp(data: bytes) -> dict:
+        """ERP IE (42): g/b-Koexistenz."""
+        b = data[0]
+        return {
+            "non_erp_present": bool(b & 0x01),
+            "use_protection": bool(b & 0x02),
+            "barker_preamble_mode": bool(b & 0x04),
+        }
+
+    @staticmethod
+    def parse_ht_cap(data: bytes) -> dict:
+        """HT Capabilities IE (45), 26 bytes."""
+        cap = int.from_bytes(data[0:2], "little")
+        ampdu = data[2]
+        mcs_set = list(data[3:19])
+        ext_cap = int.from_bytes(data[19:21], "little")
+        txbf = int.from_bytes(data[21:25], "little")
+        asel = data[25]
+        mcs_idx = []
+        for i, b in enumerate(mcs_set):
+            for j in range(8):
+                if i * 8 + j >= 77:
+                    break
+                if b & (1 << j):
+                    mcs_idx.append(i * 8 + j)
+        return {
+            "cap_info": cap,
+            "ldpc": bool(cap & 0x01),
+            "ht_40": bool(cap & 0x02),
+            "sgi_20": bool(cap & 0x20),
+            "sgi_40": bool(cap & 0x40),
+            "greenfield": bool(cap & 0x10),
+            "sm_ps": (cap >> 2) & 0x03,
+            "max_amsdu_7935": bool(cap & 0x0800),
+            "ampdu_params": ampdu,
+            "mcs_set": mcs_set,
+            "mcs_indices_supported": mcs_idx,
+            "max_mcs_index": max(mcs_idx) if mcs_idx else -1,
+            "txbf_cap": txbf,
+            "asel_cap": asel,
+            "ext_ht_cap": ext_cap,
+        }
+
+    @staticmethod
+    def parse_ht_operation(data: bytes) -> dict:
+        """HT Operation IE (61), 22 bytes."""
+        op = data[1:6]
+        sec_off = op[0] & 0x03
+        sta_w = op[1] & 0x03
+        width_map = {0: 20, 1: 40, 2: 80, 3: 160}
+        return {
+            "primary_channel": data[0],
+            "secondary_channel_offset": sec_off,
+            "sta_channel_width": sta_w,
+            "channel_width_mhz": width_map.get(sta_w, 20),
+            "rifs_mode": bool(op[1] & 0x04),
+            "ht_protection": (op[1] >> 2) & 0x03,
+            "basic_mcs_set": list(data[6:22]),
+            "operation_info_raw": list(op),
+        }
+
+    @staticmethod
+    def parse_vht_cap(data: bytes) -> dict:
+        """VHT Capabilities IE (191), 12 bytes."""
+        cap = int.from_bytes(data[0:4], "little")
+        return {
+            "cap_info": cap,
+            "max_mpdu_len": cap & 0x03,
+            "channel_width_80": bool(cap & 0x04),
+            "channel_width_160": bool(cap & 0x08),
+            "channel_width_8080": bool(cap & 0x08),
+            "rx_ldpc": bool(cap & 0x10),
+            "short_gi_80": bool(cap & 0x20),
+            "short_gi_160": bool(cap & 0x40),
+            "tx_stbc": bool(cap & 0x80),
+            "rx_stbc": (cap >> 8) & 0x07,
+            "su_beamformer": bool(cap & 0x0800),
+            "su_beamformee": bool(cap & 0x1000),
+            "mu_beamformer": bool(cap & 0x10000),
+            "mu_beamformee": bool(cap & 0x20000),
+            "rx_mcs_map": int.from_bytes(data[4:6], "little"),
+            "rx_highest_mbps": int.from_bytes(data[6:8], "little"),
+            "tx_mcs_map": int.from_bytes(data[8:10], "little"),
+            "tx_highest_mbps": int.from_bytes(data[10:12], "little"),
+        }
+
+    @staticmethod
+    def parse_vht_operation(data: bytes) -> dict:
+        """VHT Operation IE (192), 5 bytes."""
+        return {
+            "channel_width": data[0],
+            "center_freq_seg0": data[1],
+            "center_freq_seg1": data[2],
+            "basic_vht_mcs_set": int.from_bytes(data[3:5], "little"),
+        }
+
+    @staticmethod
+    def parse_country(data: bytes) -> dict:
+        """Country IE (7) mit vollen Reg-Triplets."""
+        country = data[0:2].decode("ascii", errors="ignore")
+        env = chr(data[2]) if len(data) > 2 else ""
+        triplets = []
+        idx = 3
+        while idx + 3 <= len(data):
+            first = data[idx]
+            num = data[idx + 1]
+            power = data[idx + 2]
+            triplets.append({
+                "first_channel": first,
+                "num_channels": num,
+                "max_tx_power_dbm": power,
+                "last_channel": first + num - 1 if num > 0 else first,
+            })
+            idx += 3
+        return {
+            "country_code": country,
+            "environment": env,
+            "channel_triplets": triplets,
+            "num_constraints": len(triplets),
+        }
+
+    @staticmethod
+    def parse_mobility_domain(data: bytes) -> dict:
+        """Mobility Domain IE (54), 3 bytes: 802.11r."""
+        return {
+            "mdid": data[0:2].hex(),
+            "ft_capability": bool(data[2] & 0x01),
+            "ft_policy": (data[2] >> 1) & 0x03,
+        }
+
+    @staticmethod
+    def parse_ft_capability(data: bytes) -> dict:
+        """Fast BSS Transition IE (55)."""
+        return {
+            "raw_len": len(data),
+            "ft_capability": data[0] if len(data) > 0 else 0,
+            "mobility_domain": data[1:3].hex() if len(data) >= 3 else "",
+        }
+
+    @staticmethod
+    def parse_rm_enabled(data: bytes) -> dict:
+        """RM Enabled Capabilities IE (70), 5 bytes: 802.11k."""
+        if len(data) < 5:
+            return {"raw": list(data)}
+        return {
+            "neighbor_report": bool(data[0] & 0x01),
+            "link_measurement": bool(data[0] & 0x02),
+            "link_trace": bool(data[0] & 0x04),
+            "channel_usage": bool(data[0] & 0x08),
+            "bss_avg_access_delay": bool(data[0] & 0x80),
+            "bss_available_admission": bool(data[1] & 0x01),
+            "bss_max_idle_period": bool(data[1] & 0x10),
+            "measurement_pilot": bool(data[2] & 0x04),
+            "raw": list(data),
+        }
+
+    @staticmethod
+    def parse_extended_cap(data: bytes) -> dict:
+        """Extended Capabilities IE (127) mit dekodierten 802.11k/v/r-Bits."""
+        b = lambda n: IEEE80211IEParser._bit(data, n)
+        return {
+            "raw_len": len(data),
+            "raw": list(data),
+            "bss_transition_19": b(19),
+            "ssid_list_31": b(31),
+            "extended_sleep_47": b(47),
+            "multi_bssid_55": b(55),
+            "fils_68": b(68),
+            "sae_h2e_70": b(70),
+            "complete_list_71": b(71),
+            "twt_75": b(75),
+            "proxy_arp_78": b(78),
+            "wnm_sleep_79": b(79),
+        }
+
+    @staticmethod
+    def parse_rnr(data: bytes) -> dict:
+        """Reduced Neighbor Report IE (201)."""
+        neighbors = []
+        idx = 0
+        while idx + 13 <= len(data):
+            neighbors.append({
+                "tbtt_offset": data[idx],
+                "bssid": ":".join(f"{b:02x}" for b in data[idx+1:idx+7]),
+                "short_ssid": int.from_bytes(data[idx+7:idx+11], "little"),
+                "bss_params": data[idx+11],
+                "psc_20mhz": data[idx+12],
+            })
+            idx += 13
+        return {"neighbors": neighbors, "count": len(neighbors)}
+
+    @staticmethod
+    def parse_vendor_specific(data: bytes) -> dict:
+        """Vendor-Specific IE (221), mit WMM/WPS/WPA1-Erkennung."""
+        if len(data) < 4:
+            return {"oui": data[:3].hex() if len(data) >= 3 else "", "type": -1}
+        oui = data[:3]
+        oui_type = data[3]
+        r = {"oui": oui.hex(), "type": oui_type, "len": len(data)}
+        if oui == b"\x00\x50\xf2" and oui_type == 2 and len(data) >= 7:
+            qos = data[4]
+            r["wmm"] = {
+                "qos_info": qos,
+                "uapsd": bool(qos & 0x80),
+                "num_ac": (qos >> 4) & 0x0F,
+                "ac_params": list(data[6:]),
+            }
+        elif oui == b"\x00\x50\xf2" and oui_type == 4:
+            r["wps_present"] = True
+        elif oui == b"\x00\x50\xf2" and oui_type == 1:
+            r["wpa1_present"] = True
+        return r
+
+    @staticmethod
+    def parse_ext_ie(data: bytes) -> dict:
+        """Erweiterte IE (ID 255). ext_id = data[0]."""
+        if not data:
+            return {}
+        ext_id = data[0]
+        body = data[1:]
+        r = {"ext_id": ext_id}
+        if ext_id == 35 and len(body) >= 17:
+            r["he_capabilities"] = IEEE80211IEParser._parse_he_cap(body)
+        elif ext_id == 36 and len(body) >= 3:
+            r["he_operation"] = IEEE80211IEParser._parse_he_op(body)
+        elif ext_id == 55 and len(body) >= 3:
+            r["multi_bssid"] = {"raw": list(body)}
+        elif ext_id == 106:
+            r["owe_transition"] = True
+        elif ext_id == 107:
+            r["twt"] = True
+        elif ext_id == 108:
+            r["sae_h2e"] = True
+        return r
+
+    @staticmethod
+    def _parse_he_cap(data: bytes) -> dict:
+        if len(data) < 17:
+            return {"raw": list(data)}
+        mac = int.from_bytes(data[0:6], "little")
+        phy = int.from_bytes(data[6:17], "little")
+        return {
+            "mac_cap": mac,
+            "phy_cap": phy,
+            "he_support": True,
+            "twt_requester": bool(mac & 0x02),
+            "twt_responder": bool(mac & 0x01),
+        }
+
+    @staticmethod
+    def _parse_he_op(data: bytes) -> dict:
+        params = int.from_bytes(data[0:3], "little")
+        return {
+            "params": params,
+            "bss_color": params & 0x3F,
+            "default_pe_duration": (params >> 6) & 0x07,
+            "twt_required": bool(params & 0x0200),
+            "vht_op_info_present": bool(params & 0x4000),
+            "co_hosted_bss": bool(params & 0x8000),
+        }
+    @staticmethod
+    def collect_from_packet(pkt) -> dict:
+        """DATA-2c: Sammelt alle dekodierten IEs aus einem Scapy-Paket.
+
+        Liefert dict[int, dict|list]:
+          - einzelne IE: dict
+          - mehrfach vorkommende IE-ID: Liste von dicts
+
+        Defensiv: bei fehlendem Scapy, leerem Paket oder ungueltigen
+        IE-Bytes wird ein leeres dict geliefert bzw. der betroffene
+        IE uebersprungen.
+        """
+        if not SCAPY_VERFÜGBAR or pkt is None:
+            return {}
+        try:
+            layer = pkt.getlayer(Dot11Elt)
+        except (AttributeError, TypeError):
+            return {}
+        if layer is None:
+            return {}
+        decoded: dict = {}
+        seen = set()
+        while (
+            layer is not None
+            and isinstance(layer, Dot11Elt)
+            and id(layer) not in seen
+        ):
+            seen.add(id(layer))
+            try:
+                ie_id = getattr(layer, "ID", None)
+                raw = getattr(layer, "info", b"")
+                if not isinstance(raw, bytes):
+                    try:
+                        raw = bytes(raw)
+                    except (TypeError, ValueError):
+                        raw = b""
+                if ie_id is not None:
+                    parsed = IEEE80211IEParser.parse_ie(int(ie_id), raw)
+                    if parsed is not None:
+                        if ie_id in decoded:
+                            existing = decoded[ie_id]
+                            if isinstance(existing, list):
+                                existing.append(parsed)
+                            else:
+                                decoded[ie_id] = [existing, parsed]
+                        else:
+                            decoded[ie_id] = parsed
+            except (IndexError, ValueError, AttributeError, TypeError):
+                pass
+            try:
+                layer = layer.payload
+            except AttributeError:
+                break
+        return decoded
+
+
+
+class MultiAdapterMixin:
+    """P5.1: Multi-Adapter-Tab, aus WLANUltimateGUI extrahiert.
+
+    Erwartet im Traeger:
+      self.tab_widget        : QTabWidget
+      self.logger            : logging.Logger
+      self.interface_manager : InterfaceManager
+    """
+
+    def create_multi_adapter_tab(self):
+        """v11.0: Multi-Adapter-Verwaltung."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        header = QLabel("🔀 Multi-Adapter-Verwaltung")
+        header.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
+        )
+        layout.addWidget(header)
+
+        info = QLabel(
+            "Erkennt alle WLAN-Adapter. Zeigt empfohlene Zuweisung "
+            "(z.B. 2.4 GHz + 5 GHz parallel)."
+        )
+        info.setStyleSheet("color:#bdc3c7;font-size:9pt;padding:4px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Buttons
+        ctrl = QHBoxLayout()
+        b_refresh = QPushButton("🔄 Adapter neu erkennen")
+        b_refresh.clicked.connect(self._ma_refresh)
+        ctrl.addWidget(b_refresh)
+        b_assign = QPushButton("📋 Zuweisung vorschlagen")
+        b_assign.clicked.connect(self._ma_assign)
+        ctrl.addWidget(b_assign)
+        ctrl.addStretch()
+        layout.addLayout(ctrl)
+
+        # Tabelle
+        self.ma_table = QTableWidget(0, 6)
+        self.ma_table.setHorizontalHeaderLabels(
+            [
+                "Interface",
+                "MAC",
+                "Chipset",
+                "Monitor",
+                "Injection",
+                "Empfohlene Aufgabe",
+            ]
+        )
+        self.ma_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.ma_table)
+
+        # Status
+        self.ma_status = QLabel("Bereit")
+        self.ma_status.setStyleSheet(
+            "color:#7f8c8d;padding:4px;background:#2d2d2d;border-radius:4px;"
+        )
+        layout.addWidget(self.ma_status)
+
+        # MultiAdapterManager
+        if not hasattr(self, "_multi_adapter"):
+            try:
+                self._multi_adapter = MultiAdapterManager(
+                    self.interface_manager, self.logger
+                )
+            except Exception:
+                self._multi_adapter = None
+
+        self.tab_widget.addTab(tab, "🔀 Multi-Adapter")
+        QTimer.singleShot(500, self._ma_refresh)
+
+    def _ma_refresh(self):
+        if not hasattr(self, "_multi_adapter") or not self._multi_adapter:
+            return
+        try:
+            adapters = self._multi_adapter.detect_adapters()
+            self.ma_table.setRowCount(0)
+            for ad in adapters:
+                row = self.ma_table.rowCount()
+                self.ma_table.insertRow(row)
+                self.ma_table.setItem(row, 0, QTableWidgetItem(ad["name"]))
+                self.ma_table.setItem(row, 1, QTableWidgetItem(ad["mac"]))
+                self.ma_table.setItem(row, 2, QTableWidgetItem(ad["chipset"]))
+                mi = QTableWidgetItem("✅" if ad["monitor"] else "❌")
+                self.ma_table.setItem(row, 3, mi)
+                ii = QTableWidgetItem("✅" if ad["injection"] else "❌")
+                self.ma_table.setItem(row, 4, ii)
+                self.ma_table.setItem(row, 5, QTableWidgetItem("—"))
+            self.ma_status.setText(str(len(adapters)) + " Adapter erkannt")
+            if hasattr(self, "_multi_adapter"):
+                self._ma_assign()
+        except Exception as e:
+            self.ma_status.setText("Fehler: " + str(e))
+
+    def _ma_assign(self):
+        if not hasattr(self, "_multi_adapter") or not self._multi_adapter:
+            return
+        try:
+            adapters = self._multi_adapter.detect_adapters()
+            assign = self._multi_adapter.get_recommended_assignment(adapters)
+            for row in range(self.ma_table.rowCount()):
+                item = self.ma_table.item(row, 0)
+                if item:
+                    name = item.text()
+                    task = assign.get(name, "—")
+                    self.ma_table.setItem(row, 5, QTableWidgetItem(task))
+        except Exception:
+            pass
+
+
+class VisualizationMixin:
+    """P5.2: Visualisierungs-Tab, aus WLANUltimateGUI extrahiert.
+
+    Erwartet im Traeger:
+      self.tab_widget          : QTabWidget
+      self.aktuelle_netzwerke  : list[WLANNetzwerk]
+
+    Erzeugt und liest intern (kein Traeger-Vertrag):
+      self.viz_display, self.viz_status
+    """
+
+    def create_visualization_tab(self):
+        """v11.6: Visualisierungs-Tab - garantiert sichtbar."""
+        tab = QWidget()
+        tab.setStyleSheet("background-color: #2b2b2b; color: #d4d4d4;")
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        header = QLabel("📊 Visualisierung & Diagramme")
+        header.setStyleSheet(
+            "font-size:18px;font-weight:bold;color:#2a82da;"
+            "padding:6px;background:#1e1e1e;border-radius:4px;"
+        )
+        layout.addWidget(header)
+
+        info = QLabel(
+            "Verschiedene Visualisierungen der WLAN-Daten. "
+            "Text-basiert (funktioniert auch ohne Matplotlib)."
+        )
+        info.setStyleSheet(
+            "color:#bdc3c7;font-size:10pt;padding:6px;"
+            "background:#2d2d2d;border-radius:4px;"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        buttons_group = QGroupBox("Verfuegbare Diagramme")
+        buttons_group.setStyleSheet(
+            "QGroupBox {color:#2a82da;font-weight:bold;"
+            "border:1px solid #444;border-radius:4px;margin-top:8px;"
+            "padding-top:8px;}"
+        )
+        bg_layout = QGridLayout()
+        btns = [
+            ("📈 Signal-Verteilung", self._viz_show_signal_dist),
+            ("📻 Kanal-Auslastung", self._viz_show_channels),
+            ("🕸️ Netzwerk-Topologie", self._viz_show_topology),
+            ("🔥 Signal-Heatmap", self._viz_show_heatmap),
+            ("📊 ASCII-Balken (Top 20)", self._viz_show_ascii_bars),
+            ("🗑️ Ausgabe leeren", self._viz_clear),
+        ]
+        for i, (label, fn) in enumerate(btns):
+            b = QPushButton(label)
+            b.setStyleSheet(
+                "QPushButton {background:#3a3a3a;color:#d4d4d4;"
+                "border:1px solid #555;padding:8px;border-radius:3px;"
+                "text-align:left;font-size:10pt;}"
+                "QPushButton:hover {background:#2a82da;color:white;}"
+            )
+            b.clicked.connect(fn)
+            bg_layout.addWidget(b, i // 2, i % 2)
+        buttons_group.setLayout(bg_layout)
+        layout.addWidget(buttons_group)
+
+        self.viz_display = QTextEdit()
+        self.viz_display.setReadOnly(True)
+        self.viz_display.setMinimumHeight(250)
+        self.viz_display.setStyleSheet(
+            "background:#1a1a1a;color:#d4d4d4;"
+            "font-family:monospace;font-size:10pt;"
+            "border:1px solid #444;padding:8px;"
+        )
+        self.viz_display.setPlainText(
+            "Willkommen im Visualisierungs-Tab!\n\n"
+            "Klick einen Button, um eine Visualisierung zu erzeugen.\n"
+            "Voraussetzung: Erst einen Scan durchfuehren."
+        )
+        layout.addWidget(self.viz_display, 1)
+
+        self.viz_status = QLabel("Bereit")
+        self.viz_status.setStyleSheet(
+            "color:#7f8c8d;padding:6px;background:#1e1e1e;border-radius:4px;"
+        )
+        layout.addWidget(self.viz_status)
+
+        self.tab_widget.addTab(tab, "📊 Visualisierung")
+
+    def _viz_clear(self):
+        try:
+            self.viz_display.clear()
+            self.viz_status.setText("Geleert")
+        except Exception:
+            pass
+
+    def _viz_show_signal_dist(self):
+        try:
+            nets = self.aktuelle_netzwerke
+            if not nets:
+                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
+                return
+            lines = ["=== SIGNAL-VERTEILUNG ===", ""]
+            buckets = {}
+            for n in nets:
+                s = n.signal_stärke or -100
+                b = (s // 5) * 5
+                buckets[b] = buckets.get(b, 0) + 1
+            for b in sorted(buckets.keys(), reverse=True):
+                v = buckets[b]
+                bar = "#" * v
+                lines.append(f"  {b:>5} bis {b+4:>5} dBm: {bar} ({v})")
+            self.viz_display.setPlainText("\n".join(lines))
+            self.viz_status.setText(f"Verteilung: {len(buckets)} Buckets")
+        except Exception as e:
+            self.viz_display.setPlainText("Fehler: " + str(e))
+
+    def _viz_show_channels(self):
+        try:
+            nets = self.aktuelle_netzwerke
+            if not nets:
+                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
+                return
+            lines = ["=== KANAL-AUSLASTUNG ===", ""]
+            ch_sig = {}
+            for n in nets:
+                ch_sig.setdefault(n.kanal, []).append(n.signal_stärke or -100)
+            for ch in sorted(ch_sig.keys()):
+                sigs = ch_sig[ch]
+                avg = sum(sigs) / len(sigs)
+                band = "2.4" if ch <= 14 else "5" if ch < 200 else "6"
+                bar = "#" * len(sigs)
+                lines.append(
+                    f"  Kanal {ch:>3} ({band}G): {bar} ({len(sigs)} APs, avg {avg:.0f} dBm)"
+                )
+            self.viz_display.setPlainText("\n".join(lines))
+            self.viz_status.setText(f"{len(ch_sig)} Kanaele")
+        except Exception as e:
+            self.viz_display.setPlainText("Fehler: " + str(e))
+
+    def _viz_show_topology(self):
+        try:
+            nets = self.aktuelle_netzwerke
+            if not nets:
+                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
+                return
+            lines = ["=== NETZWERK-TOPOLOGIE ===", ""]
+            vendors = {}
+            for n in nets:
+                v = n.hersteller or "Unbekannt"
+                vendors.setdefault(v, []).append(n)
+            for vendor, vnets in sorted(vendors.items(), key=lambda x: -len(x[1])):
+                lines.append(f"[{vendor}] ({len(vnets)} APs):")
+                for n in vnets[:5]:
+                    lines.append(f"   - {str(n.ssid)[:30]:<30} ({n.bssid}) K{n.kanal}")
+                if len(vnets) > 5:
+                    lines.append(f"   ... und {len(vnets)-5} weitere")
+                lines.append("")
+            self.viz_display.setPlainText("\n".join(lines))
+            self.viz_status.setText(f"{len(vendors)} Hersteller")
+        except Exception as e:
+            self.viz_display.setPlainText("Fehler: " + str(e))
+
+    def _viz_show_heatmap(self):
+        try:
+            nets = self.aktuelle_netzwerke
+            if not nets:
+                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
+                return
+            lines = ["=== SIGNAL-HEATMAP ===", ""]
+            for n in sorted(nets, key=lambda x: x.signal_stärke or -100, reverse=True)[
+                :30
+            ]:
+                s = n.signal_stärke or -100
+                if s > -50:
+                    marker = "#"
+                elif s > -60:
+                    marker = "+"
+                elif s > -70:
+                    marker = "-"
+                else:
+                    marker = "."
+                width = max(1, min(60, (s + 100)))
+                bar = marker * width
+                lines.append(f"  {s:>4}dBm {bar}  {str(n.ssid)[:25]}")
+            self.viz_display.setPlainText("\n".join(lines))
+            self.viz_status.setText(f"Heatmap: {len(nets)} Netzwerke")
+        except Exception as e:
+            self.viz_display.setPlainText("Fehler: " + str(e))
+
+    def _viz_show_ascii_bars(self):
+        try:
+            nets = self.aktuelle_netzwerke
+            if not nets:
+                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
+                return
+            lines = ["=== ASCII-BALKEN (Top 20) ===", ""]
+            for n in sorted(nets, key=lambda x: x.signal_stärke or -100, reverse=True)[
+                :20
+            ]:
+                s = n.signal_stärke or -100
+                width = max(1, (s + 100))
+                bar = "#" * min(width, 70)
+                lines.append(f"  {str(n.ssid)[:20]:<20} |{bar}| {s} dBm")
+            self.viz_display.setPlainText("\n".join(lines))
+            self.viz_status.setText(f"{min(20, len(nets))} Netzwerke dargestellt")
+        except Exception as e:
+            self.viz_display.setPlainText("Fehler: " + str(e))
+
+
+class BpfMixin:
+    """P5.3: BPF-Filter-Tab, aus WLANUltimateGUI extrahiert.
+
+    Erwartet im Traeger:
+      self.tab_widget        : QTabWidget
+      self.interface_manager : InterfaceManager
+
+    Erzeugt und liest intern:
+      self.bpf_edit, self.bpf_output
+    """
+
+    def create_bpf_filter_tab(self):
+        """v10.2: BPF-Filter-Builder für tcpdump."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        header = QLabel("🔬 BPF-Filter-Builder")
+        header.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
+        )
+        layout.addWidget(header)
+        info = QLabel(
+            "Erstellt BPF-Filter für tcpdump/Wireshark. "
+            "Fertige Templates + manueller Filter."
+        )
+        info.setStyleSheet("color:#bdc3c7;font-size:9pt;padding:4px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Presets
+        preset_group = QGroupBox("Vorlagen")
+        preset_layout = QGridLayout()
+        presets = [
+            ("Beacons only", "wlan type mgt subtype beacon"),
+            ("Probe-Requests", "wlan type mgt subtype probe-req"),
+            ("Probe-Responses", "wlan type mgt subtype probe-resp"),
+            ("Data-Frames", "wlan type data"),
+            ("Management", "wlan type mgt"),
+            ("Control", "wlan type ctl"),
+            ("EAPOL only", "wlan type data and ether proto 0x888e"),
+            ("Deauth", "wlan type mgt subtype deauth"),
+            ("Assoc-Req", "wlan type mgt subtype assoc-req"),
+            ("Auth", "wlan type mgt subtype auth"),
+            ("Von BSSID", "wlan addr3 == XX:XX:XX:XX:XX:XX"),
+            ("Nur 5 GHz", "wlan type mgt and wlan[0] & 0x03 == 0x80"),
+        ]
+        for i, (name, bpf) in enumerate(presets):
+            b = QPushButton(name)
+            b.setToolTip(bpf)
+            b.clicked.connect(lambda _, f=bpf: self._bpf_set_filter(f))
+            preset_layout.addWidget(b, i // 4, i % 4)
+        preset_group.setLayout(preset_layout)
+        layout.addWidget(preset_group)
+
+        # Manueller Filter
+        man_group = QGroupBox("Manueller BPF")
+        man_layout = QVBoxLayout()
+        self.bpf_edit = QLineEdit()
+        self.bpf_edit.setPlaceholderText("z.B. wlan addr1 == AA:BB:CC:DD:EE:FF")
+        man_layout.addWidget(self.bpf_edit)
+        btn_row = QHBoxLayout()
+        b_apply = QPushButton("📋 In Zwischenablage kopieren")
+        b_apply.clicked.connect(self._bpf_copy)
+        btn_row.addWidget(b_apply)
+        b_test = QPushButton("🧪 Test mit tcpdump (5s)")
+        b_apply.setToolTip("Filter in die Zwischenablage kopieren")
+        b_test.clicked.connect(self._bpf_test)
+        btn_row.addWidget(b_test)
+        btn_row.addStretch()
+        man_layout.addLayout(btn_row)
+        man_group.setLayout(man_layout)
+        layout.addWidget(man_group)
+
+        # Ausgabe
+        self.bpf_output = QTextEdit()
+        self.bpf_output.setReadOnly(True)
+        self.bpf_output.setMaximumHeight(200)
+        self.bpf_output.setStyleSheet(
+            "background:#1a1a1a;color:#d4d4d4;font-family:monospace;"
+        )
+        layout.addWidget(self.bpf_output)
+
+        self.tab_widget.addTab(tab, "🔬 BPF-Filter")
+
+    def _bpf_set_filter(self, bpf: str):
+        try:
+            self.bpf_edit.setText(bpf)
+            self.bpf_output.append("Filter gesetzt: " + bpf)
+        except Exception:
+            pass
+
+    def _bpf_copy(self):
+        try:
+            from PyQt6.QtWidgets import QApplication
+
+            QApplication.clipboard().setText(self.bpf_edit.text())
+            self.bpf_output.append("✅ In Zwischenablage kopiert")
+        except Exception as e:
+            self.bpf_output.append("Fehler: " + str(e))
+
+    def _bpf_test(self):
+        bpf = self.bpf_edit.text().strip()
+        if not bpf:
+            return
+        # Test mit tcpdump 5s
+        try:
+            iface = "wlan0"
+            try:
+                active = self.interface_manager.aktives_interface
+                if active:
+                    iface = active.name
+            except Exception:
+                pass
+            self.bpf_output.append("Test: tcpdump -i " + iface + " -c 5 '" + bpf + "'")
+            rc, out, err = CommandRunner.run(
+                ["timeout", "5", "tcpdump", "-i", iface, "-c", "5", "-nn", bpf],
+                subsystem="support",
+                tag="bpf-test",
+                soft_fail=True,
+                timeout=10,
+            )
+            for line in out.splitlines()[:20]:
+                self.bpf_output.append(line)
+            if err:
+                self.bpf_output.append("stderr: " + err[:200])
+        except Exception as e:
+            self.bpf_output.append("Test-Fehler: " + str(e))
+
+
+class NotesMixin:
+    """P5.4: Notizen-Tab, aus WLANUltimateGUI extrahiert.
+
+    Erwartet im Traeger:
+      self.tab_widget          : QTabWidget
+      self.aktuelle_netzwerke  : list[WLANNetzwerk]
+
+    Erzeugt und liest intern:
+      self._notes_mgr, self.notes_combo,
+      self.notes_edit, self.notes_status
+    """
+
+    def create_notes_tab(self):
+        """v10.3: Notizen pro BSSID."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        header = QLabel("📝 Notizen pro Netzwerk")
+        header.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
+        )
+        layout.addWidget(header)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Netzwerk:"))
+        self.notes_combo = QComboBox()
+        row.addWidget(self.notes_combo, 1)
+        b_reload = QPushButton("🔄 Netzwerke laden")
+        b_reload.clicked.connect(self._notes_reload_networks)
+        row.addWidget(b_reload)
+        layout.addLayout(row)
+
+        self.notes_edit = QTextEdit()
+        self.notes_edit.setPlaceholderText(
+            "Notizen zu diesem Netzwerk...\n\n"
+            "z.B.:\n"
+            "- Router-Modell erkannt\n"
+            "- Passwort-Hinweise\n"
+            "- Schwachstellen gefunden\n"
+            "- Owner-Kontakt\n"
+            "- Letzter Angriff: ..."
+        )
+        layout.addWidget(self.notes_edit)
+
+        btn_row = QHBoxLayout()
+        b_save = QPushButton("💾 Speichern")
+        b_save.clicked.connect(self._notes_save)
+        btn_row.addWidget(b_save)
+        b_clear = QPushButton("🗑️ Leeren")
+        b_clear.clicked.connect(lambda: self.notes_edit.clear())
+        btn_row.addWidget(b_clear)
+        btn_row.addStretch()
+        self.notes_status = QLabel("Bereit")
+        self.notes_status.setStyleSheet("color:#7f8c8d;")
+        btn_row.addWidget(self.notes_status)
+        layout.addLayout(btn_row)
+
+        # NotesManager
+        try:
+            self._notes_mgr = NotesManager()
+        except Exception:
+            self._notes_mgr = None
+        QTimer.singleShot(500, self._notes_reload_networks)
+        self.tab_widget.addTab(tab, "📝 Notizen")
+
+    def _notes_reload_networks(self):
+        try:
+            self.notes_combo.clear()
+            for n in self.aktuelle_netzwerke[:300]:
+                display = str(n.ssid or "<hidden>")[:30] + " | " + str(n.bssid)
+                self.notes_combo.addItem(display, n.bssid)
+            self.notes_status.setText(str(len(self.aktuelle_netzwerke)) + " Netzwerke")
+        except Exception:
+            pass
+
+    def _notes_save(self):
+        try:
+            if not self._notes_mgr:
+                self.notes_status.setText("NotesManager fehlt")
+                return
+            bssid = self.notes_combo.currentData()
+            if not bssid:
+                return
+            text = self.notes_edit.toPlainText()
+            self._notes_mgr.set(bssid, text)
+            self.notes_status.setText("✅ Gespeichert für " + str(bssid))
+        except Exception as e:
+            self.notes_status.setText("Fehler: " + str(e))
+
+
+class CustomCmdMixin:
+    """P5.5: Custom-Command-Tab, aus WLANUltimateGUI extrahiert.
+
+    Erwartet im Traeger:
+      self.tab_widget          : QTabWidget
+      self.interface_manager   : InterfaceManager
+      self.network_table       : QTableWidget
+      self.aktuelle_netzwerke  : list[WLANNetzwerk]
+
+    Erzeugt und liest intern:
+      self._cmd_process, self.cmd_edit, self.cmd_output,
+      self.cmd_preset_combo, self.cmd_status
+
+    Nutzt Top-Level-Helfer: _thread_wrap.
+    """
+
+    def create_custom_cmd_tab(self):
+        """v10.3: Custom-Command-Runner."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        header = QLabel("🎮 Custom-Command-Runner")
+        header.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
+        )
+        layout.addWidget(header)
+        info = QLabel(
+            "Führe beliebige Shell-Befehle aus. Nutze Platzhalter:\n"
+            "  {iface}   - aktives Interface\n"
+            "  {bssid}   - BSSID des gewählten Netzwerks\n"
+            "  {ssid}    - SSID des gewählten Netzwerks\n"
+            "  {channel} - Kanal des gewählten Netzwerks"
+        )
+        info.setStyleSheet(
+            "color:#bdc3c7;font-size:9pt;padding:4px;"
+            "background:#2d2d2d;border-radius:4px;"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Presets
+        presets_row = QHBoxLayout()
+        self.cmd_preset_combo = QComboBox()
+        self.cmd_preset_combo.addItem("-- Preset wählen --", "")
+        presets = [
+            (
+                "Alle Beacons sniffen (30s)",
+                "timeout 30 tcpdump -i {iface} -c 200 'wlan type mgt subtype beacon'",
+            ),
+            (
+                "Alle Probe-Reqs (30s)",
+                "timeout 30 tcpdump -i {iface} -c 100 'wlan type mgt subtype probe-req'",
+            ),
+            ("ARP-Tabelle zeigen", "arp -an"),
+            ("Routing-Tabelle", "ip route"),
+            ("Interface-Details", "iw dev {iface} info"),
+            ("Link-Qualität", "iw dev {iface} link"),
+            ("Alle Sockets", "ss -tulpn"),
+            ("USB-Geräte", "lsusb"),
+            ("Dmesg WLAN (letzte 20)", "dmesg | grep -iE 'wlan|8812|rtl' | tail -20"),
+            ("Kernel-Module WLAN", "lsmod | grep -E '8812|rtl|ath|mt76|iwl'"),
+        ]
+        for name, cmd in presets:
+            self.cmd_preset_combo.addItem(name, cmd)
+        self.cmd_preset_combo.currentIndexChanged.connect(self._custom_cmd_load_preset)
+        presets_row.addWidget(QLabel("Preset:"))
+        presets_row.addWidget(self.cmd_preset_combo, 1)
+        layout.addLayout(presets_row)
+
+        # Eingabe
+        self.cmd_edit = QPlainTextEdit()
+        self.cmd_edit.setPlaceholderText("Shell-Befehl hier eingeben...")
+        self.cmd_edit.setMaximumHeight(80)
+        layout.addWidget(self.cmd_edit)
+
+        btn_row = QHBoxLayout()
+        b_run = QPushButton("▶️ Ausführen")
+        b_run.clicked.connect(self._custom_cmd_run)
+        btn_row.addWidget(b_run)
+        b_stop = QPushButton("⏹️ Stop")
+        b_stop.clicked.connect(self._custom_cmd_stop)
+        btn_row.addWidget(b_stop)
+        btn_row.addStretch()
+        self.cmd_status = QLabel("Bereit")
+        self.cmd_status.setStyleSheet("color:#7f8c8d;")
+        btn_row.addWidget(self.cmd_status)
+        layout.addLayout(btn_row)
+
+        # Output
+        self.cmd_output = QTextEdit()
+        self.cmd_output.setReadOnly(True)
+        self.cmd_output.setStyleSheet(
+            "background:#1a1a1a;color:#d4d4d4;font-family:monospace;"
+        )
+        layout.addWidget(self.cmd_output)
+
+        self._cmd_process = None
+        self.tab_widget.addTab(tab, "🎮 Custom-Commands")
+
+    def _custom_cmd_load_preset(self, index):
+        try:
+            cmd = self.cmd_preset_combo.currentData()
+            if cmd:
+                self.cmd_edit.setPlainText(cmd)
+        except Exception:
+            pass
+
+    def _custom_cmd_expand(self, cmd: str) -> str:
+        try:
+            iface = "wlan0"
+            active = self.interface_manager.aktives_interface
+            if active:
+                iface = active.name
+        except Exception:
+            iface = "wlan0"
+        bssid = "{bssid}"
+        ssid = "{ssid}"
+        ch = "0"
+        try:
+            row = self.network_table.currentRow()
+            if row >= 0 and row < len(self.aktuelle_netzwerke):
+                n = self.aktuelle_netzwerke[row]
+                bssid = n.bssid
+                ssid = n.ssid or "<hidden>"
+                ch = str(n.kanal)
+        except Exception:
+            pass
+        return (
+            cmd.replace("{iface}", iface)
+            .replace("{bssid}", bssid)
+            .replace("{ssid}", ssid)
+            .replace("{channel}", ch)
+        )
+
+    def _custom_cmd_run(self):
+        cmd_raw = self.cmd_edit.toPlainText().strip()
+        if not cmd_raw:
+            return
+        cmd = self._custom_cmd_expand(cmd_raw)
+        self.cmd_output.append("═" * 60)
+        self.cmd_output.append("▶ " + cmd)
+        self.cmd_output.append("─" * 60)
+        try:
+            # Nutzer-Terminal: eingegebene Befehle bewusst durch
+            # die Shell laufen lassen (Feature, kein Bug).
+            self._cmd_process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            self.cmd_status.setText("⏳ läuft...")
+
+            # Reader-Thread
+            def _read():
+                try:
+                    if self._cmd_process and self._cmd_process.stdout:
+                        for line in self._cmd_process.stdout:
+                            QTimer.singleShot(
+                                0, lambda l=line: self.cmd_output.append(l.rstrip())
+                            )
+                        self._cmd_process.wait()
+                except Exception:
+                    pass
+                rc = self._cmd_process.returncode if self._cmd_process else -1
+                QTimer.singleShot(
+                    0, lambda: self.cmd_status.setText(f"✅ Fertig (rc={rc})")
+                )
+
+            threading.Thread(target=_thread_wrap(_read, "anon-63963"), daemon=True).start()
+        except Exception as e:
+            self.cmd_output.append("❌ " + str(e))
+
+    def _custom_cmd_stop(self):
+        try:
+            if self._cmd_process and self._cmd_process.poll() is None:
+                self._cmd_process.terminate()
+                self.cmd_status.setText("⏹️ gestoppt")
+        except Exception:
+            pass
+
+
+class WatchlistMixin:
+    """P5.6: Watchlist-Tab, aus WLANUltimateGUI extrahiert.
+
+    Erwartet im Traeger:
+      self.tab_widget          : QTabWidget
+      self.network_table       : QTableWidget
+      self.aktuelle_netzwerke  : list[WLANNetzwerk]
+      self.logger              : logging.Logger
+      self.status_label        : QLabel
+      self.tray_icon           : QSystemTrayIcon | None
+
+    Erzeugt und liest intern:
+      self._watchlist_mgr, self.sound_alerts,
+      self.wl_table, self.wl_alerts, self.wl_bssid_edit,
+      self.wl_reason_edit, self.wl_prio_spin,
+      self.wl_sound_check, self.wl_notify_check
+    """
+
+    def create_watchlist_tab(self):
+        """v11.0: Watchlist mit Alerts."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        header = QLabel("👁️ Watchlist - BSSID-Überwachung")
+        header.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
+        )
+        layout.addWidget(header)
+
+        info = QLabel(
+            "Überwacht ausgewählte BSSIDs. Bei Erscheinen: "
+            "Alarm + Log + optional Sound."
+        )
+        info.setStyleSheet("color:#bdc3c7;font-size:9pt;padding:4px;")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # Steuerung
+        ctrl = QHBoxLayout()
+        ctrl.addWidget(QLabel("BSSID:"))
+        self.wl_bssid_edit = QLineEdit()
+        self.wl_bssid_edit.setPlaceholderText("AA:BB:CC:DD:EE:FF")
+        ctrl.addWidget(self.wl_bssid_edit, 2)
+        ctrl.addWidget(QLabel("Grund:"))
+        self.wl_reason_edit = QLineEdit()
+        self.wl_reason_edit.setPlaceholderText("z.B. Verdächtig, Kunde, Eigener AP")
+        ctrl.addWidget(self.wl_reason_edit, 2)
+        ctrl.addWidget(QLabel("Prio:"))
+        self.wl_prio_spin = QSpinBox()
+        self.wl_prio_spin.setRange(1, 5)
+        self.wl_prio_spin.setValue(3)
+        ctrl.addWidget(self.wl_prio_spin)
+        b_add = QPushButton("➕ Hinzufügen")
+        b_add.clicked.connect(self._wl_add)
+        ctrl.addWidget(b_add)
+        b_from_sel = QPushButton("📡 Aus Auswahl")
+        b_from_sel.clicked.connect(self._wl_add_from_selection)
+        ctrl.addWidget(b_from_sel)
+        layout.addLayout(ctrl)
+
+        # Actions
+        actions = QHBoxLayout()
+        b_clear = QPushButton("🗑️ Alle entfernen")
+        b_clear.clicked.connect(self._wl_clear)
+        actions.addWidget(b_clear)
+        b_export = QPushButton("💾 Export JSON")
+        b_export.clicked.connect(self._wl_export)
+        actions.addWidget(b_export)
+        b_import = QPushButton("📂 Import JSON")
+        b_import.clicked.connect(self._wl_import)
+        actions.addWidget(b_import)
+        self.wl_sound_check = QCheckBox("🔊 Sound bei Treffer")
+        self.wl_sound_check.setChecked(True)
+        actions.addWidget(self.wl_sound_check)
+        self.wl_notify_check = QCheckBox("🔔 Desktop-Notification")
+        self.wl_notify_check.setChecked(True)
+        actions.addWidget(self.wl_notify_check)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        # Tabelle
+        self.wl_table = QTableWidget(0, 6)
+        self.wl_table.setHorizontalHeaderLabels(
+            [
+                "BSSID",
+                "SSID",
+                "Grund",
+                "Prio",
+                "Sichtungen",
+                "Letzte Sichtung",
+            ]
+        )
+        self.wl_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        layout.addWidget(self.wl_table)
+
+        # Alert-Log
+        alert_group = QGroupBox("🚨 Alert-Log")
+        alert_layout = QVBoxLayout()
+        self.wl_alerts = QTextEdit()
+        self.wl_alerts.setReadOnly(True)
+        self.wl_alerts.setMaximumHeight(150)
+        self.wl_alerts.setStyleSheet(
+            "background:#1a1a1a;color:#d4d4d4;font-family:monospace;"
+        )
+        alert_layout.addWidget(self.wl_alerts)
+        alert_group.setLayout(alert_layout)
+        layout.addWidget(alert_group)
+
+        # WatchlistManager
+        if not hasattr(self, "_watchlist_mgr"):
+            try:
+                self._watchlist_mgr = WatchlistManager()
+                self._watchlist_mgr.register_callback(self._wl_alert)
+            except Exception as e:
+                self._watchlist_mgr = None
+                self.logger.warning("WatchlistManager: " + str(e))
+
+        # Sound-Alerts
+        if not hasattr(self, "sound_alerts"):
+            try:
+                self.sound_alerts = SoundAlerts(enabled=False)
+            except Exception:
+                self.sound_alerts = None
+
+        self.tab_widget.addTab(tab, "👁️ Watchlist")
+        QTimer.singleShot(500, self._wl_refresh)
+
+    def _wl_add(self):
+        if not self._watchlist_mgr:
+            return
+        bssid = self.wl_bssid_edit.text().strip()
+        if not bssid:
+            QMessageBox.warning(self, "Keine BSSID", "Bitte BSSID eingeben.")
+            return
+        self._watchlist_mgr.add(
+            bssid, "", self.wl_reason_edit.text().strip(), self.wl_prio_spin.value()
+        )
+        self.wl_bssid_edit.clear()
+        self.wl_reason_edit.clear()
+        self._wl_refresh()
+
+    def _wl_add_from_selection(self):
+        if not self._watchlist_mgr:
+            return
+        try:
+            row = self.network_table.currentRow()
+            if row < 0 or row >= len(self.aktuelle_netzwerke):
+                QMessageBox.information(
+                    self,
+                    "Keine Auswahl",
+                    "Bitte in Netzwerke-Tabelle ein Netzwerk wählen.",
+                )
+                return
+            n = self.aktuelle_netzwerke[row]
+            self._watchlist_mgr.add(
+                n.bssid,
+                n.ssid or "",
+                self.wl_reason_edit.text().strip() or "Aus Auswahl",
+                self.wl_prio_spin.value(),
+            )
+            self._wl_refresh()
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+
+    def _wl_clear(self):
+        if not self._watchlist_mgr:
+            return
+        r = QMessageBox.question(
+            self,
+            "Liste leeren",
+            "Alle Watchlist-Einträge entfernen?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if r == QMessageBox.StandardButton.Yes:
+            self._watchlist_mgr.clear()
+            self._wl_refresh()
+
+    def _wl_export(self):
+        if not self._watchlist_mgr:
+            return
+        fn, _ = QFileDialog.getSaveFileName(
+            self, "Watchlist exportieren", "watchlist.json", "JSON (*.json)"
+        )
+        if not fn:
+            return
+        try:
+            data = [e.to_dict() for e in self._watchlist_mgr.get_all()]
+            Path(fn).write_text(
+                json.dumps(data, indent=2, default=str), encoding="utf-8"
+            )
+            QMessageBox.information(self, "Export", "Gespeichert: " + fn)
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+
+    def _wl_import(self):
+        if not self._watchlist_mgr:
+            return
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "Watchlist importieren", "", "JSON (*.json)"
+        )
+        if not fn:
+            return
+        try:
+            data = json.loads(Path(fn).read_text(encoding="utf-8"))
+            for d in data:
+                e = WatchlistEntry.from_dict(d)
+                self._watchlist_mgr._entries[e.bssid] = e
+            self._watchlist_mgr._save()
+            self._wl_refresh()
+            QMessageBox.information(
+                self, "Import", str(len(data)) + " Einträge geladen."
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Fehler", str(e))
+
+    def _wl_refresh(self):
+        if not hasattr(self, "_watchlist_mgr") or not self._watchlist_mgr:
+            return
+        try:
+            entries = self._watchlist_mgr.get_all()
+            self.wl_table.setRowCount(0)
+            for e in sorted(entries, key=lambda x: -x.priority):
+                row = self.wl_table.rowCount()
+                self.wl_table.insertRow(row)
+                self.wl_table.setItem(row, 0, QTableWidgetItem(e.bssid))
+                self.wl_table.setItem(row, 1, QTableWidgetItem(e.ssid))
+                self.wl_table.setItem(row, 2, QTableWidgetItem(e.reason))
+                pi = QTableWidgetItem(str(e.priority))
+                if e.priority >= 4:
+                    pi.setForeground(QBrush(QColor(231, 76, 60)))
+                elif e.priority >= 3:
+                    pi.setForeground(QBrush(QColor(243, 156, 18)))
+                self.wl_table.setItem(row, 3, pi)
+                self.wl_table.setItem(row, 4, QTableWidgetItem(str(e.seen_count)))
+                self.wl_table.setItem(
+                    row,
+                    5,
+                    QTableWidgetItem(
+                        e.last_seen.strftime("%H:%M:%S") if e.last_seen else "—"
+                    ),
+                )
+        except Exception:
+            pass
+
+    def _wl_alert(self, entry, signal):
+        """v11.0: Alert-Callback wenn Watchlist-Treffer."""
+        try:
+            ts = datetime.now().strftime("%H:%M:%S")
+            msg = (
+                "["
+                + ts
+                + "] 🚨 TREFFER: "
+                + entry.bssid
+                + " ("
+                + (entry.ssid or "?")
+                + ")"
+                + " | Prio "
+                + str(entry.priority)
+                + " | Signal "
+                + str(signal)
+                + " dBm"
+                + " | Grund: "
+                + entry.reason
+            )
+            try:
+                self.wl_alerts.append(msg)
+            except Exception:
+                pass
+            self.logger.warning("Watchlist-Treffer: " + msg)
+            # Sound
+            if hasattr(self, "wl_sound_check") and self.wl_sound_check.isChecked():
+                if self.sound_alerts:
+                    if entry.priority >= 4:
+                        self.sound_alerts.alert_high_severity()
+                    else:
+                        self.sound_alerts.beep(1)
+            # Desktop-Notification
+            if (
+                hasattr(self, "wl_notify_check")
+                and self.wl_notify_check.isChecked()
+                and hasattr(self, "tray_icon")
+                and self.tray_icon
+            ):
+                try:
+                    self.tray_icon.showMessage(
+                        "Watchlist-Treffer!",
+                        entry.bssid + " (" + entry.ssid + ")",
+                        QSystemTrayIcon.MessageIcon.Warning,
+                        5000,
+                    )
+                except Exception:
+                    pass
+            # GUI-Status
+            try:
+                self.status_label.setText("🚨 Watchlist: " + entry.bssid)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+
+class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixin, CustomCmdMixin, WatchlistMixin, QMainWindow):
     """
     Hauptfenster der WLAN Ultimate Security Suite.
 
@@ -64686,22 +67198,72 @@ class WLANUltimateGUI(QMainWindow):
             if not usb_ids:
                 return
             cmp = AdapterCompare.compare(usb_ids)
+            if not cmp["columns"]:
+                return
             t = self.hw_compare_table
             t.setRowCount(0)
             t.setColumnCount(len(cmp["columns"]) + 1)
             hdr = ["Merkmal"] + [name for _uid, name in cmp["columns"]]
             t.setHorizontalHeaderLabels(hdr)
+
+            # Score-Zeile oben
+            r = t.rowCount()
+            t.insertRow(r)
+            score_item = QTableWidgetItem("Score")
+            score_item.setForeground(QBrush(QColor(42, 130, 218)))
+            t.setItem(r, 0, score_item)
+            for i, (_uid, _name, sc, rating) in enumerate(
+                cmp["scores"], start=1
+            ):
+                txt = f"{sc}/100  {rating}"
+                item = QTableWidgetItem(txt)
+                try:
+                    if sc >= 85:
+                        item.setForeground(QBrush(QColor(39, 174, 96)))
+                    elif sc >= 55:
+                        item.setForeground(QBrush(QColor(243, 156, 18)))
+                    else:
+                        item.setForeground(QBrush(QColor(231, 76, 60)))
+                except (NameError, AttributeError):
+                    pass
+                t.setItem(r, i, item)
+
+            # Gruppen und Daten-Zeilen
             for row in cmp["rows"]:
                 r = t.rowCount()
                 t.insertRow(r)
+                if row.get("type") == "group":
+                    grp = QTableWidgetItem(f"-- {row['label']} --")
+                    try:
+                        grp.setForeground(QBrush(QColor(127, 140, 141)))
+                    except (NameError, AttributeError):
+                        pass
+                    t.setItem(r, 0, grp)
+                    for i in range(1, len(cmp["columns"]) + 1):
+                        t.setItem(r, i, QTableWidgetItem(""))
+                    continue
                 t.setItem(r, 0, QTableWidgetItem(row["label"]))
                 for i, cell in enumerate(row["cells"], start=1):
                     txt = cell["text"]
                     if cell["best"]:
                         txt = "* " + txt
                     item = QTableWidgetItem(txt)
+                    if cell["best"]:
+                        try:
+                            item.setForeground(
+                                QBrush(QColor(39, 174, 96))
+                            )
+                        except (NameError, AttributeError):
+                            pass
                     t.setItem(r, i, item)
-        except (AttributeError, RuntimeError, NameError) as exc:
+            try:
+                t.resizeColumnsToContents()
+            except (RuntimeError, AttributeError):
+                pass
+        except (
+            AttributeError, RuntimeError, NameError,
+            KeyError, TypeError, IndexError,
+        ) as exc:
             self.logger.debug("hw_compare_run: " + str(exc))
 
     def create_network_tab(self):
@@ -66149,364 +68711,6 @@ class WLANUltimateGUI(QMainWindow):
         except Exception as e:
             QMessageBox.warning(self, "Fehler", str(e))
 
-    def create_bpf_filter_tab(self):
-        """v10.2: BPF-Filter-Builder für tcpdump."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        header = QLabel("🔬 BPF-Filter-Builder")
-        header.setStyleSheet(
-            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
-        )
-        layout.addWidget(header)
-        info = QLabel(
-            "Erstellt BPF-Filter für tcpdump/Wireshark. "
-            "Fertige Templates + manueller Filter."
-        )
-        info.setStyleSheet("color:#bdc3c7;font-size:9pt;padding:4px;")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Presets
-        preset_group = QGroupBox("Vorlagen")
-        preset_layout = QGridLayout()
-        presets = [
-            ("Beacons only", "wlan type mgt subtype beacon"),
-            ("Probe-Requests", "wlan type mgt subtype probe-req"),
-            ("Probe-Responses", "wlan type mgt subtype probe-resp"),
-            ("Data-Frames", "wlan type data"),
-            ("Management", "wlan type mgt"),
-            ("Control", "wlan type ctl"),
-            ("EAPOL only", "wlan type data and ether proto 0x888e"),
-            ("Deauth", "wlan type mgt subtype deauth"),
-            ("Assoc-Req", "wlan type mgt subtype assoc-req"),
-            ("Auth", "wlan type mgt subtype auth"),
-            ("Von BSSID", "wlan addr3 == XX:XX:XX:XX:XX:XX"),
-            ("Nur 5 GHz", "wlan type mgt and wlan[0] & 0x03 == 0x80"),
-        ]
-        for i, (name, bpf) in enumerate(presets):
-            b = QPushButton(name)
-            b.setToolTip(bpf)
-            b.clicked.connect(lambda _, f=bpf: self._bpf_set_filter(f))
-            preset_layout.addWidget(b, i // 4, i % 4)
-        preset_group.setLayout(preset_layout)
-        layout.addWidget(preset_group)
-
-        # Manueller Filter
-        man_group = QGroupBox("Manueller BPF")
-        man_layout = QVBoxLayout()
-        self.bpf_edit = QLineEdit()
-        self.bpf_edit.setPlaceholderText("z.B. wlan addr1 == AA:BB:CC:DD:EE:FF")
-        man_layout.addWidget(self.bpf_edit)
-        btn_row = QHBoxLayout()
-        b_apply = QPushButton("📋 In Zwischenablage kopieren")
-        b_apply.clicked.connect(self._bpf_copy)
-        btn_row.addWidget(b_apply)
-        b_test = QPushButton("🧪 Test mit tcpdump (5s)")
-        b_apply.setToolTip("Filter in die Zwischenablage kopieren")
-        b_test.clicked.connect(self._bpf_test)
-        btn_row.addWidget(b_test)
-        btn_row.addStretch()
-        man_layout.addLayout(btn_row)
-        man_group.setLayout(man_layout)
-        layout.addWidget(man_group)
-
-        # Ausgabe
-        self.bpf_output = QTextEdit()
-        self.bpf_output.setReadOnly(True)
-        self.bpf_output.setMaximumHeight(200)
-        self.bpf_output.setStyleSheet(
-            "background:#1a1a1a;color:#d4d4d4;font-family:monospace;"
-        )
-        layout.addWidget(self.bpf_output)
-
-        self.tab_widget.addTab(tab, "🔬 BPF-Filter")
-
-    def _bpf_set_filter(self, bpf: str):
-        try:
-            self.bpf_edit.setText(bpf)
-            self.bpf_output.append("Filter gesetzt: " + bpf)
-        except Exception:
-            pass
-
-    def _bpf_copy(self):
-        try:
-            from PyQt6.QtWidgets import QApplication
-
-            QApplication.clipboard().setText(self.bpf_edit.text())
-            self.bpf_output.append("✅ In Zwischenablage kopiert")
-        except Exception as e:
-            self.bpf_output.append("Fehler: " + str(e))
-
-    def _bpf_test(self):
-        bpf = self.bpf_edit.text().strip()
-        if not bpf:
-            return
-        # Test mit tcpdump 5s
-        try:
-            iface = "wlan0"
-            try:
-                active = self.interface_manager.aktives_interface
-                if active:
-                    iface = active.name
-            except Exception:
-                pass
-            self.bpf_output.append("Test: tcpdump -i " + iface + " -c 5 '" + bpf + "'")
-            rc, out, err = CommandRunner.run(
-                ["timeout", "5", "tcpdump", "-i", iface, "-c", "5", "-nn", bpf],
-                subsystem="support",
-                tag="bpf-test",
-                soft_fail=True,
-                timeout=10,
-            )
-            for line in out.splitlines()[:20]:
-                self.bpf_output.append(line)
-            if err:
-                self.bpf_output.append("stderr: " + err[:200])
-        except Exception as e:
-            self.bpf_output.append("Test-Fehler: " + str(e))
-
-    def create_notes_tab(self):
-        """v10.3: Notizen pro BSSID."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        header = QLabel("📝 Notizen pro Netzwerk")
-        header.setStyleSheet(
-            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
-        )
-        layout.addWidget(header)
-
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Netzwerk:"))
-        self.notes_combo = QComboBox()
-        row.addWidget(self.notes_combo, 1)
-        b_reload = QPushButton("🔄 Netzwerke laden")
-        b_reload.clicked.connect(self._notes_reload_networks)
-        row.addWidget(b_reload)
-        layout.addLayout(row)
-
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setPlaceholderText(
-            "Notizen zu diesem Netzwerk...\n\n"
-            "z.B.:\n"
-            "- Router-Modell erkannt\n"
-            "- Passwort-Hinweise\n"
-            "- Schwachstellen gefunden\n"
-            "- Owner-Kontakt\n"
-            "- Letzter Angriff: ..."
-        )
-        layout.addWidget(self.notes_edit)
-
-        btn_row = QHBoxLayout()
-        b_save = QPushButton("💾 Speichern")
-        b_save.clicked.connect(self._notes_save)
-        btn_row.addWidget(b_save)
-        b_clear = QPushButton("🗑️ Leeren")
-        b_clear.clicked.connect(lambda: self.notes_edit.clear())
-        btn_row.addWidget(b_clear)
-        btn_row.addStretch()
-        self.notes_status = QLabel("Bereit")
-        self.notes_status.setStyleSheet("color:#7f8c8d;")
-        btn_row.addWidget(self.notes_status)
-        layout.addLayout(btn_row)
-
-        # NotesManager
-        try:
-            self._notes_mgr = NotesManager()
-        except Exception:
-            self._notes_mgr = None
-        QTimer.singleShot(500, self._notes_reload_networks)
-        self.tab_widget.addTab(tab, "📝 Notizen")
-
-    def _notes_reload_networks(self):
-        try:
-            self.notes_combo.clear()
-            for n in self.aktuelle_netzwerke[:300]:
-                display = str(n.ssid or "<hidden>")[:30] + " | " + str(n.bssid)
-                self.notes_combo.addItem(display, n.bssid)
-            self.notes_status.setText(str(len(self.aktuelle_netzwerke)) + " Netzwerke")
-        except Exception:
-            pass
-
-    def _notes_save(self):
-        try:
-            if not self._notes_mgr:
-                self.notes_status.setText("NotesManager fehlt")
-                return
-            bssid = self.notes_combo.currentData()
-            if not bssid:
-                return
-            text = self.notes_edit.toPlainText()
-            self._notes_mgr.set(bssid, text)
-            self.notes_status.setText("✅ Gespeichert für " + str(bssid))
-        except Exception as e:
-            self.notes_status.setText("Fehler: " + str(e))
-
-    def create_custom_cmd_tab(self):
-        """v10.3: Custom-Command-Runner."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        header = QLabel("🎮 Custom-Command-Runner")
-        header.setStyleSheet(
-            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
-        )
-        layout.addWidget(header)
-        info = QLabel(
-            "Führe beliebige Shell-Befehle aus. Nutze Platzhalter:\n"
-            "  {iface}   - aktives Interface\n"
-            "  {bssid}   - BSSID des gewählten Netzwerks\n"
-            "  {ssid}    - SSID des gewählten Netzwerks\n"
-            "  {channel} - Kanal des gewählten Netzwerks"
-        )
-        info.setStyleSheet(
-            "color:#bdc3c7;font-size:9pt;padding:4px;"
-            "background:#2d2d2d;border-radius:4px;"
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Presets
-        presets_row = QHBoxLayout()
-        self.cmd_preset_combo = QComboBox()
-        self.cmd_preset_combo.addItem("-- Preset wählen --", "")
-        presets = [
-            (
-                "Alle Beacons sniffen (30s)",
-                "timeout 30 tcpdump -i {iface} -c 200 'wlan type mgt subtype beacon'",
-            ),
-            (
-                "Alle Probe-Reqs (30s)",
-                "timeout 30 tcpdump -i {iface} -c 100 'wlan type mgt subtype probe-req'",
-            ),
-            ("ARP-Tabelle zeigen", "arp -an"),
-            ("Routing-Tabelle", "ip route"),
-            ("Interface-Details", "iw dev {iface} info"),
-            ("Link-Qualität", "iw dev {iface} link"),
-            ("Alle Sockets", "ss -tulpn"),
-            ("USB-Geräte", "lsusb"),
-            ("Dmesg WLAN (letzte 20)", "dmesg | grep -iE 'wlan|8812|rtl' | tail -20"),
-            ("Kernel-Module WLAN", "lsmod | grep -E '8812|rtl|ath|mt76|iwl'"),
-        ]
-        for name, cmd in presets:
-            self.cmd_preset_combo.addItem(name, cmd)
-        self.cmd_preset_combo.currentIndexChanged.connect(self._custom_cmd_load_preset)
-        presets_row.addWidget(QLabel("Preset:"))
-        presets_row.addWidget(self.cmd_preset_combo, 1)
-        layout.addLayout(presets_row)
-
-        # Eingabe
-        self.cmd_edit = QPlainTextEdit()
-        self.cmd_edit.setPlaceholderText("Shell-Befehl hier eingeben...")
-        self.cmd_edit.setMaximumHeight(80)
-        layout.addWidget(self.cmd_edit)
-
-        btn_row = QHBoxLayout()
-        b_run = QPushButton("▶️ Ausführen")
-        b_run.clicked.connect(self._custom_cmd_run)
-        btn_row.addWidget(b_run)
-        b_stop = QPushButton("⏹️ Stop")
-        b_stop.clicked.connect(self._custom_cmd_stop)
-        btn_row.addWidget(b_stop)
-        btn_row.addStretch()
-        self.cmd_status = QLabel("Bereit")
-        self.cmd_status.setStyleSheet("color:#7f8c8d;")
-        btn_row.addWidget(self.cmd_status)
-        layout.addLayout(btn_row)
-
-        # Output
-        self.cmd_output = QTextEdit()
-        self.cmd_output.setReadOnly(True)
-        self.cmd_output.setStyleSheet(
-            "background:#1a1a1a;color:#d4d4d4;font-family:monospace;"
-        )
-        layout.addWidget(self.cmd_output)
-
-        self._cmd_process = None
-        self.tab_widget.addTab(tab, "🎮 Custom-Commands")
-
-    def _custom_cmd_load_preset(self, index):
-        try:
-            cmd = self.cmd_preset_combo.currentData()
-            if cmd:
-                self.cmd_edit.setPlainText(cmd)
-        except Exception:
-            pass
-
-    def _custom_cmd_expand(self, cmd: str) -> str:
-        try:
-            iface = "wlan0"
-            active = self.interface_manager.aktives_interface
-            if active:
-                iface = active.name
-        except Exception:
-            iface = "wlan0"
-        bssid = "{bssid}"
-        ssid = "{ssid}"
-        ch = "0"
-        try:
-            row = self.network_table.currentRow()
-            if row >= 0 and row < len(self.aktuelle_netzwerke):
-                n = self.aktuelle_netzwerke[row]
-                bssid = n.bssid
-                ssid = n.ssid or "<hidden>"
-                ch = str(n.kanal)
-        except Exception:
-            pass
-        return (
-            cmd.replace("{iface}", iface)
-            .replace("{bssid}", bssid)
-            .replace("{ssid}", ssid)
-            .replace("{channel}", ch)
-        )
-
-    def _custom_cmd_run(self):
-        cmd_raw = self.cmd_edit.toPlainText().strip()
-        if not cmd_raw:
-            return
-        cmd = self._custom_cmd_expand(cmd_raw)
-        self.cmd_output.append("═" * 60)
-        self.cmd_output.append("▶ " + cmd)
-        self.cmd_output.append("─" * 60)
-        try:
-            # Nutzer-Terminal: eingegebene Befehle bewusst durch
-            # die Shell laufen lassen (Feature, kein Bug).
-            self._cmd_process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            self.cmd_status.setText("⏳ läuft...")
-
-            # Reader-Thread
-            def _read():
-                try:
-                    if self._cmd_process and self._cmd_process.stdout:
-                        for line in self._cmd_process.stdout:
-                            QTimer.singleShot(
-                                0, lambda l=line: self.cmd_output.append(l.rstrip())
-                            )
-                        self._cmd_process.wait()
-                except Exception:
-                    pass
-                rc = self._cmd_process.returncode if self._cmd_process else -1
-                QTimer.singleShot(
-                    0, lambda: self.cmd_status.setText(f"✅ Fertig (rc={rc})")
-                )
-
-            threading.Thread(target=_thread_wrap(_read, "anon-63963"), daemon=True).start()
-        except Exception as e:
-            self.cmd_output.append("❌ " + str(e))
-
-    def _custom_cmd_stop(self):
-        try:
-            if self._cmd_process and self._cmd_process.poll() is None:
-                self._cmd_process.terminate()
-                self.cmd_status.setText("⏹️ gestoppt")
-        except Exception:
-            pass
-
     def create_theme_tab(self):
         """v10.5: Theme-Auswahl."""
         tab = QWidget()
@@ -66867,392 +69071,6 @@ class WLANUltimateGUI(QMainWindow):
     def _tools_install_all(self):
         self._tools_install_apt()
         QTimer.singleShot(2000, self._tools_install_pip)
-
-    def create_watchlist_tab(self):
-        """v11.0: Watchlist mit Alerts."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        header = QLabel("👁️ Watchlist - BSSID-Überwachung")
-        header.setStyleSheet(
-            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
-        )
-        layout.addWidget(header)
-
-        info = QLabel(
-            "Überwacht ausgewählte BSSIDs. Bei Erscheinen: "
-            "Alarm + Log + optional Sound."
-        )
-        info.setStyleSheet("color:#bdc3c7;font-size:9pt;padding:4px;")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Steuerung
-        ctrl = QHBoxLayout()
-        ctrl.addWidget(QLabel("BSSID:"))
-        self.wl_bssid_edit = QLineEdit()
-        self.wl_bssid_edit.setPlaceholderText("AA:BB:CC:DD:EE:FF")
-        ctrl.addWidget(self.wl_bssid_edit, 2)
-        ctrl.addWidget(QLabel("Grund:"))
-        self.wl_reason_edit = QLineEdit()
-        self.wl_reason_edit.setPlaceholderText("z.B. Verdächtig, Kunde, Eigener AP")
-        ctrl.addWidget(self.wl_reason_edit, 2)
-        ctrl.addWidget(QLabel("Prio:"))
-        self.wl_prio_spin = QSpinBox()
-        self.wl_prio_spin.setRange(1, 5)
-        self.wl_prio_spin.setValue(3)
-        ctrl.addWidget(self.wl_prio_spin)
-        b_add = QPushButton("➕ Hinzufügen")
-        b_add.clicked.connect(self._wl_add)
-        ctrl.addWidget(b_add)
-        b_from_sel = QPushButton("📡 Aus Auswahl")
-        b_from_sel.clicked.connect(self._wl_add_from_selection)
-        ctrl.addWidget(b_from_sel)
-        layout.addLayout(ctrl)
-
-        # Actions
-        actions = QHBoxLayout()
-        b_clear = QPushButton("🗑️ Alle entfernen")
-        b_clear.clicked.connect(self._wl_clear)
-        actions.addWidget(b_clear)
-        b_export = QPushButton("💾 Export JSON")
-        b_export.clicked.connect(self._wl_export)
-        actions.addWidget(b_export)
-        b_import = QPushButton("📂 Import JSON")
-        b_import.clicked.connect(self._wl_import)
-        actions.addWidget(b_import)
-        self.wl_sound_check = QCheckBox("🔊 Sound bei Treffer")
-        self.wl_sound_check.setChecked(True)
-        actions.addWidget(self.wl_sound_check)
-        self.wl_notify_check = QCheckBox("🔔 Desktop-Notification")
-        self.wl_notify_check.setChecked(True)
-        actions.addWidget(self.wl_notify_check)
-        actions.addStretch()
-        layout.addLayout(actions)
-
-        # Tabelle
-        self.wl_table = QTableWidget(0, 6)
-        self.wl_table.setHorizontalHeaderLabels(
-            [
-                "BSSID",
-                "SSID",
-                "Grund",
-                "Prio",
-                "Sichtungen",
-                "Letzte Sichtung",
-            ]
-        )
-        self.wl_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        layout.addWidget(self.wl_table)
-
-        # Alert-Log
-        alert_group = QGroupBox("🚨 Alert-Log")
-        alert_layout = QVBoxLayout()
-        self.wl_alerts = QTextEdit()
-        self.wl_alerts.setReadOnly(True)
-        self.wl_alerts.setMaximumHeight(150)
-        self.wl_alerts.setStyleSheet(
-            "background:#1a1a1a;color:#d4d4d4;font-family:monospace;"
-        )
-        alert_layout.addWidget(self.wl_alerts)
-        alert_group.setLayout(alert_layout)
-        layout.addWidget(alert_group)
-
-        # WatchlistManager
-        if not hasattr(self, "_watchlist_mgr"):
-            try:
-                self._watchlist_mgr = WatchlistManager()
-                self._watchlist_mgr.register_callback(self._wl_alert)
-            except Exception as e:
-                self._watchlist_mgr = None
-                self.logger.warning("WatchlistManager: " + str(e))
-
-        # Sound-Alerts
-        if not hasattr(self, "sound_alerts"):
-            try:
-                self.sound_alerts = SoundAlerts(enabled=False)
-            except Exception:
-                self.sound_alerts = None
-
-        self.tab_widget.addTab(tab, "👁️ Watchlist")
-        QTimer.singleShot(500, self._wl_refresh)
-
-    def _wl_add(self):
-        if not self._watchlist_mgr:
-            return
-        bssid = self.wl_bssid_edit.text().strip()
-        if not bssid:
-            QMessageBox.warning(self, "Keine BSSID", "Bitte BSSID eingeben.")
-            return
-        self._watchlist_mgr.add(
-            bssid, "", self.wl_reason_edit.text().strip(), self.wl_prio_spin.value()
-        )
-        self.wl_bssid_edit.clear()
-        self.wl_reason_edit.clear()
-        self._wl_refresh()
-
-    def _wl_add_from_selection(self):
-        if not self._watchlist_mgr:
-            return
-        try:
-            row = self.network_table.currentRow()
-            if row < 0 or row >= len(self.aktuelle_netzwerke):
-                QMessageBox.information(
-                    self,
-                    "Keine Auswahl",
-                    "Bitte in Netzwerke-Tabelle ein Netzwerk wählen.",
-                )
-                return
-            n = self.aktuelle_netzwerke[row]
-            self._watchlist_mgr.add(
-                n.bssid,
-                n.ssid or "",
-                self.wl_reason_edit.text().strip() or "Aus Auswahl",
-                self.wl_prio_spin.value(),
-            )
-            self._wl_refresh()
-        except Exception as e:
-            QMessageBox.warning(self, "Fehler", str(e))
-
-    def _wl_clear(self):
-        if not self._watchlist_mgr:
-            return
-        r = QMessageBox.question(
-            self,
-            "Liste leeren",
-            "Alle Watchlist-Einträge entfernen?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if r == QMessageBox.StandardButton.Yes:
-            self._watchlist_mgr.clear()
-            self._wl_refresh()
-
-    def _wl_export(self):
-        if not self._watchlist_mgr:
-            return
-        fn, _ = QFileDialog.getSaveFileName(
-            self, "Watchlist exportieren", "watchlist.json", "JSON (*.json)"
-        )
-        if not fn:
-            return
-        try:
-            data = [e.to_dict() for e in self._watchlist_mgr.get_all()]
-            Path(fn).write_text(
-                json.dumps(data, indent=2, default=str), encoding="utf-8"
-            )
-            QMessageBox.information(self, "Export", "Gespeichert: " + fn)
-        except Exception as e:
-            QMessageBox.warning(self, "Fehler", str(e))
-
-    def _wl_import(self):
-        if not self._watchlist_mgr:
-            return
-        fn, _ = QFileDialog.getOpenFileName(
-            self, "Watchlist importieren", "", "JSON (*.json)"
-        )
-        if not fn:
-            return
-        try:
-            data = json.loads(Path(fn).read_text(encoding="utf-8"))
-            for d in data:
-                e = WatchlistEntry.from_dict(d)
-                self._watchlist_mgr._entries[e.bssid] = e
-            self._watchlist_mgr._save()
-            self._wl_refresh()
-            QMessageBox.information(
-                self, "Import", str(len(data)) + " Einträge geladen."
-            )
-        except Exception as e:
-            QMessageBox.warning(self, "Fehler", str(e))
-
-    def _wl_refresh(self):
-        if not hasattr(self, "_watchlist_mgr") or not self._watchlist_mgr:
-            return
-        try:
-            entries = self._watchlist_mgr.get_all()
-            self.wl_table.setRowCount(0)
-            for e in sorted(entries, key=lambda x: -x.priority):
-                row = self.wl_table.rowCount()
-                self.wl_table.insertRow(row)
-                self.wl_table.setItem(row, 0, QTableWidgetItem(e.bssid))
-                self.wl_table.setItem(row, 1, QTableWidgetItem(e.ssid))
-                self.wl_table.setItem(row, 2, QTableWidgetItem(e.reason))
-                pi = QTableWidgetItem(str(e.priority))
-                if e.priority >= 4:
-                    pi.setForeground(QBrush(QColor(231, 76, 60)))
-                elif e.priority >= 3:
-                    pi.setForeground(QBrush(QColor(243, 156, 18)))
-                self.wl_table.setItem(row, 3, pi)
-                self.wl_table.setItem(row, 4, QTableWidgetItem(str(e.seen_count)))
-                self.wl_table.setItem(
-                    row,
-                    5,
-                    QTableWidgetItem(
-                        e.last_seen.strftime("%H:%M:%S") if e.last_seen else "—"
-                    ),
-                )
-        except Exception:
-            pass
-
-    def _wl_alert(self, entry, signal):
-        """v11.0: Alert-Callback wenn Watchlist-Treffer."""
-        try:
-            ts = datetime.now().strftime("%H:%M:%S")
-            msg = (
-                "["
-                + ts
-                + "] 🚨 TREFFER: "
-                + entry.bssid
-                + " ("
-                + (entry.ssid or "?")
-                + ")"
-                + " | Prio "
-                + str(entry.priority)
-                + " | Signal "
-                + str(signal)
-                + " dBm"
-                + " | Grund: "
-                + entry.reason
-            )
-            try:
-                self.wl_alerts.append(msg)
-            except Exception:
-                pass
-            self.logger.warning("Watchlist-Treffer: " + msg)
-            # Sound
-            if hasattr(self, "wl_sound_check") and self.wl_sound_check.isChecked():
-                if self.sound_alerts:
-                    if entry.priority >= 4:
-                        self.sound_alerts.alert_high_severity()
-                    else:
-                        self.sound_alerts.beep(1)
-            # Desktop-Notification
-            if (
-                hasattr(self, "wl_notify_check")
-                and self.wl_notify_check.isChecked()
-                and hasattr(self, "tray_icon")
-                and self.tray_icon
-            ):
-                try:
-                    self.tray_icon.showMessage(
-                        "Watchlist-Treffer!",
-                        entry.bssid + " (" + entry.ssid + ")",
-                        QSystemTrayIcon.MessageIcon.Warning,
-                        5000,
-                    )
-                except Exception:
-                    pass
-            # GUI-Status
-            try:
-                self.status_label.setText("🚨 Watchlist: " + entry.bssid)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    def create_multi_adapter_tab(self):
-        """v11.0: Multi-Adapter-Verwaltung."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        header = QLabel("🔀 Multi-Adapter-Verwaltung")
-        header.setStyleSheet(
-            "font-size:16px;font-weight:bold;color:#2a82da;padding:4px;"
-        )
-        layout.addWidget(header)
-
-        info = QLabel(
-            "Erkennt alle WLAN-Adapter. Zeigt empfohlene Zuweisung "
-            "(z.B. 2.4 GHz + 5 GHz parallel)."
-        )
-        info.setStyleSheet("color:#bdc3c7;font-size:9pt;padding:4px;")
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        # Buttons
-        ctrl = QHBoxLayout()
-        b_refresh = QPushButton("🔄 Adapter neu erkennen")
-        b_refresh.clicked.connect(self._ma_refresh)
-        ctrl.addWidget(b_refresh)
-        b_assign = QPushButton("📋 Zuweisung vorschlagen")
-        b_assign.clicked.connect(self._ma_assign)
-        ctrl.addWidget(b_assign)
-        ctrl.addStretch()
-        layout.addLayout(ctrl)
-
-        # Tabelle
-        self.ma_table = QTableWidget(0, 6)
-        self.ma_table.setHorizontalHeaderLabels(
-            [
-                "Interface",
-                "MAC",
-                "Chipset",
-                "Monitor",
-                "Injection",
-                "Empfohlene Aufgabe",
-            ]
-        )
-        self.ma_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        layout.addWidget(self.ma_table)
-
-        # Status
-        self.ma_status = QLabel("Bereit")
-        self.ma_status.setStyleSheet(
-            "color:#7f8c8d;padding:4px;background:#2d2d2d;border-radius:4px;"
-        )
-        layout.addWidget(self.ma_status)
-
-        # MultiAdapterManager
-        if not hasattr(self, "_multi_adapter"):
-            try:
-                self._multi_adapter = MultiAdapterManager(
-                    self.interface_manager, self.logger
-                )
-            except Exception:
-                self._multi_adapter = None
-
-        self.tab_widget.addTab(tab, "🔀 Multi-Adapter")
-        QTimer.singleShot(500, self._ma_refresh)
-
-    def _ma_refresh(self):
-        if not hasattr(self, "_multi_adapter") or not self._multi_adapter:
-            return
-        try:
-            adapters = self._multi_adapter.detect_adapters()
-            self.ma_table.setRowCount(0)
-            for ad in adapters:
-                row = self.ma_table.rowCount()
-                self.ma_table.insertRow(row)
-                self.ma_table.setItem(row, 0, QTableWidgetItem(ad["name"]))
-                self.ma_table.setItem(row, 1, QTableWidgetItem(ad["mac"]))
-                self.ma_table.setItem(row, 2, QTableWidgetItem(ad["chipset"]))
-                mi = QTableWidgetItem("✅" if ad["monitor"] else "❌")
-                self.ma_table.setItem(row, 3, mi)
-                ii = QTableWidgetItem("✅" if ad["injection"] else "❌")
-                self.ma_table.setItem(row, 4, ii)
-                self.ma_table.setItem(row, 5, QTableWidgetItem("—"))
-            self.ma_status.setText(str(len(adapters)) + " Adapter erkannt")
-            if hasattr(self, "_multi_adapter"):
-                self._ma_assign()
-        except Exception as e:
-            self.ma_status.setText("Fehler: " + str(e))
-
-    def _ma_assign(self):
-        if not hasattr(self, "_multi_adapter") or not self._multi_adapter:
-            return
-        try:
-            adapters = self._multi_adapter.detect_adapters()
-            assign = self._multi_adapter.get_recommended_assignment(adapters)
-            for row in range(self.ma_table.rowCount()):
-                item = self.ma_table.item(row, 0)
-                if item:
-                    name = item.text()
-                    task = assign.get(name, "—")
-                    self.ma_table.setItem(row, 5, QTableWidgetItem(task))
-        except Exception:
-            pass
 
     def create_kismet_tab(self):
         """v11.0: Kismet-Integration."""
@@ -69698,203 +71516,6 @@ class WLANUltimateGUI(QMainWindow):
             QMessageBox.warning(self, "Fehler", f"Downgrade-Test: {exc}")
         finally:
             QApplication.restoreOverrideCursor()
-
-    def create_visualization_tab(self):
-        """v11.6: Visualisierungs-Tab - garantiert sichtbar."""
-        tab = QWidget()
-        tab.setStyleSheet("background-color: #2b2b2b; color: #d4d4d4;")
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(8)
-
-        header = QLabel("📊 Visualisierung & Diagramme")
-        header.setStyleSheet(
-            "font-size:18px;font-weight:bold;color:#2a82da;"
-            "padding:6px;background:#1e1e1e;border-radius:4px;"
-        )
-        layout.addWidget(header)
-
-        info = QLabel(
-            "Verschiedene Visualisierungen der WLAN-Daten. "
-            "Text-basiert (funktioniert auch ohne Matplotlib)."
-        )
-        info.setStyleSheet(
-            "color:#bdc3c7;font-size:10pt;padding:6px;"
-            "background:#2d2d2d;border-radius:4px;"
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        buttons_group = QGroupBox("Verfuegbare Diagramme")
-        buttons_group.setStyleSheet(
-            "QGroupBox {color:#2a82da;font-weight:bold;"
-            "border:1px solid #444;border-radius:4px;margin-top:8px;"
-            "padding-top:8px;}"
-        )
-        bg_layout = QGridLayout()
-        btns = [
-            ("📈 Signal-Verteilung", self._viz_show_signal_dist),
-            ("📻 Kanal-Auslastung", self._viz_show_channels),
-            ("🕸️ Netzwerk-Topologie", self._viz_show_topology),
-            ("🔥 Signal-Heatmap", self._viz_show_heatmap),
-            ("📊 ASCII-Balken (Top 20)", self._viz_show_ascii_bars),
-            ("🗑️ Ausgabe leeren", self._viz_clear),
-        ]
-        for i, (label, fn) in enumerate(btns):
-            b = QPushButton(label)
-            b.setStyleSheet(
-                "QPushButton {background:#3a3a3a;color:#d4d4d4;"
-                "border:1px solid #555;padding:8px;border-radius:3px;"
-                "text-align:left;font-size:10pt;}"
-                "QPushButton:hover {background:#2a82da;color:white;}"
-            )
-            b.clicked.connect(fn)
-            bg_layout.addWidget(b, i // 2, i % 2)
-        buttons_group.setLayout(bg_layout)
-        layout.addWidget(buttons_group)
-
-        self.viz_display = QTextEdit()
-        self.viz_display.setReadOnly(True)
-        self.viz_display.setMinimumHeight(250)
-        self.viz_display.setStyleSheet(
-            "background:#1a1a1a;color:#d4d4d4;"
-            "font-family:monospace;font-size:10pt;"
-            "border:1px solid #444;padding:8px;"
-        )
-        self.viz_display.setPlainText(
-            "Willkommen im Visualisierungs-Tab!\n\n"
-            "Klick einen Button, um eine Visualisierung zu erzeugen.\n"
-            "Voraussetzung: Erst einen Scan durchfuehren."
-        )
-        layout.addWidget(self.viz_display, 1)
-
-        self.viz_status = QLabel("Bereit")
-        self.viz_status.setStyleSheet(
-            "color:#7f8c8d;padding:6px;background:#1e1e1e;border-radius:4px;"
-        )
-        layout.addWidget(self.viz_status)
-
-        self.tab_widget.addTab(tab, "📊 Visualisierung")
-
-    def _viz_clear(self):
-        try:
-            self.viz_display.clear()
-            self.viz_status.setText("Geleert")
-        except Exception:
-            pass
-
-    def _viz_show_signal_dist(self):
-        try:
-            nets = self.aktuelle_netzwerke
-            if not nets:
-                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
-                return
-            lines = ["=== SIGNAL-VERTEILUNG ===", ""]
-            buckets = {}
-            for n in nets:
-                s = n.signal_stärke or -100
-                b = (s // 5) * 5
-                buckets[b] = buckets.get(b, 0) + 1
-            for b in sorted(buckets.keys(), reverse=True):
-                v = buckets[b]
-                bar = "#" * v
-                lines.append(f"  {b:>5} bis {b+4:>5} dBm: {bar} ({v})")
-            self.viz_display.setPlainText("\n".join(lines))
-            self.viz_status.setText(f"Verteilung: {len(buckets)} Buckets")
-        except Exception as e:
-            self.viz_display.setPlainText("Fehler: " + str(e))
-
-    def _viz_show_channels(self):
-        try:
-            nets = self.aktuelle_netzwerke
-            if not nets:
-                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
-                return
-            lines = ["=== KANAL-AUSLASTUNG ===", ""]
-            ch_sig = {}
-            for n in nets:
-                ch_sig.setdefault(n.kanal, []).append(n.signal_stärke or -100)
-            for ch in sorted(ch_sig.keys()):
-                sigs = ch_sig[ch]
-                avg = sum(sigs) / len(sigs)
-                band = "2.4" if ch <= 14 else "5" if ch < 200 else "6"
-                bar = "#" * len(sigs)
-                lines.append(
-                    f"  Kanal {ch:>3} ({band}G): {bar} ({len(sigs)} APs, avg {avg:.0f} dBm)"
-                )
-            self.viz_display.setPlainText("\n".join(lines))
-            self.viz_status.setText(f"{len(ch_sig)} Kanaele")
-        except Exception as e:
-            self.viz_display.setPlainText("Fehler: " + str(e))
-
-    def _viz_show_topology(self):
-        try:
-            nets = self.aktuelle_netzwerke
-            if not nets:
-                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
-                return
-            lines = ["=== NETZWERK-TOPOLOGIE ===", ""]
-            vendors = {}
-            for n in nets:
-                v = n.hersteller or "Unbekannt"
-                vendors.setdefault(v, []).append(n)
-            for vendor, vnets in sorted(vendors.items(), key=lambda x: -len(x[1])):
-                lines.append(f"[{vendor}] ({len(vnets)} APs):")
-                for n in vnets[:5]:
-                    lines.append(f"   - {str(n.ssid)[:30]:<30} ({n.bssid}) K{n.kanal}")
-                if len(vnets) > 5:
-                    lines.append(f"   ... und {len(vnets)-5} weitere")
-                lines.append("")
-            self.viz_display.setPlainText("\n".join(lines))
-            self.viz_status.setText(f"{len(vendors)} Hersteller")
-        except Exception as e:
-            self.viz_display.setPlainText("Fehler: " + str(e))
-
-    def _viz_show_heatmap(self):
-        try:
-            nets = self.aktuelle_netzwerke
-            if not nets:
-                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
-                return
-            lines = ["=== SIGNAL-HEATMAP ===", ""]
-            for n in sorted(nets, key=lambda x: x.signal_stärke or -100, reverse=True)[
-                :30
-            ]:
-                s = n.signal_stärke or -100
-                if s > -50:
-                    marker = "#"
-                elif s > -60:
-                    marker = "+"
-                elif s > -70:
-                    marker = "-"
-                else:
-                    marker = "."
-                width = max(1, min(60, (s + 100)))
-                bar = marker * width
-                lines.append(f"  {s:>4}dBm {bar}  {str(n.ssid)[:25]}")
-            self.viz_display.setPlainText("\n".join(lines))
-            self.viz_status.setText(f"Heatmap: {len(nets)} Netzwerke")
-        except Exception as e:
-            self.viz_display.setPlainText("Fehler: " + str(e))
-
-    def _viz_show_ascii_bars(self):
-        try:
-            nets = self.aktuelle_netzwerke
-            if not nets:
-                self.viz_display.setPlainText("Keine Netzwerke - erst Scan.")
-                return
-            lines = ["=== ASCII-BALKEN (Top 20) ===", ""]
-            for n in sorted(nets, key=lambda x: x.signal_stärke or -100, reverse=True)[
-                :20
-            ]:
-                s = n.signal_stärke or -100
-                width = max(1, (s + 100))
-                bar = "#" * min(width, 70)
-                lines.append(f"  {str(n.ssid)[:20]:<20} |{bar}| {s} dBm")
-            self.viz_display.setPlainText("\n".join(lines))
-            self.viz_status.setText(f"{min(20, len(nets))} Netzwerke dargestellt")
-        except Exception as e:
-            self.viz_display.setPlainText("Fehler: " + str(e))
 
     def create_training_tab(self):
         tab = QWidget()
@@ -75369,6 +76990,19 @@ def main() -> int:
         help="v37-R14: Hardware-Berater",
     )
     parser.add_argument(
+        "--hw-antenna",
+        metavar="FILTER",
+        nargs="?",
+        const="",
+        help="P9.4: Antennen-Katalog (optional Filter)",
+    )
+    parser.add_argument(
+        "--hw-for",
+        metavar="USB_ID",
+        default="",
+        help="P9.4: Antennen-Empfehlung fuer Adapter (mit --hw-antenna)",
+    )
+    parser.add_argument(
         "--hw-compare", metavar="IDS", help="v37-R16: Vergleich mehrerer Adapter"
     )
     parser.add_argument(
@@ -75388,7 +77022,11 @@ def main() -> int:
         help="v37-R19a: Audit der Adapter-Registrys",
     )
     parser.add_argument(
-        "--hw-catalog", action="store_true", help="v37-R14: alle bekannten Adapter"
+        "--hw-catalog",
+        nargs="?",
+        const="",
+        default=None,
+        help="v37-R15: Adapter-Katalog [Suchbegriff]",
     )
     parser.add_argument(
         "--hw-status", action="store_true", help="v37-R10cR2: Hardware+Software-Status"
@@ -75474,7 +77112,61 @@ def main() -> int:
     parser.add_argument(
         "--orchestrate", action="store_true", help="Adapter-Orchestrator im CLI-Modus"
     )
-    parser.add_argument("--hw-scan", action="store_true", help="Hardware-Scan")
+    parser.add_argument(
+        "--hw-scan",
+        nargs="?",
+        const="text",
+        default=None,
+        choices=["text", "json", "yaml"],
+        help="Hardware-Scan: text|json|yaml (default: text)",
+    )
+    parser.add_argument(
+        "--hw-score",
+        type=str,
+        default=None,
+        help="v37-R15: Score-Breakdown fuer Adapter (USB-ID)",
+    )
+    parser.add_argument(
+        "--hw-upgrade",
+        type=str,
+        default=None,
+        help="v37-R15: Upgrade-Pfad fuer Adapter (USB-ID)",
+    )
+    parser.add_argument(
+        "--hw-bt",
+        action="store_true",
+        help="v37-R16: Bluetooth-Status + Dongle-Katalog",
+    )
+    parser.add_argument(
+        "--hw-verify",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "v37-R17: Empirische Verifikation von Adapter-Behauptungen "
+            "[iface]. Benoetigt root fuer volle Tests."
+        ),
+    )
+    parser.add_argument(
+        "--hw-dump",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "v37-R17: Hardware-Diagnose in Textdatei sammeln "
+            "[pfad]. Standard: ~/.wlan_ultimate/hw_dump_*.txt"
+        ),
+    )
+    parser.add_argument(
+        "--hw-kernel",
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "v37-R18: Kernel-Kompatibilitaets-Matrix [USB_ID]. "
+            "Zeigt Treiber/Wirkung pro Kernel-Bereich."
+        ),
+    )
     parser.add_argument(
         "--verify-crypto",
         action="store_true",
@@ -75505,6 +77197,117 @@ def main() -> int:
     )
     parser.add_argument(
         "--profile", action="store_true", help="Startup-Profiling aktivieren"
+    )
+
+    # v38: --scan-once (headless WLAN-Scan)
+    parser.add_argument(
+        "--scan-once", action="store_true",
+        help="v38: WLAN-Scan headless (einmalig, IE-Dump-faehig)",
+    )
+    parser.add_argument(
+        "--scan-multi", action="store_true",
+        help="N7e: paralleler Scan via iw (managed) + Scapy (monitor)",
+    )
+    parser.add_argument(
+        "--scan-multi-seconds", metavar="N", type=int, default=10,
+        help="N7e: Scapy-Nachlauf in Sekunden (Default: 10)",
+    )
+    parser.add_argument(
+        "--scan-multi-repeats", metavar="N", type=int, default=1,
+        help="N7e: Anzahl iw-Scan-Runden (Default: 1)",
+    )
+    parser.add_argument(
+        "--scan-multi-managed", metavar="IFACE",
+        help="N7e: festes Interface fuer managed-Rolle (Default: Auto)",
+    )
+    parser.add_argument(
+        "--scan-multi-monitor", metavar="IFACE",
+        help="N7e: festes Interface fuer monitor-Rolle (Default: Auto)",
+    )
+    parser.add_argument(
+        "--scan-iface", metavar="IFACE",
+        help="v38: Interface fuer --scan-once (Default: Auto)",
+    )
+    parser.add_argument(
+        "--scan-seconds", metavar="N", type=int, default=30,
+        help="v38: Scan-Dauer in Sekunden (Default: 30)",
+    )
+    parser.add_argument(
+        "--scan-dump-ies", action="store_true",
+        help="v38: decoded_ies als JSON ausgeben",
+    )
+    parser.add_argument(
+        "--scan-channels", metavar="LIST",
+        help="v38: Kanaele fuer --scan-once, z.B. '1,6,11' oder '1 6 11'",
+    )
+    parser.add_argument(
+        "--scan-dwell", metavar="SEC", type=float, default=0.5,
+        help="v38: Verweildauer pro Kanal in Sekunden (Default: 0.5)",
+    )
+    parser.add_argument(
+        "--scan-dump-signals", action="store_true",
+        help="v38: Signal-Sample-Liste pro BSSID im JSON ausgeben",
+    )
+    parser.add_argument(
+        "--scan-dump-full", action="store_true",
+        help="v38: Vollstaendiges Envelope-JSON (Schema v1)",
+    )
+    parser.add_argument(
+        "--scan-explain", action="store_true",
+        help="v38: dBm-Legende + Feldbeschreibung ausgeben (kein Scan)",
+    )
+    parser.add_argument(
+        "--scan-out", metavar="FILE",
+        help="v38: JSON direkt in Datei schreiben (kein stdout-Header)",
+    )
+    parser.add_argument(
+        "--scan-compare", metavar="\"A.json,B.json\"",
+        help="v38: Vergleich zweier Scan-Envelopes (Delta pro BSSID)",
+    )
+    parser.add_argument(
+        "--scan-wlan-deep", action="store_true",
+        help="v38: Tiefer WLAN-Scan (Dwell 1.0s, mind. 3 Zyklen)",
+    )
+    parser.add_argument(
+        "--scan-iw", action="store_true",
+        help="v38: Treiber-Scan via iw (braucht managed-Modus, "
+             "100 Prozent Kanalabdeckung)",
+    )
+    parser.add_argument(
+        "--scan-iw-repeats", metavar="N", type=int, default=1,
+        help="v38: Anzahl iw-Scans fuer Mittelwertbildung (Default: 1)",
+    )
+    parser.add_argument(
+        "--scan-iw-switch", action="store_true",
+        help="v38: Interface automatisch auf managed umschalten",
+    )
+    parser.add_argument(
+        "--scan-iw-baseline", action="store_true",
+        help="v38: Baseline-Scan (5 Runden, managed, Label)",
+    )
+    parser.add_argument(
+        "--scan-label", metavar="LABEL",
+        help="v38: Label fuer Scan-Envelope (z.B. Antennenname)",
+    )
+    parser.add_argument(
+        "--scan-iw-compare", metavar="A.json,B.json",
+        help="v38: Antennenvergleich zweier iw-Scans (Filter: n>=3)",
+    )
+    parser.add_argument(
+        "--scan-live", action="store_true",
+        help="v38: Kontinuierlicher Live-Scan (Monitor, Hopping, Strg-C)",
+    )
+    parser.add_argument(
+        "--scan-live-refresh", metavar="SEC", type=float, default=1.0,
+        help="v38: Tabellen-Refresh in Sekunden (Default: 1.0)",
+    )
+    parser.add_argument(
+        "--scan-live-duration", metavar="SEC", type=int, default=0,
+        help="v38: Laufzeit in Sekunden (0 = bis Strg-C)",
+    )
+    parser.add_argument(
+        "--scan-live-log", metavar="FILE",
+        help="v38: Optionales Logfile (TSV: ts,bssid,signal,ssid,ch,enc)",
     )
 
     try:
@@ -75858,6 +77661,91 @@ def main() -> int:
     # Kurze CLI-Modi als Liste von (attribut, dispatcher)
     _cli_dispatch = [
         (
+            "scan_explain",
+            lambda a: _scan_once_explain(),
+        ),
+        (
+            "scan_iw",
+            lambda a: _scan_iw_cli(
+                iface=getattr(a, "scan_iface", "") or "",
+                repeats=int(getattr(a, "scan_iw_repeats", 1) or 1),
+                dump_full=bool(getattr(a, "scan_dump_full", False)),
+                out_file=str(getattr(a, "scan_out", "") or ""),
+                dump_signals=bool(getattr(a, "scan_dump_signals", False)),
+                auto_switch=bool(getattr(a, "scan_iw_switch", False)),
+                label=str(getattr(a, "scan_label", "") or ""),
+                dump_ies=bool(getattr(a, "scan_dump_ies", False)),
+            ),
+        ),
+        (
+            "scan_multi",
+            lambda a: _scan_multi_cli(
+                iface_managed=str(
+                    getattr(a, "scan_multi_managed", "") or ""
+                ),
+                iface_monitor=str(
+                    getattr(a, "scan_multi_monitor", "") or ""
+                ),
+                repeats=int(
+                    getattr(a, "scan_multi_repeats", 1) or 1
+                ),
+                seconds=int(
+                    getattr(a, "scan_multi_seconds", 10) or 10
+                ),
+                dump_ies=bool(getattr(a, "scan_dump_ies", False)),
+                out_file=str(getattr(a, "scan_out", "") or ""),
+                dump_signals=bool(
+                    getattr(a, "scan_dump_signals", False)
+                ),
+                dump_full=bool(getattr(a, "scan_dump_full", False)),
+                label=str(getattr(a, "scan_label", "") or ""),
+            ),
+        ),
+        (
+            "scan_live",
+            lambda a: _scan_live_cli(
+                iface=getattr(a, "scan_iface", "") or "",
+                channels=_scan_once_parse_channels(
+                    getattr(a, "scan_channels", "") or ""
+                ),
+                dwell=float(getattr(a, "scan_dwell", 0.3) or 0.3),
+                refresh=float(
+                    getattr(a, "scan_live_refresh", 1.0) or 1.0
+                ),
+                max_duration=int(
+                    getattr(a, "scan_live_duration", 0) or 0
+                ),
+                out_file=str(getattr(a, "scan_out", "") or ""),
+                log_file=str(getattr(a, "scan_live_log", "") or ""),
+            ),
+        ),
+        (
+            "scan_iw_baseline",
+            lambda a: _scan_iw_baseline_cli(
+                iface=getattr(a, "scan_iface", "") or "",
+                label=str(getattr(a, "scan_label", "") or ""),
+                repeats=int(getattr(a, "scan_iw_repeats", 5) or 5),
+                out_file=str(getattr(a, "scan_out", "") or ""),
+                auto_switch=True,
+            ),
+        ),
+        (
+            "scan_once",
+            lambda a: _scan_once_cli(
+                iface=getattr(a, "scan_iface", "") or "",
+                seconds=int(getattr(a, "scan_seconds", 30) or 30),
+                dump_ies=bool(getattr(a, "scan_dump_ies", False)),
+                channels=_scan_once_parse_channels(
+                    getattr(a, "scan_channels", "") or ""
+                ),
+                dwell=float(getattr(a, "scan_dwell", 0.5) or 0.5),
+                dump_signals=bool(getattr(a, "scan_dump_signals", False)),
+                dump_full=bool(getattr(a, "scan_dump_full", False)),
+                out_file=str(getattr(a, "scan_out", "") or ""),
+                scan_wlan_deep=bool(getattr(a, "scan_wlan_deep", False)),
+            ),
+        ),
+        (
             "scan_lan",
             lambda a: _scan_lan_cli(
                 subnet=getattr(a, "scan_subnet", None),
@@ -75872,7 +77760,8 @@ def main() -> int:
         ("deep_sync", lambda a: _deep_sync_cli()),
         ("adapter_registry_dump", lambda a: _adapter_registry_dump_cli()),
         ("adapter_registry_audit", lambda a: _adapter_registry_audit_cli()),
-        ("hw_catalog", lambda a: _hw_catalog_cli()),
+        ("hw_scan", lambda a: _hw_scan_cli(a.hw_scan or "text")),
+        ("hw_bt", lambda a: _hw_bt_cli()),
         ("hw_status", lambda a: _hw_status_cli()),
         ("net_diag", lambda a: _net_diag_cli()),
         ("diag_adapters", lambda a: _diag_adapters_cli()),
@@ -75911,6 +77800,12 @@ def main() -> int:
     # Parameter-Modi (mit Wert)
     _param_dispatch = [
         (
+            "scan_iw_compare",
+            lambda a: _scan_iw_compare_cli(
+                getattr(a, "scan_iw_compare", "") or ""
+            ),
+        ),
+        (
             "store_clients",
             lambda a: _store_clients_cli(
                 a.store_clients if a.store_clients is not None else 50
@@ -75926,7 +77821,26 @@ def main() -> int:
         ("store_live", lambda a: _store_live_cli(a.store_live)),
         ("store_search", lambda a: _store_search_cli(a.store_search)),
         ("hw_advisor", lambda a: _hw_advisor_cli(a.hw_advisor or "")),
+        (
+            "hw_antenna",
+            lambda a: _hw_antenna_cli(
+                a.hw_antenna or "",
+                getattr(a, "hw_for", "") or "",
+            ),
+        ),
         ("hw_compare", lambda a: _hw_compare_cli(a.hw_compare)),
+        ("hw_score", lambda a: _hw_score_cli(a.hw_score)),
+        ("hw_upgrade", lambda a: _hw_upgrade_cli(a.hw_upgrade)),
+        ("hw_catalog", lambda a: _hw_catalog_cli(a.hw_catalog or "")),
+        ("hw_verify", lambda a: _hw_verify_cli(a.hw_verify or "")),
+        ("hw_dump", lambda a: _hw_dump_cli(a.hw_dump or "")),
+        ("hw_kernel", lambda a: _hw_kernel_cli(a.hw_kernel or "")),
+        (
+            "scan_compare",
+            lambda a: _scan_compare_cli(
+                getattr(a, "scan_compare", "") or ""
+            ),
+        ),
         (
             "nmap",
             lambda a: _nmap_cli(a.nmap, profile=getattr(a, "nmap_profile", "quick")),
@@ -76182,6 +78096,8 @@ def main() -> int:
         "--store-live",
         "--store-search",
         "--hw-advisor",
+        "--hw-antenna",
+        "--hw-for",
         "--hw-compare",
         "--fritz-host",
         "--fritz-user",
@@ -76197,8 +78113,27 @@ def main() -> int:
         "--diag-crypto",
         "--trace-beacons",
         "--scan-subnet",
+        "--scan-iface",
+        "--scan-seconds",
+        "--scan-channels",
+        "--scan-dwell",
+        "--scan-out",
+        "--scan-compare",
+        "--scan-iw-repeats",
+        "--scan-label",
+        "--scan-iw-compare",
+        "--scan-live-refresh",
+        "--scan-live-duration",
+        "--scan-live-log",
         "--kismet-user",
         "--kismet-password",
+        "--hw-catalog",
+        "--hw-scan",
+        "--hw-score",
+        "--hw-upgrade",
+        "--hw-verify",
+        "--hw-dump",
+        "--hw-kernel",
     }
     _cli_flags_bool = {
         "-q",
@@ -76217,6 +78152,16 @@ def main() -> int:
         "--oui-status",
         "--scan-lan",
         "--scan-deep",
+        "--scan-once",
+        "--scan-dump-ies",
+        "--scan-dump-signals",
+        "--scan-dump-full",
+        "--scan-explain",
+        "--scan-wlan-deep",
+        "--scan-iw",
+        "--scan-iw-switch",
+        "--scan-iw-baseline",
+        "--scan-live",
         "--gui-error-report",
         "--store-sync",
         "--store-stats",
@@ -76225,7 +78170,7 @@ def main() -> int:
         "--deep-sync",
         "--adapter-registry-dump",
         "--adapter-registry-audit",
-        "--hw-catalog",
+        "--hw-bt",
         "--hw-status",
         "--fritz-info",
         "--fritz-wan",
@@ -76240,7 +78185,6 @@ def main() -> int:
         "--perf-tune",
         "--oui-install",
         "--orchestrate",
-        "--hw-scan",
         "--verify-crypto",
         "--auto-install",
         "--safe",
@@ -81060,189 +83004,297 @@ def _store_client_export_cli(path: str) -> int:
 
 
 class WiFiAdapterCatalog:
-    """v37-R14: Katalog bekannter WLAN-Adapter mit Kompatibilitaets-Profil."""
+    """v37-R15: Umfassender Katalog bekannter WLAN-, Bluetooth- und
+    GPS-Adapter mit detailliertem Kompatibilitaetsprofil.
 
+    Nutzt folgende Felder pro Adapter (alle optional, aber empfohlen):
+      model, vendor, chipset, chipset_family, driver, driver_source,
+      kernel_since, release_date, eol, bands, wifi_gen, max_rate_mbps,
+      mimo, usb, interface, monitor, active_monitor, injection, ap_mode,
+      p2p_go, vif, ap_plus_monitor, tx_max_dbm, tx_max_mw, antenna,
+      antenna_gain_dbi, price_eur, price_tier, pros, cons, known_issues,
+      reliability, buy_recommendation
+    """
+
+    # ------------------------------------------------------------------
+    # Datenbank: USB-ID -> vollstaendiges Profil
+    # ------------------------------------------------------------------
     KNOWN = {
-        "0bda:8812": {
-            "model": "Alfa AWUS036ACH-C v2",
+        # ==============================================================
+        # ALFA - MEDIATEK (In-Kernel, plug&play) - TOP-EMPFEHLUNGEN
+        # ==============================================================
+        "0e8d:7610": {
+            "model": "Alfa AWUS036ACHM",
             "vendor": "Alfa",
-            "chipset": "RTL8812AU",
+            "chipset": "MT7610U",
+            "chipset_family": "mt76",
+            "driver": "mt76x0u",
+            "driver_source": "in-kernel",
+            "kernel_since": "4.19 (2018)",
+            "release_date": "2021-06",
+            "eol": False,
             "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 4/5 (802.11ac)",
-            "usb": "3.0",
+            "wifi_gen": "WiFi 5 (802.11ac)",
+            "max_rate_mbps": 433,
+            "mimo": "1x1",
+            "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": True,
             "injection": True,
-            "tx_max_dbm": 30,
-            "antenna": "2x RP-SMA (wechselbar)",
-            "price_eur": 55,
-            "kernel_ok": ["4.x", "5.x"],
-            "kernel_warning": "rtl88XXau-Treiber aelter als 2018 und "
-            "NICHT offiziell gepflegt. Stabil auf Kernel "
-            "5.x (bis 5.15). Auf Kernel 6.x/7.x gibt es "
-            "Berichte ueber Compile-Fehler und "
-            "Instabilitaet. Moderne Alternative: "
-            "AWUS036ACM (MT7612U) oder AWUS036ACHM "
-            "(MT7610U) — beide Treiber im Mainline-Kernel.",
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 20,
+            "tx_max_mw": 100,
+            "antenna": "1x RP-SMA (wechselbar)",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 59,
+            "price_tier": "mid",
             "pros": [
-                "2x2 MIMO 5 GHz",
-                "USB 3.0 (schnell)",
-                "Wechselbare Antennen",
-                "Sehr gute Empfindlichkeit",
-                "Injection-faehig",
+                "In-Kernel-Treiber (mt76x0u) seit 2018 - plug&play",
+                "Active Monitor Mode unterstuetzt",
+                "Sehr gute Reichweite (5x Empfindlichkeit vs. Standard)",
+                "25% mehr gefundene Netzwerke als Vergleichsadapter",
+                "Wechselbare 5-dBi-Antenne",
+                "Laeuft auf allen modernen Distros (Kali, Ubuntu)",
+                "Guenstiger als AWUS036ACH (Realtek)",
+                "Bessere Reichweite als AWUS036ACM",
+                "Kali-Empfehlung 2025 (Lab401: 'Best WiFi Adapter for Pentesting')",
+                "VIF (Virtual Interfaces) unterstuetzt",
             ],
             "cons": [
-                "Treiber-Problem auf neuen Kernels",
-                "In VBox manchmal instabil (USB-Passthrough)",
-                "Kein WiFi 6/6E",
+                "Nur USB 2.0 (max. 433 Mbps auf 5 GHz)",
+                "Nur 1x1 (kein MIMO)",
+                "Geringerer Durchsatz als ACM (AC600 vs. AC1200)",
+                "LED leuchtet unter Linux nicht (kosmetisch)",
             ],
             "known_issues": [
-                "Monitor-Mode: TX-Power oft nur 20 dBm, unabhaengig von RegDomain",
-                "Injection in VBox kann 20s-Haenger verursachen",
+                "Keine bekannten kritischen Probleme Stand 2026",
+                "LED-Beleuchtung funktioniert unter Linux nicht",
             ],
-            "reliability": "usually-ok",
-            "recommendation": "gut fuer 2.4+5 GHz Pentest, aber nicht fuer Produktion",
-        },
-        "0bda:881a": {
-            "model": "Alfa AWUS036ACH",
-            "vendor": "Alfa",
-            "chipset": "RTL8812AU",
-            "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 4/5",
-            "usb": "3.0",
-            "monitor": True,
-            "injection": True,
-            "tx_max_dbm": 30,
-            "antenna": "2x RP-SMA",
-            "price_eur": 50,
-            "kernel_ok": ["5.x"],
-            "pros": ["Bewaehrt", "Injection-faehig"],
-            "cons": ["Aeltere Revision"],
-        },
-        "0bda:8179": {
-            "model": "Alfa AWUS036NH",
-            "vendor": "Alfa",
-            "chipset": "RTL8188EU",
-            "bands": ["2.4"],
-            "wifi_gen": "WiFi 4 (n)",
-            "usb": "2.0",
-            "monitor": True,
-            "injection": True,
-            "tx_max_dbm": 30,
-            "antenna": "1x RP-SMA",
-            "price_eur": 25,
-            "kernel_ok": ["4.x", "5.x", "6.x"],
-            "pros": ["Guentig", "Stabil", "Wechselbare Antenne"],
-            "cons": ["Nur 2.4 GHz", "Nur USB 2.0", "Nur 1x1"],
-        },
-        "0e8d:7961": {
-            "model": "Alfa AWUS036AXML",
-            "vendor": "Alfa",
-            "chipset": "MT7921AU",
-            "bands": ["2.4", "5", "6"],
-            "wifi_gen": "WiFi 6/6E",
-            "usb": "3.0",
-            "monitor": True,
-            "injection": True,
-            "tx_max_dbm": 20,
-            "antenna": "1x RP-SMA",
-            "price_eur": 70,
-            "kernel_ok": ["5.16+", "6.x"],
-            "pros": ["WiFi 6E (6 GHz)", "Moderner mt7921u-Treiber", "2x2 in 5 GHz"],
-            "cons": ["Teuer", "TX-max nur 20 dBm"],
-            "known_issues": [
-                "KRITISCH: mt7921u-Monitor-Mode ist Stand 2025/2026 "
-                "KAPUTT (bestaetigt von morrownr, Kernel 6.12/6.18)",
-                "Firmware-Probleme seit 2022 dokumentiert",
-                "Monitor-Mode auf 6 GHz unzuverlaessig",
-                "Firmware-Recovery nicht immer moeglich",
-                "NICHT KAUFEN bis Monitor-Mode-Bug gefixt ist",
-                "VOR KAUF pruefen: morrownr/USB-WiFi GitHub-Issues + "
-                "Kernel-Mailinglisten",
-            ],
-            "reliability": "broken",
-            "recommendation": "NICHT KAUFEN (Stand 2026) — Monitor-Mode "
-            "defekt, auf AWUS036ACM/ACHM ausweichen",
+            "reliability": "excellent",
+            "buy_recommendation": (
+                "TOP-EMPFEHLUNG fuer Pentesting 2025/2026 - "
+                "beste Kombination aus Stabilitaet, Reichweite und "
+                "In-Kernel-Support."
+            ),
         },
         "0e8d:7612": {
             "model": "Alfa AWUS036ACM",
             "vendor": "Alfa",
             "chipset": "MT7612U",
+            "chipset_family": "mt76",
+            "driver": "mt76x2u",
+            "driver_source": "in-kernel",
+            "kernel_since": "4.19 (2018)",
+            "release_date": "2020-03",
+            "eol": False,
             "bands": ["2.4", "5"],
             "wifi_gen": "WiFi 5 (AC1200)",
+            "max_rate_mbps": 867,
+            "mimo": "2x2",
             "usb": "3.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": True,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "1x RP-SMA (wechselbar)",
+            "antenna_gain_dbi": 5.0,
             "price_eur": 45,
-            "kernel_ok": ["4.19+", "5.x", "6.x"],
+            "price_tier": "mid",
             "pros": [
-                "Treiber mt76x2u IM KERNEL (plug and play)",
-                "Sehr stabil (mt76-Treiber)",
-                "2x2 MIMO (besser als ACHM)",
+                "In-Kernel-Treiber (mt76x2u) - plug&play",
+                "2x2 MIMO (besserer Durchsatz als ACHM)",
                 "USB 3.0 (schneller Durchsatz)",
-            ],
-            "cons": ["Nur 20 dBm TX", "Etwas weniger Reichweite als ACHM"],
-            "known_issues": [
-                "UNTERSCHIED zu ACHM: ACM hat AC1200 + USB 3.0 + 2x2 MIMO "
-                "= mehr Durchsatz, aber ETWAS weniger Reichweite als ACHM.",
-                "ACM = besser fuer parallele Captures (mehr Pakete/s)",
-                "ACHM = besser fuer schwache Signale (weiter entfernt)",
-                "Beide Treiber im Kernel = extrem zuverlaessig",
-            ],
-            "reliability": "stable",
-            "recommendation": "Top-Empfehlung fuer 2. Karte — "
-            "stabil, guenstig, Kernel-Treiber",
-        },
-        "0e8d:7610": {
-            "model": "Alfa AWUS036ACHM",
-            "vendor": "Alfa",
-            "chipset": "MT7610U",
-            "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 5 (AC600, nur 433 Mbps 5 GHz)",
-            "usb": "2.0",
-            "monitor": True,
-            "injection": True,
-            "tx_max_dbm": 20,
-            "antenna": "1x RP-SMA (wechselbar)",
-            "price_eur": 30,
-            "kernel_ok": ["4.19+", "5.x", "6.x"],
-            "pros": [
-                "Treiber mt76x0u IM KERNEL (plug and play)",
-                "Sehr gute Reichweite (besser als ACM!)",
+                "Active Monitor Mode",
                 "Sehr stabil (mt76-Treiber)",
-                "Antenne wechselbar",
+                "Kali-Empfehlung",
             ],
             "cons": [
-                "Nur USB 2.0 (max 433 Mbps auf 5 GHz)",
-                "Nur 1x1 (kein MIMO)",
-                "Weniger Durchsatz als ACM (AC600 vs AC1200)",
+                "Etwas weniger Reichweite als ACHM",
+                "Nur 20 dBm TX",
+                "Kein DFS (radar_detect_widths fehlt im USB-Treiber)",
+                "In VMs Probleme mit Packet-Injection",
             ],
             "known_issues": [
-                "UNTERSCHIED zu ACM: Das 'H' steht fuer 'High Power' "
-                "— ACHM ist auf REICHWEITE optimiert, "
-                "ACM auf DURCHSATZ (AC1200, 2x2, USB 3.0).",
-                "ACHM = MT7610U (AC600, USB 2.0, 1x1)",
-                "ACM = MT7612U (AC1200, USB 3.0, 2x2)",
-                "Beide Treiber im Kernel = extrem stabil",
+                "UNTERSCHIED zu ACHM: ACM hat AC1200 + USB 3.0 + 2x2 MIMO "
+                "= mehr Durchsatz, aber ETWAS weniger Reichweite.",
+                "ACM = besser fuer parallele Captures",
+                "ACHM = besser fuer schwache Signale",
+                "Injection in VMs oft unzuverlaessig - Bare-Metal empfohlen",
+                "Retry-Limit-Problem: immer 15 Retransmissions, "
+                "RTS/CTS-Problem (Issue morrownr/7612u#388)",
+                "Kernel-WARN bei fcsfail Monitor-Mode (CVE-2026-90382)",
             ],
-            "reliability": "stable",
-            "recommendation": "Beste Wahl fuer Reichweite/Wardriving — "
-            "ACM besser fuer Durchsatz",
+            "reliability": "excellent",
+            "buy_recommendation": (
+                "TOP-EMPFEHLUNG fuer Durchsatz-intensive Anwendungen - "
+                "2x2 MIMO, USB 3.0, In-Kernel. Ideal als primaerer "
+                "Arbeitsadapter auf Bare-Metal."
+            ),
+        },
+
+        # ==============================================================
+        # ALFA - REALTEK (DKMS, aeltere Modelle)
+        # ==============================================================
+        "0bda:8812": {
+            "model": "Alfa AWUS036ACH-C v2",
+            "vendor": "Alfa",
+            "chipset": "RTL8812AU",
+            "chipset_family": "rtl88XXau",
+            "driver": "rtl88XXau (aircrack-ng)",
+            "driver_source": "manual",
+            "kernel_since": "N/A (out-of-tree)",
+            "release_date": "2017-11",
+            "eol": False,
+            "bands": ["2.4", "5"],
+            "wifi_gen": "WiFi 4/5 (802.11ac)",
+            "max_rate_mbps": 867,
+            "mimo": "2x2",
+            "usb": "3.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": True,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": False,
+            "ap_plus_monitor": False,
+            "tx_max_dbm": 30,
+            "tx_max_mw": 1000,
+            "antenna": "2x RP-SMA (wechselbar)",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 55,
+            "price_tier": "mid",
+            "pros": [
+                "2x2 MIMO 5 GHz",
+                "USB 3.0 (schnell)",
+                "2x RP-SMA (wechselbar)",
+                "Sehr gute Empfindlichkeit",
+                "Injection-faehig",
+                "Hohe TX-Leistung (30 dBm)",
+                "DFS-Kanaele im AP-Modus unterstuetzt",
+                "Red-Team-Standard (aircrack-ng FAQ)",
+                "HW-Verify: ap_mode, injection, monitor verifiziert",
+            ],
+            "cons": [
+                "Treiber-Problem auf neuen Kernels",
+                "In VBox manchmal instabil",
+                "Kein WiFi 6/6E",
+                "Kein Active Monitor",
+                "LED leuchtet unter Linux nicht",
+            ],
+            "known_issues": [
+                "Monitor-Mode: TX-Power oft nur 20 dBm, unabhaengig von "
+                "RegDomain",
+                "Injection in VBox kann 20s-Haenger verursachen",
+                "rtl88XXau-Treiber aelter als 2018 und nicht offiziell "
+                "gepflegt",
+                "Auf Kernel 6.x/7.x Berichte ueber Compile-Fehler",
+                "Kernel 6.14+: rtw88/rtw89 In-Kernel-Treiber verfuegbar, "
+                "aber OHNE Active Monitor / VIF",
+                "aircrack-ng FAQ warnt: 'the driver can be unstable enough "
+                "to crash your kernel'",
+                "HW-Verify (Kernel 5.16, rtl88XXau-DKMS): VIF NICHT "
+                "unterstuetzt (Operation not supported -95). "
+                "ap_plus_monitor damit ebenfalls nicht moeglich.",
+                "Konsequenz: AP-Modus + Monitor parallel auf EINEM "
+                "Adapter nicht verfuegbar. Zwei Adapter erforderlich.",
+            ],
+            "reliability": "usually-ok",
+            "buy_recommendation": (
+                "NUR NOCH BEDINGT EMPFOHLEN - DKMS-Risiko. Fuer DFS und "
+                "maximale 5-GHz-Leistung weiterhin erste Wahl."
+            ),
+        },
+        "0bda:881a": {
+            "model": "Alfa AWUS036ACH",
+            "vendor": "Alfa",
+            "chipset": "RTL8812AU",
+            "chipset_family": "rtl88XXau",
+            "driver": "rtl88XXau (aircrack-ng)",
+            "driver_source": "manual",
+            "kernel_since": "N/A (out-of-tree)",
+            "release_date": "2016-06",
+            "eol": False,
+            "bands": ["2.4", "5"],
+            "wifi_gen": "WiFi 4/5",
+            "max_rate_mbps": 867,
+            "mimo": "2x2",
+            "usb": "3.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": True,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": False,
+            "ap_plus_monitor": False,
+            "tx_max_dbm": 30,
+            "tx_max_mw": 1000,
+            "antenna": "2x RP-SMA",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 50,
+            "price_tier": "mid",
+            "pros": [
+                "Bewaehrt",
+                "Injection-faehig",
+                "2x2 MIMO",
+                "Hohe TX-Leistung",
+            ],
+            "cons": [
+                "Aeltere Revision",
+                "Treiber-DKMS",
+                "Kein Active Monitor",
+            ],
+            "known_issues": [
+                "Wie 0bda:8812, aber aeltere Revision",
+                "Treiber-Probleme auf Kernel 6.x/7.x",
+                "VIF und ap_plus_monitor: siehe 0bda:8812 - "
+                "auf Kernel 5.16 DKMS nicht unterstuetzt",
+            ],
+            "reliability": "usually-ok",
+            "buy_recommendation": (
+                "VERALTET - AWUS036ACH-C v2 oder ACM/ACHM waehlen."
+            ),
         },
         "0bda:8813": {
             "model": "Alfa AWUS1900",
             "vendor": "Alfa",
             "chipset": "RTL8814AU",
+            "chipset_family": "rtl8814au",
+            "driver": "rtl8814au (aircrack-ng)",
+            "driver_source": "manual",
+            "kernel_since": "N/A (out-of-tree)",
+            "release_date": "2018-09",
+            "eol": False,
             "bands": ["2.4", "5"],
             "wifi_gen": "WiFi 5 (ac)",
+            "max_rate_mbps": 1733,
+            "mimo": "4x4",
             "usb": "3.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": False,
             "injection": True,
-            "tx_max_dbm": 23,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 33,
+            "tx_max_mw": 2000,
             "antenna": "4x RP-SMA (wechselbar!)",
+            "antenna_gain_dbi": 5.0,
             "price_eur": 90,
-            "kernel_ok": ["5.x"],
+            "price_tier": "high",
             "pros": [
                 "4x4 MIMO (bestes MIMO)",
                 "TX bis 33 dBm",
@@ -81254,117 +83306,399 @@ class WiFiAdapterCatalog:
                 "Gross (USB-Stick mit Kabel)",
                 "Treiber rtl8814au oft instabil",
                 "Wird warm",
+                "Stromhunger (VBox selten stabil)",
             ],
             "known_issues": [
                 "rtl8814au-Treiber weniger stabil als rtl8812au",
                 "In VBox selten stabil (Stromhunger)",
+                "Kein Active Monitor",
             ],
             "reliability": "usually-ok",
-            "recommendation": "Maximale Reichweite, aber Treiber-Risiko",
+            "buy_recommendation": (
+                "Maximale Reichweite, aber Treiber-Risiko. Nur fuer "
+                "Spezialfaelle (4x4 MIMO)."
+            ),
         },
+
+        # ==============================================================
+        # ALFA - RALINK (In-Kernel, stabil, aber alt)
+        # ==============================================================
         "148f:3572": {
             "model": "Alfa AWUS051NH v2",
             "vendor": "Alfa",
             "chipset": "RT3572",
+            "chipset_family": "rt2800usb",
+            "driver": "rt2800usb",
+            "driver_source": "in-kernel",
+            "kernel_since": "3.x (alt)",
+            "release_date": "2012-05",
+            "eol": True,
             "bands": ["2.4", "5"],
             "wifi_gen": "WiFi 4 (n)",
+            "max_rate_mbps": 300,
+            "mimo": "2x2",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": False,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": False,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 27,
+            "tx_max_mw": 500,
             "antenna": "2x RP-SMA",
+            "antenna_gain_dbi": 5.0,
             "price_eur": 40,
-            "kernel_ok": ["3.x+", "4.x", "5.x", "6.x"],
+            "price_tier": "low",
             "pros": [
                 "Sehr stabiler rt2800usb-Treiber (im Kernel)",
                 "2x RP-SMA",
                 "Dual-Band 2.4+5",
+                "Hohe TX-Leistung (27 dBm)",
             ],
-            "cons": ["Nur WiFi 4 (n)", "USB 2.0", "Nur 2x2"],
-            "known_issues": ["Treiber im Kernel — sehr stabil"],
+            "cons": [
+                "Nur WiFi 4 (n)",
+                "USB 2.0",
+                "Nur 2x2",
+                "EOL (End of Life)",
+                "Kein Active Monitor",
+            ],
+            "known_issues": [
+                "Treiber im Kernel - sehr stabil, aber alt",
+                "Nicht mehr produziert",
+            ],
             "reliability": "stable",
-            "recommendation": "sehr zuverlaessig fuer Dual-Band-Injection",
+            "buy_recommendation": (
+                "EOL - nur noch gebraucht. Fuer moderne Anforderungen "
+                "besser ACM/ACHM."
+            ),
         },
         "148f:3070": {
             "model": "Alfa Tube-U(N)",
             "vendor": "Alfa",
             "chipset": "RT3070",
+            "chipset_family": "rt2800usb",
+            "driver": "rt2800usb",
+            "driver_source": "in-kernel",
+            "kernel_since": "2.6.31 (2009)",
+            "release_date": "2011-08",
+            "eol": True,
             "bands": ["2.4"],
             "wifi_gen": "WiFi 4 (n)",
+            "max_rate_mbps": 150,
+            "mimo": "1x1",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": False,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": False,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 27,
+            "tx_max_mw": 500,
             "antenna": "1x N-Connector (Profi)",
+            "antenna_gain_dbi": 5.0,
             "price_eur": 45,
-            "kernel_ok": ["3.x+", "4.x", "5.x", "6.x"],
+            "price_tier": "mid",
             "pros": [
                 "Wasserdicht (Outdoor)",
-                "N-Connector fuer " "Richtantennen",
+                "N-Connector fuer Richtantennen",
                 "rt2800usb-Treiber (stabil)",
             ],
             "cons": [
                 "Nur 2.4 GHz",
                 "USB 2.0",
-                "Kein Gehaeuse-Schutz " "fuer USB-Stecker",
+                "Kein Gehaeuse-Schutz fuer USB-Stecker",
+                "EOL",
             ],
-            "known_issues": ["Outdoor-Einsatz — nicht fuer Labor"],
+            "known_issues": ["Outdoor-Einsatz - nicht fuer Labor"],
             "reliability": "stable",
-            "recommendation": "Outdoor/Aussenbereich mit Richtantenne",
-        },
-        "148f:5572": {
-            "model": "Panda PAU09",
-            "vendor": "Panda",
-            "chipset": "RT5572",
-            "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 4 (n)",
-            "usb": "2.0",
-            "monitor": True,
-            "injection": True,
-            "tx_max_dbm": 20,
-            "antenna": "2x RP-SMA",
-            "price_eur": 40,
-            "kernel_ok": ["3.x+", "4.x", "5.x", "6.x"],
-            "pros": [
-                "Sehr stabil (rt2800usb im Kernel)",
-                "2x RP-SMA wechselbar",
-                "Dual-Band",
-            ],
-            "cons": ["Nur WiFi 4", "USB 2.0", "Nur 2x2"],
-            "known_issues": ["Klassiker fuer Pentest — wenig Probleme"],
-            "reliability": "stable",
-            "recommendation": "sehr zuverlaessig (Kali-Empfehlung)",
+            "buy_recommendation": (
+                "EOL - nur fuer Outdoor/Aussenbereich mit Richtantenne."
+            ),
         },
         "148f:5370": {
             "model": "Alfa AWUS036NHA",
             "vendor": "Alfa",
             "chipset": "AR9271",
+            "chipset_family": "ath9k_htc",
+            "driver": "ath9k_htc",
+            "driver_source": "in-kernel",
+            "kernel_since": "2.6.35 (2010)",
+            "release_date": "2010-11",
+            "eol": True,
             "bands": ["2.4"],
             "wifi_gen": "WiFi 4 (n)",
+            "max_rate_mbps": 150,
+            "mimo": "1x1",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": False,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": False,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "1x RP-SMA",
+            "antenna_gain_dbi": 5.0,
             "price_eur": 25,
-            "kernel_ok": ["3.x+", "4.x", "5.x", "6.x"],
-            "pros": ["Ath9k-Treiber im Kernel (sehr stabil)", "Klassiker fuer Pentest"],
-            "cons": ["Nur 2.4 GHz", "USB 2.0", "Nur 1x1"],
+            "price_tier": "low",
+            "pros": [
+                "Ath9k-Treiber im Kernel (sehr stabil)",
+                "Klassiker fuer Pentest",
+                "Sehr zuverlaessig",
+            ],
+            "cons": [
+                "Nur 2.4 GHz",
+                "USB 2.0",
+                "Nur 1x1",
+                "EOL",
+                "Kein Active Monitor",
+            ],
+            "known_issues": ["Sehr stabil, aber technisch veraltet"],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "EOL - nur noch gebraucht. Fuer 2.4-GHz-Einstieg OK."
+            ),
         },
-        # TP-Link
+        "0bda:8187": {
+            "model": "Alfa AWUS036H",
+            "vendor": "Alfa",
+            "chipset": "RTL8187",
+            "chipset_family": "rtl8187",
+            "driver": "rtl8187",
+            "driver_source": "in-kernel",
+            "kernel_since": "2.6.x (2005)",
+            "release_date": "2006-01",
+            "eol": True,
+            "bands": ["2.4"],
+            "wifi_gen": "WiFi 3 (802.11b/g)",
+            "max_rate_mbps": 54,
+            "mimo": "1x1",
+            "usb": "2.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": True,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": True,
+            "ap_plus_monitor": False,
+            "tx_max_dbm": 20,
+            "tx_max_mw": 100,
+            "antenna": "1x RP-SMA (wechselbar)",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 35,
+            "price_tier": "low",
+            "pros": [
+                "Extrem stabiler rtl8187-Treiber (im Kernel)",
+                "Klassiker - laeuft mit jedem Linux",
+                "Sehr gute Empfindlichkeit auf 2.4 GHz",
+                "Voller Monitor-Mode + Injection (ZerBea-bestätigt)",
+                "VIF (managed-VIF) verifiziert: funktioniert",
+            ],
+            "cons": [
+                "Nur 802.11b/g (kein n, kein ac)",
+                "Kann HT/VHT-Frames nicht dekodieren",
+                "Nur USB 2.0",
+                "EOL seit Jahren",
+                "KEIN AP-Modus (Chipset-architektonisch)",
+            ],
+            "known_issues": [
+                "Zu alt fuer moderne Netzwerke (HT/VHT fehlen)",
+                "Beacon-Capture funktioniert, aber keine Datenanalyse "
+                "moderner Frames",
+                "Nicht fuer Evil-Twin/AP-Mode geeignet",
+                "HW-Verify (empirisch): phy-info listet nur "
+                "IBSS, managed, monitor - kein AP",
+                "HW-Verify (empirisch): managed-VIF laesst sich anlegen",
+            ],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "EOL - Legacy-Adapter. Fuer 2.4-GHz-Beacon-Capture OK, "
+                "aber technisch ueberholt. KEIN AP-Modus moeglich."
+            ),
+        },
+
+        # ==============================================================
+        # TP-LINK (Realtek DKMS)
+        # ==============================================================
+        "2357:011f": {
+            "model": "TP-Link Archer T3U (nicht Plus)",
+            "vendor": "TP-Link",
+            "chipset": "RTL8812BU",
+            "chipset_family": "rtl88x2bu",
+            "driver": "rtl88x2bu (DKMS)",
+            "driver_source": "dkms",
+            "kernel_since": "N/A (DKMS)",
+            "release_date": "2018-10",
+            "eol": False,
+            "bands": ["2.4", "5"],
+            "wifi_gen": "WiFi 5 (ac)",
+            "max_rate_mbps": 867,
+            "mimo": "1x1",
+            "usb": "3.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": "dkms",
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 20,
+            "tx_max_mw": 100,
+            "antenna": "intern (nicht wechselbar)",
+            "antenna_gain_dbi": 2.0,
+            "price_eur": 20,
+            "price_tier": "budget",
+            "pros": [
+                "Kompakt",
+                "WiFi 5 ac",
+                "USB 3.0",
+                "Guenstig",
+            ],
+            "cons": [
+                "1x1 only (kein MIMO) - halbe Reichweite",
+                "Antenne nicht wechselbar",
+                "Injection nur mit rtl8812bu-dkms",
+                "DFS-Kanaele (52-140): manche Router unsichtbar",
+                "Treiber-Stabilitaet schwankt",
+            ],
+            "known_issues": [
+                "UNTERSCHIED zu T3U Plus: keine externe Antenne",
+                "DFS-Kanal-Probleme",
+                "Kein MIMO",
+            ],
+            "reliability": "usually-ok",
+            "buy_recommendation": (
+                "Bedingt - T3U Plus (ext. Antenne) ist die bessere Wahl."
+            ),
+        },
+        "2357:0138": {
+            "model": "TP-Link Archer T3U Plus",
+            "vendor": "TP-Link",
+            "chipset": "RTL8812BU",
+            "chipset_family": "rtl88x2bu",
+            "driver": "rtl88x2bu (DKMS)",
+            "driver_source": "dkms",
+            "kernel_since": "N/A (DKMS)",
+            "release_date": "2020-06",
+            "eol": False,
+            "bands": ["2.4", "5"],
+            "wifi_gen": "WiFi 5 (ac, AC1300)",
+            "max_rate_mbps": 867,
+            "mimo": "1x1",
+            "usb": "3.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": "dkms",
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 20,
+            "tx_max_mw": 100,
+            "antenna": "1x externe High-Gain (RP-SMA, wechselbar)",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 22,
+            "price_tier": "budget",
+            "pros": [
+                "Externe High-Gain-Antenne (wechselbar!)",
+                "WiFi 5 ac, AC1300",
+                "USB 3.0",
+                "Bessere Reichweite als T3U ohne Plus",
+            ],
+            "cons": [
+                "1x1 only - kein MIMO",
+                "Injection nur mit rtl8812bu-dkms",
+                "DFS-Kanaele (52-140) eingeschraenkt",
+            ],
+            "known_issues": [
+                "Kein MIMO",
+                "DKMS-Treiber nicht im Kernel",
+                "Bestaetigt: KEIN Bluetooth (reiner WLAN-Adapter)",
+            ],
+            "reliability": "usually-ok",
+            "buy_recommendation": (
+                "Bedingt - besser als T3U ohne Plus, aber 1x1 + DKMS. "
+                "Fuer maximale Zuverlaessigkeit ACM/ACHM waehlen."
+            ),
+        },
+        "2357:0120": {
+            "model": "TP-Link Archer T2U Plus",
+            "vendor": "TP-Link",
+            "chipset": "RTL8821AU",
+            "chipset_family": "rtl8821au",
+            "driver": "rtl8821au (DKMS)",
+            "driver_source": "dkms",
+            "kernel_since": "N/A (DKMS)",
+            "release_date": "2017-08",
+            "eol": False,
+            "bands": ["2.4", "5"],
+            "wifi_gen": "WiFi 5 (ac)",
+            "max_rate_mbps": 433,
+            "mimo": "1x1",
+            "usb": "2.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": "dkms",
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 20,
+            "tx_max_mw": 100,
+            "antenna": "1x RP-SMA",
+            "antenna_gain_dbi": 3.0,
+            "price_eur": 15,
+            "price_tier": "budget",
+            "pros": ["Antenne wechselbar", "WiFi 5", "Guenstig"],
+            "cons": ["USB 2.0 (langsamer)", "1x1", "RTL8821AU-DKMS"],
+            "known_issues": ["Injection nur mit DKMS-Treiber"],
+            "reliability": "usually-ok",
+            "buy_recommendation": (
+                "OK fuer 2.4 GHz, begrenzt fuer 5 GHz."
+            ),
+        },
         "2357:0101": {
             "model": "TP-Link TL-WN722N v1",
             "vendor": "TP-Link",
             "chipset": "AR9271",
+            "chipset_family": "ath9k_htc",
+            "driver": "ath9k_htc",
+            "driver_source": "in-kernel",
+            "kernel_since": "2.6.35 (2010)",
+            "release_date": "2011-03",
+            "eol": True,
             "bands": ["2.4"],
             "wifi_gen": "WiFi 4",
+            "max_rate_mbps": 150,
+            "mimo": "1x1",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": False,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": False,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "1x RP-SMA (wechselbar!)",
+            "antenna_gain_dbi": 3.0,
             "price_eur": 15,
-            "kernel_ok": ["3.x+", "4.x", "5.x", "6.x"],
+            "price_tier": "budget",
             "pros": [
                 "Bewaehrt fuer Pentests",
                 "Sehr guenstig",
@@ -81375,34 +83709,56 @@ class WiFiAdapterCatalog:
                 "Nur 2.4 GHz",
                 "USB 2.0",
                 "1x1",
+                "EOL",
                 "NUR v1! v2/v3 sind RTL8188 (untauglich)",
             ],
             "known_issues": [
                 "v1 vs v2/v3 an USB-ID unterscheiden: "
-                "v1=2357:0101 (gut), v2/v3=2357:010c (siehe T3U)",
+                "v1=2357:0101 (gut), v2/v3=2357:010c (untauglich)",
             ],
             "reliability": "stable",
-            "recommendation": "sehr gut fuer 2.4-GHz-Pentest-Einstieg",
+            "buy_recommendation": (
+                "EOL - nur noch gebraucht. Fuer 2.4-GHz-Einstieg mit "
+                "ath9k sehr zuverlaessig."
+            ),
         },
         "2357:010c": {
             "model": "TP-Link TL-WN722N v2/v3",
             "vendor": "TP-Link",
             "chipset": "RTL8188EUS",
+            "chipset_family": "r8188eu",
+            "driver": "r8188eu",
+            "driver_source": "staging",
+            "kernel_since": "4.4 (staging)",
+            "release_date": "2016-08",
+            "eol": True,
             "bands": ["2.4"],
             "wifi_gen": "WiFi 4 (n)",
+            "max_rate_mbps": 150,
+            "mimo": "1x1",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": False,
             "injection": False,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": False,
+            "ap_plus_monitor": False,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "1x RP-SMA",
+            "antenna_gain_dbi": 3.0,
             "price_eur": 10,
-            "kernel_ok": ["4.x", "5.x", "6.x"],
+            "price_tier": "budget",
             "pros": ["Sehr guenstig", "Antenne wechselbar"],
             "cons": [
                 "v2/v3 NICHT fuer Injection (RTL8188EUS)",
                 "Nur 2.4 GHz",
                 "Nur USB 2.0",
                 "1x1",
+                "Kein AP-Mode",
+                "EOL",
             ],
             "known_issues": [
                 "Vorsicht beim Kauf: v1 (2357:0101) = AR9271 = GUT. "
@@ -81410,192 +83766,329 @@ class WiFiAdapterCatalog:
                 "Treiber r8188eu wackelig auf neuen Kernels",
             ],
             "reliability": "limited",
-            "recommendation": "NICHT kaufen — v1-Version ist besser",
+            "buy_recommendation": (
+                "NICHT KAUFEN - v1-Version (2357:0101) ist die einzig "
+                "brauchbare."
+            ),
         },
-        "2357:0138": {
-            "model": "TP-Link Archer T3U Plus",
-            "vendor": "TP-Link",
-            "chipset": "RTL8812BU",
+
+        # ==============================================================
+        # PANDA (mt76, In-Kernel)
+        # ==============================================================
+        "148f:5572": {
+            "model": "Panda PAU09",
+            "vendor": "Panda",
+            "chipset": "RT5572",
+            "chipset_family": "rt2800usb",
+            "driver": "rt2800usb",
+            "driver_source": "in-kernel",
+            "kernel_since": "3.x (alt)",
+            "release_date": "2013-07",
+            "eol": True,
             "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 5 (ac, AC1300)",
-            "usb": "3.0",
-            "monitor": True,
-            "injection": "dkms",
-            "tx_max_dbm": 20,
-            "antenna": "1x externe High-Gain (RP-SMA, wechselbar)",
-            "price_eur": 22,
-            "kernel_ok": ["5.x", "6.x"],
-            "pros": [
-                "Externe High-Gain-Antenne (wechselbar!)",
-                "WiFi 5 ac, AC1300",
-                "USB 3.0",
-                "Bessere Reichweite als T3U ohne Plus",
-            ],
-            "cons": [
-                "1x1 only — kein MIMO",
-                "Injection nur mit rtl8812bu-dkms",
-                "DFS-Kanaele (52-140) eingeschraenkt",
-            ],
-            "known_issues": [
-                "UNTERSCHIED zu T3U: Der Plus hat eine "
-                "externe RP-SMA-Antenne (wechselbar) + "
-                "bessere Empfindlichkeit. Der normale T3U hat "
-                "nur interne Antenne.",
-                "Beide sind 1x1 (kein MIMO) — halbe Reichweite "
-                "vs. 2x2-Adapter (Alfa ACM/ACHM).",
-                "Treiber rtl8812bu nicht im Kernel — DKMS-Installation.",
-            ],
-            "reliability": "usually-ok",
-            "recommendation": "bessere Wahl gegenueber dem T3U ohne Plus — "
-            "externe Antenne macht den Unterschied",
-        },
-        "2357:011f": {
-            "model": "TP-Link Archer T3U (nicht Plus)",
-            "vendor": "TP-Link",
-            "chipset": "RTL8812BU",
-            "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 5 (ac)",
-            "usb": "3.0",
-            "monitor": True,
-            "injection": "dkms",
-            "tx_max_dbm": 20,
-            "antenna": "intern (nicht wechselbar)",
-            "price_eur": 20,
-            "kernel_ok": ["5.x"],
-            "pros": ["Kompakt", "WiFi 5 ac", "USB 3.0", "Guentig"],
-            "cons": [
-                "1x1 only (kein MIMO) — halbe Reichweite",
-                "Antenne nicht wechselbar",
-                "Injection nur mit rtl8812bu-dkms (nicht im Kernel)",
-                "DFS-Kanaele (52-140): manche Router werden nicht gefunden",
-                "Treiber-Stabilitaet schwankt (RTL8812BU)",
-            ],
-            "known_issues": [
-                "UNTERSCHIED zu T3U Plus: Der normale T3U hat "
-                "KEINE externe Antenne! Der T3U Plus (2357:0138) "
-                "hat eine RP-SMA-Antenne (besser).",
-                "DFS-Kanal-Probleme: Kanal 100-140 oft unsichtbar",
-                "Kein MIMO -> schlechtere Empfindlichkeit",
-            ],
-            "reliability": "usually-ok",
-            "recommendation": "bedingt — T3U Plus (ext. Antenne) ist die "
-            "bessere Wahl fuer den gleichen Preis-Bereich",
-        },
-        "2357:0120": {
-            "model": "TP-Link Archer T2U Plus",
-            "vendor": "TP-Link",
-            "chipset": "RTL8821AU",
-            "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 5 (ac)",
+            "wifi_gen": "WiFi 4 (n)",
+            "max_rate_mbps": 300,
+            "mimo": "2x2",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": True,
-            "injection": "dkms",
-            "tx_max_dbm": 20,
-            "antenna": "1x RP-SMA",
-            "price_eur": 15,
-            "kernel_ok": ["5.x"],
-            "pros": ["Antenne wechselbar", "WiFi 5", "Guentig"],
-            "cons": ["USB 2.0 (langsamer)", "1x1", "RTL8821AU-DKMS"],
-            "known_issues": ["Injection nur mit DKMS-Treiber"],
-            "reliability": "usually-ok",
-            "recommendation": "ok fuer 2.4 GHz, begrenzt fuer 5 GHz",
-        },
-        "2357:0101": {
-            "model": "TP-Link Archer T4U v1",
-            "vendor": "TP-Link",
-            "chipset": "RTL8812AU",
-            "bands": ["2.4", "5"],
-            "wifi_gen": "WiFi 5 (ac)",
-            "usb": "3.0",
-            "monitor": True,
+            "active_monitor": False,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": False,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 20,
-            "antenna": "intern (nicht wechselbar)",
-            "price_eur": 25,
-            "kernel_ok": ["5.x"],
-            "pros": ["2x2 MIMO", "WiFi 5 ac"],
-            "cons": ["Interne Antenne", "Treiber-DKMS"],
+            "tx_max_mw": 100,
+            "antenna": "2x RP-SMA",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 40,
+            "price_tier": "mid",
+            "pros": [
+                "Sehr stabil (rt2800usb im Kernel)",
+                "2x RP-SMA wechselbar",
+                "Dual-Band",
+                "Kali-Empfehlung (Klassiker)",
+            ],
+            "cons": ["Nur WiFi 4", "USB 2.0", "Nur 2x2", "EOL"],
+            "known_issues": ["Klassiker fuer Pentest - wenig Probleme"],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "EOL - nur noch gebraucht. Sehr zuverlaessig, aber "
+                "technisch veraltet."
+            ),
+        },
+
+        # ==============================================================
+        # COMFAST - Multi-State (Vorsicht!)
+        # ==============================================================
+        "0bda:8822": {
+            "model": "Comfast CF-WU782AC",
+            "vendor": "Comfast",
+            "chipset": "MT7612U",
+            "chipset_family": "mt76",
+            "driver": "mt76x2u",
+            "driver_source": "in-kernel",
+            "kernel_since": "4.19 (2018)",
+            "release_date": "2019-08",
+            "eol": False,
+            "bands": ["2.4", "5"],
+            "wifi_gen": "WiFi 5 (AC1200)",
+            "max_rate_mbps": 867,
+            "mimo": "2x2",
+            "usb": "3.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": True,
+            "injection": True,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 18,
+            "tx_max_mw": 63,
+            "antenna": "2x 6 dBi (High-Gain, wechselbar)",
+            "antenna_gain_dbi": 6.0,
+            "price_eur": 28,
+            "price_tier": "low",
+            "multi_state": True,
+            "modeswitch_required": True,
+            "pros": [
+                "In-Kernel-Treiber (mt76x2u)",
+                "2x6 dBi High-Gain-Antennen",
+                "Signalqualitaet sehr gut",
+                "Guenstiger als ALFA",
+                "USB 3.0",
+            ],
+            "cons": [
+                "MULTI-STATE: meldet sich als CD-ROM beim Einstecken",
+                "usb_modeswitch erforderlich (Fehlerquelle!)",
+                "Auf Raspberry Pi 4 nicht als In-Kernel erkannt",
+                "Von morrownr aus 'Plug and Play'-Liste entfernt",
+            ],
             "known_issues": [
-                "Nur v1 = RTL8812AU (gut). Spaetere Revisionen = RTL8812BU"
+                "Multi-State: beim Neustart/Reconnect kann der "
+                "Modeswitch fehlschlagen",
+                "Nicht empfohlen fuer Zero-Fehler-Toleranz",
             ],
             "reliability": "usually-ok",
-            "recommendation": "solide 2x2-Option ohne ext. Antenne",
+            "buy_recommendation": (
+                "Bedingt - guenstiger als ALFA, aber Multi-State-"
+                "Risiko. Nur wenn ACM ausverkauft und Zuverlaessigkeit "
+                "zweitrangig."
+            ),
         },
+
+        # ==============================================================
+        # ALFA WiFi 6E (Monitor-Mode BROKEN!)
+        # ==============================================================
+        "0e8d:7961": {
+            "model": "Alfa AWUS036AXML",
+            "vendor": "Alfa",
+            "chipset": "MT7921AU",
+            "chipset_family": "mt76",
+            "driver": "mt7921u",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.16+",
+            "release_date": "2023-05",
+            "eol": False,
+            "bands": ["2.4", "5", "6"],
+            "wifi_gen": "WiFi 6E",
+            "max_rate_mbps": 2400,
+            "mimo": "2x2",
+            "usb": "3.0",
+            "interface": "USB",
+            "monitor": True,
+            "active_monitor": False,
+            "injection": True,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
+            "tx_max_dbm": 20,
+            "tx_max_mw": 100,
+            "antenna": "1x RP-SMA",
+            "antenna_gain_dbi": 5.0,
+            "price_eur": 70,
+            "price_tier": "high",
+            "pros": ["WiFi 6E (6 GHz)", "2x2 in 5 GHz"],
+            "cons": ["Teuer", "TX-max nur 20 dBm"],
+            "known_issues": [
+                "KRITISCH: mt7921u-Monitor-Mode ist Stand 2025/2026 "
+                "KAPUTT (bestaetigt morrownr, Kernel 6.12/6.18)",
+                "Firmware-Probleme seit 2022",
+                "Monitor-Mode auf 6 GHz unzuverlaessig",
+                "NICHT KAUFEN bis Monitor-Mode-Bug gefixt ist",
+            ],
+            "reliability": "broken",
+            "buy_recommendation": (
+                "NICHT KAUFEN (Stand 2026) - Monitor-Mode defekt, auf "
+                "AWUS036ACM/ACHM ausweichen."
+            ),
+        },
+
+        # ==============================================================
+        # INTEL (PCIe - kein Injection)
+        # ==============================================================
         "8086:2723": {
             "model": "Intel AX200",
             "vendor": "Intel",
             "chipset": "AX200",
+            "chipset_family": "iwlwifi",
+            "driver": "iwlwifi",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.1 (2019)",
+            "release_date": "2019-04",
+            "eol": False,
             "bands": ["2.4", "5"],
             "wifi_gen": "WiFi 6",
+            "max_rate_mbps": 2400,
+            "mimo": "2x2",
             "usb": "PCIe",
+            "interface": "PCIe",
             "monitor": True,
+            "active_monitor": False,
             "injection": False,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": False,
+            "ap_plus_monitor": False,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "2x MHF4 (intern)",
+            "antenna_gain_dbi": 2.0,
             "price_eur": 20,
-            "kernel_ok": ["5.1+"],
+            "price_tier": "budget",
             "pros": ["WiFi 6", "Treiber im Kernel", "Gute Reichweite"],
-            "cons": ["Nur intern verbaubar", "Kein Injection"],
+            "cons": [
+                "Nur intern verbaubar",
+                "Kein Injection",
+                "Kein AP-Mode",
+            ],
             "known_issues": [
                 "Monitor-Mode zeigt OFT NUR eigenen Traffic "
                 "(Intel-Firmware-Filter), keine fremden Beacons",
-                "Kein Packet-Injection moeglich (Intel-Firmware-Lock)",
-                "UNBRAUCHBAR fuer echte Pentests — nur fuer eigene Diagnose",
+                "Kein Packet-Injection moeglich",
+                "UNBRAUCHBAR fuer echte Pentests",
             ],
             "reliability": "usable-only",
-            "recommendation": "NICHT fuer Pentest — nur als 2. Karte",
+            "buy_recommendation": (
+                "NICHT fuer Pentest - nur als 2. Karte fuer Diagnose."
+            ),
         },
         "8086:2725": {
             "model": "Intel AX210",
             "vendor": "Intel",
             "chipset": "AX210",
+            "chipset_family": "iwlwifi",
+            "driver": "iwlwifi",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.10 (2020)",
+            "release_date": "2020-10",
+            "eol": False,
             "bands": ["2.4", "5", "6"],
             "wifi_gen": "WiFi 6E",
+            "max_rate_mbps": 2400,
+            "mimo": "2x2",
             "usb": "PCIe",
+            "interface": "PCIe",
             "monitor": True,
+            "active_monitor": False,
             "injection": False,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": False,
+            "ap_plus_monitor": False,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "2x MHF4 (intern)",
+            "antenna_gain_dbi": 2.0,
             "price_eur": 25,
-            "kernel_ok": ["5.10+"],
+            "price_tier": "budget",
             "pros": ["WiFi 6E", "Treiber im Kernel"],
-            "cons": ["Nur intern", "Kein Injection"],
+            "cons": ["Nur intern", "Kein Injection", "Kein AP-Mode"],
             "known_issues": [
                 "Monitor-Mode wie AX200 stark eingeschraenkt",
                 "Kein Injection",
             ],
             "reliability": "usable-only",
-            "recommendation": "NICHT fuer Pentest — nur fuer Diagnose",
+            "buy_recommendation": "NICHT fuer Pentest - nur Diagnose.",
         },
+
+        # ==============================================================
+        # NETGEAR
+        # ==============================================================
         "0846:9011": {
             "model": "Netgear A6210",
             "vendor": "Netgear",
             "chipset": "MT7612U",
+            "chipset_family": "mt76",
+            "driver": "mt76x2u",
+            "driver_source": "in-kernel",
+            "kernel_since": "4.19 (2018)",
+            "release_date": "2015-06",
+            "eol": True,
             "bands": ["2.4", "5"],
             "wifi_gen": "WiFi 5",
+            "max_rate_mbps": 867,
+            "mimo": "2x2",
             "usb": "3.0",
+            "interface": "USB",
             "monitor": True,
+            "active_monitor": True,
             "injection": True,
+            "ap_mode": True,
+            "p2p_go": True,
+            "vif": True,
+            "ap_plus_monitor": True,
             "tx_max_dbm": 20,
+            "tx_max_mw": 100,
             "antenna": "2x intern",
+            "antenna_gain_dbi": 3.0,
             "price_eur": 40,
-            "kernel_ok": ["4.19+", "5.x", "6.x"],
-            "pros": ["Stabil", "2x2"],
-            "cons": ["Interne Antennen"],
+            "price_tier": "mid",
+            "pros": ["Stabil", "2x2", "In-Kernel"],
+            "cons": ["Interne Antennen", "EOL"],
+            "known_issues": ["Nicht mehr produziert"],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "EOL - nur noch gebraucht. In-Kernel-Stabilitaet mit "
+                "2x2 MIMO, aber ohne externe Antennen."
+            ),
         },
+
+        # ==============================================================
+        # BLUETOOTH
+        # ==============================================================
         "0a12:0001": {
             "model": "CSR 4.0 USB-Dongle (BCM20702)",
             "vendor": "CSR/Generic",
             "chipset": "BCM20702",
+            "chipset_family": "btusb",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "3.x",
+            "release_date": "2012-01",
+            "eol": False,
             "bands": ["BT-Classic", "BLE"],
             "wifi_gen": "Bluetooth 4.0",
+            "max_rate_mbps": 3,
+            "mimo": "N/A",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": False,
+            "active_monitor": False,
             "injection": False,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": False,
+            "ap_plus_monitor": False,
             "tx_max_dbm": 4,
+            "tx_max_mw": 2.5,
             "antenna": "intern",
+            "antenna_gain_dbi": 2.0,
             "price_eur": 10,
-            "kernel_ok": ["4.x+", "5.x", "6.x"],
+            "price_tier": "budget",
             "pros": [
                 "BLE + Classic",
                 "Kompakt",
@@ -81603,191 +84096,245 @@ class WiFiAdapterCatalog:
                 "Funktioniert direkt mit bluez/bleak",
             ],
             "cons": ["Kein WiFi", "Kurze Reichweite"],
+            "known_issues": [],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Solide Wahl fuer BLE-Sniffing/Classic - guenstig."
+            ),
         },
         "0bda:8771": {
             "model": "Realtek RTL8761B BT 5.0",
             "vendor": "Realtek",
             "chipset": "RTL8761B",
+            "chipset_family": "btusb",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.4 (2019)",
+            "release_date": "2020-03",
+            "eol": False,
             "bands": ["BT-Classic", "BLE"],
             "wifi_gen": "Bluetooth 5.0",
+            "max_rate_mbps": 3,
+            "mimo": "N/A",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": False,
+            "active_monitor": False,
             "injection": False,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": False,
+            "ap_plus_monitor": False,
             "tx_max_dbm": 4,
+            "tx_max_mw": 2.5,
             "antenna": "intern",
+            "antenna_gain_dbi": 2.0,
             "price_eur": 12,
-            "kernel_ok": ["5.4+"],
-            "pros": ["BLE 5.0 (schneller, laenger)", "Guentig"],
+            "price_tier": "budget",
+            "pros": ["BLE 5.0", "Guenstig", "Sehr gute Treiberqualitaet"],
             "cons": ["Kernel 5.4+ noetig"],
+            "known_issues": [],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Gute Wahl fuer BLE 5.0 - morrownr empfiehlt RTL8761B "
+                "fuer 'very long range'."
+            ),
         },
+
+        # ==============================================================
         # GPS
+        # ==============================================================
         "1546:01a7": {
             "model": "u-blox NEO-6M (USB)",
             "vendor": "u-blox",
             "chipset": "NEO-6M",
+            "chipset_family": "gpsd",
+            "driver": "gpsd",
+            "driver_source": "userspace",
+            "kernel_since": "N/A",
+            "release_date": "2011-05",
+            "eol": False,
             "bands": ["GPS", "GLONASS"],
             "wifi_gen": "GPS",
+            "max_rate_mbps": 0,
+            "mimo": "N/A",
             "usb": "2.0",
+            "interface": "USB",
             "monitor": False,
+            "active_monitor": False,
             "injection": False,
+            "ap_mode": False,
+            "p2p_go": False,
+            "vif": False,
+            "ap_plus_monitor": False,
             "tx_max_dbm": 0,
+            "tx_max_mw": 0,
             "antenna": "Keramik-Patch + SMA-option",
+            "antenna_gain_dbi": 3.0,
             "price_eur": 15,
-            "kernel_ok": ["3.x+", "4.x", "5.x", "6.x"],
-            "pros": ["Guentig", "Funktioniert direkt mit gpsd", "NMEA-Standard"],
+            "price_tier": "budget",
+            "pros": [
+                "Guenstig",
+                "Funktioniert direkt mit gpsd",
+                "NMEA-Standard",
+            ],
             "cons": ["Langsam (1 Hz)", "Kein Multi-Band"],
+            "known_issues": [],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Solide GPS-Wahl fuer War-Driving - NMEA-kompatibel."
+            ),
         },
     }
 
+    # ------------------------------------------------------------------
+    # Antennen-Info
+    # ------------------------------------------------------------------
     ANTENNA_INFO = {
-        "0bda:8812": {
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0bda:881a": {
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0bda:8179": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0bda:8187": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0bda:8813": {
-            "antennas": 4,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "148f:5370": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "148f:3572": {
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "148f:5572": {
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0e8d:7610": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0e8d:7612": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0e8d:7961": {
-            "antennas": 2,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "2357:0101": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 3.0,
-            "removable": True,
-            "bt": False,
-        },
-        "2357:010c": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 3.0,
-            "removable": True,
-            "bt": False,
-        },
-        "2357:011f": {
-            "antennas": 0,
-            "connector": "intern",
-            "gain_dbi": 2.0,
-            "removable": False,
-            "bt": False,
-        },
-        "2357:0138": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 5.0,
-            "removable": True,
-            "bt": False,
-        },
-        "2357:0120": {
-            "antennas": 1,
-            "connector": "RP-SMA",
-            "gain_dbi": 3.0,
-            "removable": True,
-            "bt": False,
-        },
-        "0846:9011": {
-            "antennas": 2,
-            "connector": "intern",
-            "gain_dbi": 3.0,
-            "removable": False,
-            "bt": False,
-        },
-        "0a12:0001": {
-            "antennas": 1,
-            "connector": "intern",
-            "gain_dbi": 2.0,
-            "removable": False,
-            "bt": True,
-        },
-        "0bda:8771": {
-            "antennas": 1,
-            "connector": "intern",
-            "gain_dbi": 2.0,
-            "removable": False,
-            "bt": True,
-        },
-        "1546:01a7": {
-            "antennas": 1,
-            "connector": "SMA-optional",
-            "gain_dbi": 3.0,
-            "removable": True,
-            "bt": False,
-        },
+        "0bda:8812": {"antennas": 2, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0bda:881a": {"antennas": 2, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0bda:8813": {"antennas": 4, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0bda:8187": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "148f:5370": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "148f:3572": {"antennas": 2, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "148f:5572": {"antennas": 2, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0e8d:7610": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0e8d:7612": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0e8d:7961": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "0bda:8822": {"antennas": 2, "connector": "RP-SMA",
+                      "gain_dbi": 6.0, "removable": True, "bt": False},
+        "2357:0101": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 3.0, "removable": True, "bt": False},
+        "2357:010c": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 3.0, "removable": True, "bt": False},
+        "2357:011f": {"antennas": 0, "connector": "intern",
+                      "gain_dbi": 2.0, "removable": False, "bt": False},
+        "2357:0138": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 5.0, "removable": True, "bt": False},
+        "2357:0120": {"antennas": 1, "connector": "RP-SMA",
+                      "gain_dbi": 3.0, "removable": True, "bt": False},
+        "0846:9011": {"antennas": 2, "connector": "intern",
+                      "gain_dbi": 3.0, "removable": False, "bt": False},
+        "0a12:0001": {"antennas": 1, "connector": "intern",
+                      "gain_dbi": 2.0, "removable": False, "bt": True},
+        "0bda:8771": {"antennas": 1, "connector": "intern",
+                      "gain_dbi": 2.0, "removable": False, "bt": True},
+        "1546:01a7": {"antennas": 1, "connector": "SMA-optional",
+                      "gain_dbi": 3.0, "removable": True, "bt": False},
     }
 
+    # ------------------------------------------------------------------
+    # Chipset-Referenz
+    # ------------------------------------------------------------------
+    CHIPSET_REFERENCE = {
+        "MT7610U": {"vendor": "MediaTek", "driver": "mt76x0u",
+                    "source": "in-kernel", "monitor": True,
+                    "injection": True, "active_monitor": True,
+                    "ap_mode": True, "wifi_gen": "WiFi 5",
+                    "usb": "2.0", "mimo": "1x1",
+                    "notes": "Sehr stabil, plug&play, beste Reichweite"},
+        "MT7612U": {"vendor": "MediaTek", "driver": "mt76x2u",
+                    "source": "in-kernel", "monitor": True,
+                    "injection": True, "active_monitor": True,
+                    "ap_mode": True, "wifi_gen": "WiFi 5",
+                    "usb": "3.0", "mimo": "2x2",
+                    "notes": "Sehr stabil, plug&play, mehr Durchsatz"},
+        "MT7921AU": {"vendor": "MediaTek", "driver": "mt7921u",
+                     "source": "in-kernel", "monitor": True,
+                     "injection": True, "active_monitor": False,
+                     "ap_mode": True, "wifi_gen": "WiFi 6E",
+                     "usb": "3.0", "mimo": "2x2",
+                     "notes": "Monitor-Mode instabil (2025/2026), "
+                              "von morrownr abgeraten"},
+        "RTL8812AU": {"vendor": "Realtek", "driver": "rtl88XXau (DKMS)",
+                      "source": "dkms", "monitor": True,
+                      "injection": True, "active_monitor": False,
+                      "ap_mode": True, "wifi_gen": "WiFi 5",
+                      "usb": "3.0", "mimo": "2x2",
+                      "notes": "Treiber veraltet, Probleme auf Kernel 6.x+"},
+        "RTL8814AU": {"vendor": "Realtek", "driver": "rtl8814au (DKMS)",
+                      "source": "dkms", "monitor": True,
+                      "injection": True, "active_monitor": False,
+                      "ap_mode": True, "wifi_gen": "WiFi 5",
+                      "usb": "3.0", "mimo": "4x4",
+                      "notes": "Instabil, Stromhunger, VBox-Probleme"},
+        "RTL8812BU": {"vendor": "Realtek", "driver": "rtl88x2bu (DKMS)",
+                      "source": "dkms", "monitor": True,
+                      "injection": "dkms", "active_monitor": False,
+                      "ap_mode": True, "wifi_gen": "WiFi 5",
+                      "usb": "3.0", "mimo": "1x1",
+                      "notes": "DFS-Probleme, kein MIMO, DKMS noetig"},
+        "AR9271": {"vendor": "Atheros", "driver": "ath9k_htc",
+                   "source": "in-kernel", "monitor": True,
+                   "injection": True, "active_monitor": False,
+                   "ap_mode": True, "wifi_gen": "WiFi 4",
+                   "usb": "2.0", "mimo": "1x1",
+                   "notes": "Sehr stabil, aber technisch veraltet (EOL)"},
+        "RT3070": {"vendor": "Ralink", "driver": "rt2800usb",
+                   "source": "in-kernel", "monitor": True,
+                   "injection": True, "active_monitor": False,
+                   "ap_mode": True, "wifi_gen": "WiFi 4",
+                   "usb": "2.0", "mimo": "1x1",
+                   "notes": "Stabil, aber EOL"},
+        "RT3572": {"vendor": "Ralink", "driver": "rt2800usb",
+                   "source": "in-kernel", "monitor": True,
+                   "injection": True, "active_monitor": False,
+                   "ap_mode": True, "wifi_gen": "WiFi 4",
+                   "usb": "2.0", "mimo": "2x2",
+                   "notes": "Stabil, aber EOL"},
+        "RT5572": {"vendor": "Ralink", "driver": "rt2800usb",
+                   "source": "in-kernel", "monitor": True,
+                   "injection": True, "active_monitor": False,
+                   "ap_mode": True, "wifi_gen": "WiFi 4",
+                   "usb": "2.0", "mimo": "2x2",
+                   "notes": "Stabil, aber EOL"},
+        "RTL8187": {"vendor": "Realtek", "driver": "rtl8187",
+                    "source": "in-kernel", "monitor": True,
+                    "injection": True, "active_monitor": False,
+                    "ap_mode": False, "wifi_gen": "WiFi 3 (b/g)",
+                    "usb": "2.0", "mimo": "1x1",
+                    "notes": "Legacy, kann HT/VHT nicht dekodieren"},
+        "RTL8188EUS": {"vendor": "Realtek", "driver": "r8188eu",
+                       "source": "staging", "monitor": True,
+                       "injection": False, "active_monitor": False,
+                       "ap_mode": False, "wifi_gen": "WiFi 4",
+                       "usb": "2.0", "mimo": "1x1",
+                       "notes": "UNBRAUCHBAR fuer Injection/AP - "
+                                "NICHT kaufen"},
+        "AX200": {"vendor": "Intel", "driver": "iwlwifi",
+                  "source": "in-kernel", "monitor": True,
+                  "injection": False, "active_monitor": False,
+                  "ap_mode": False, "wifi_gen": "WiFi 6",
+                  "usb": "PCIe", "mimo": "2x2",
+                  "notes": "Monitor-Mode eingeschraenkt, kein "
+                           "Injection - NICHT fuer Pentest"},
+        "AX210": {"vendor": "Intel", "driver": "iwlwifi",
+                  "source": "in-kernel", "monitor": True,
+                  "injection": False, "active_monitor": False,
+                  "ap_mode": False, "wifi_gen": "WiFi 6E",
+                  "usb": "PCIe", "mimo": "2x2",
+                  "notes": "Wie AX200 - NICHT fuer Pentest"},
+    }
+
+    AGE_WARNING_YEARS = 5
+
+    # ------------------------------------------------------------------
+    # Basis-Lookup
+    # ------------------------------------------------------------------
     @classmethod
     def alfa_usb_ids(cls) -> set:
-        """Erzeugt die Liste der Alfa-USB-IDs aus KNOWN."""
         return {
-            uid
-            for uid, info in cls.KNOWN.items()
+            uid for uid, info in cls.KNOWN.items()
             if info.get("vendor", "").lower() == "alfa"
         }
 
@@ -81797,7 +84344,9 @@ class WiFiAdapterCatalog:
 
     @classmethod
     def usb_to_chipset(cls) -> dict:
-        return {uid: info.get("chipset", "") for uid, info in cls.KNOWN.items()}
+        return {
+            uid: info.get("chipset", "") for uid, info in cls.KNOWN.items()
+        }
 
     @classmethod
     def get_antenna_info(cls, usb_id: str) -> dict:
@@ -81811,7 +84360,6 @@ class WiFiAdapterCatalog:
 
     @classmethod
     def wifi_usb_ids(cls) -> set:
-        """Nur WLAN-Adapter (kein BT/GPS)."""
         out = set()
         for uid, info in cls.KNOWN.items():
             gen = info.get("wifi_gen", "")
@@ -81830,13 +84378,253 @@ class WiFiAdapterCatalog:
     def all_vendors(cls) -> list:
         return sorted(set(a["vendor"] for a in cls.KNOWN.values()))
 
-
-class HardwareAdvisor:
-    """v37-R14: Analysiert System und empfiehlt konkrete Hardware."""
+    # ------------------------------------------------------------------
+    # Such- und Filter-Methoden
+    # ------------------------------------------------------------------
+    @classmethod
+    def find_by_chipset(cls, chipset: str) -> list:
+        cs = chipset.upper()
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("chipset", "").upper() == cs
+        ]
 
     @classmethod
+    def find_by_vendor(cls, vendor: str) -> list:
+        v = vendor.lower()
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("vendor", "").lower() == v
+        ]
+
+    @classmethod
+    def find_recommended(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("buy_recommendation", "").startswith(
+                ("TOP", "Gute", "Solide", "Bedingt")
+            )
+        ]
+
+    @classmethod
+    def find_pentest_capable(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if (info.get("monitor") and info.get("injection")
+                and info.get("ap_mode"))
+        ]
+
+    @classmethod
+    def find_in_kernel(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("driver_source") == "in-kernel"
+        ]
+
+    @classmethod
+    def find_with_active_monitor(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("active_monitor")
+        ]
+
+    @classmethod
+    def find_with_mimo(cls, min_mimo: str = "2x2") -> list:
+        order = {"1x1": 1, "2x2": 2, "4x4": 4}
+        min_val = order.get(min_mimo, 0)
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if order.get(info.get("mimo", "1x1"), 0) >= min_val
+        ]
+
+    # ------------------------------------------------------------------
+    # Zusammenfassungen
+    # ------------------------------------------------------------------
+    @classmethod
+    def summary(cls) -> dict:
+        total = len(cls.KNOWN)
+        wifi = len(cls.wifi_usb_ids())
+        bt_gps = total - wifi
+        in_kernel = len(cls.find_in_kernel())
+        dkms = sum(
+            1 for i in cls.KNOWN.values()
+            if i.get("driver_source") == "dkms"
+        )
+        recommended = len(cls.find_recommended())
+        pentest = len(cls.find_pentest_capable())
+        active = len(cls.find_with_active_monitor())
+        eol = sum(1 for i in cls.KNOWN.values() if i.get("eol"))
+        return {
+            "total": total,
+            "wifi": wifi,
+            "bt_gps": bt_gps,
+            "in_kernel": in_kernel,
+            "dkms": dkms,
+            "recommended": recommended,
+            "pentest_capable": pentest,
+            "active_monitor": active,
+            "eol": eol,
+            "vendors": len(cls.all_vendors()),
+            "chipsets": len(cls.CHIPSET_REFERENCE),
+        }
+
+    @classmethod
+    def render_short_report(cls, usb_id: str) -> str:
+        info = cls.lookup(usb_id)
+        if not info:
+            return f"Unbekannter Adapter: {usb_id}"
+        lines = [
+            f"{info['model']} ({usb_id})",
+            f"  Chipsatz:    {info.get('chipset', '?')}",
+            f"  Treiber:     {info.get('driver', '?')} "
+            f"({info.get('driver_source', '?')}, "
+            f"seit Kernel {info.get('kernel_since', '?')})",
+            f"  Baender:     {', '.join(info.get('bands', []))}",
+            f"  WiFi-Gen:    {info.get('wifi_gen', '?')}",
+            f"  MIMO:        {info.get('mimo', '?')}",
+            f"  USB:         {info.get('usb', '?')}",
+            f"  Monitor:     {'OK' if info.get('monitor') else 'X'}"
+            f"  Active: {'OK' if info.get('active_monitor') else 'X'}",
+            f"  Injection:   {'OK' if info.get('injection') else 'X'}",
+            f"  AP-Mode:     {'OK' if info.get('ap_mode') else 'X'}",
+            f"  TX-Max:      {info.get('tx_max_dbm', '?')} dBm",
+            f"  Antenne:     {info.get('antenna', '?')}",
+            f"  Preis:       {info.get('price_eur', '?')} EUR",
+            f"  Release:     {info.get('release_date', '?')}",
+            f"  EOL:         {'ja' if info.get('eol') else 'nein'}",
+            f"  Reliability: {info.get('reliability', '?')}",
+        ]
+        if info.get("buy_recommendation"):
+            lines.append(f"  Empfehlung:  {info['buy_recommendation']}")
+        if info.get("known_issues"):
+            lines.append("  Bekannte Probleme:")
+            for issue in info["known_issues"]:
+                lines.append(f"    - {issue}")
+        return "\n".join(lines)
+
+    @classmethod
+    def render_full_report(cls) -> str:
+        lines = [
+            "=" * 72,
+            "  WIFI ADAPTER KATALOG - VOLLSTAENDIGER BERICHT",
+            "=" * 72,
+            "",
+        ]
+        s = cls.summary()
+        lines.append(f"Adapter gesamt:      {s['total']}")
+        lines.append(f"  davon WLAN:        {s['wifi']}")
+        lines.append(f"  davon BT/GPS:      {s['bt_gps']}")
+        lines.append(f"In-Kernel-Treiber:   {s['in_kernel']}")
+        lines.append(f"DKMS-Treiber:        {s['dkms']}")
+        lines.append(f"Pentest-faehig:      {s['pentest_capable']}")
+        lines.append(f"Active Monitor:      {s['active_monitor']}")
+        lines.append(f"Empfohlen:           {s['recommended']}")
+        lines.append(f"EOL:                 {s['eol']}")
+        lines.append(f"Hersteller:          {s['vendors']}")
+        lines.append(f"Chipsaetze:          {s['chipsets']}")
+        lines.append("")
+        for uid, info in sorted(
+            cls.KNOWN.items(), key=lambda x: x[1].get("model", "")
+        ):
+            lines.append("-" * 72)
+            lines.append(cls.render_short_report(uid))
+            lines.append("")
+        return "\n".join(lines)
+
+    @classmethod
+    def check_usb_id(cls, usb_id: str) -> dict:
+        info = cls.lookup(usb_id)
+        if not info:
+            return {
+                "known": False,
+                "usb_id": usb_id,
+                "status": "unknown",
+                "message": "Adapter nicht im Katalog - manuelle "
+                           "Pruefung empfohlen",
+            }
+        status = "ok"
+        messages = []
+        rec = info.get("buy_recommendation", "")
+        if rec.startswith("NICHT"):
+            status = "avoid"
+            messages.append("Vom Kauf abgeraten!")
+        elif rec.startswith("EOL") or rec.startswith("VERALTET"):
+            status = "eol"
+            messages.append("EOL / veraltet")
+        elif rec.startswith("Bedingt"):
+            status = "caution"
+            messages.append("Nur bedingt empfohlen")
+        if info.get("eol"):
+            if status == "ok":
+                status = "eol"
+            messages.append("EOL - nicht mehr produziert")
+        if info.get("driver_source") == "dkms":
+            messages.append("DKMS-Treiber noetig (nicht im Kernel)")
+        elif info.get("driver_source") == "manual":
+            messages.append(
+                "Manuell installierter Treiber (out-of-tree) - "
+                "kein Auto-Rebuild bei Kernel-Update"
+            )
+        if info.get("driver_source") == "staging":
+            messages.append("Staging-Treiber (unvollstaendig)")
+        if info.get("multi_state"):
+            messages.append("MULTI-STATE: usb_modeswitch erforderlich")
+        if not info.get("injection"):
+            messages.append("Kein Packet-Injection")
+        if not info.get("ap_mode"):
+            messages.append("Kein AP-Modus")
+        return {
+            "known": True,
+            "usb_id": usb_id,
+            "model": info["model"],
+            "chipset": info.get("chipset"),
+            "status": status,
+            "reliability": info.get("reliability"),
+            "messages": messages,
+            "recommendation": rec,
+        }
+
+
+
+
+class HardwareAdvisor:
+    """v37-R15: Analysiert das System und empfiehlt konkrete Hardware.
+
+    Nutzt alle Felder des WiFiAdapterCatalog (driver_source, eol,
+    reliability, buy_recommendation, mimo, active_monitor, ...).
+    """
+
+    SCORE_WEIGHTS = {
+        "monitor": 15,
+        "active_monitor": 10,
+        "injection": 15,
+        "ap_mode": 10,
+        "vif": 3,
+        "ap_plus_monitor": 5,
+    }
+    DRIVER_SOURCE_SCORE = {
+        "in-kernel": 20,
+        "userspace": 10,
+        "dkms": 8,
+        "manual": 6,       # out-of-tree vendor blobs: kein Auto-Rebuild
+        "staging": 2,
+    }
+    RELIABILITY_SCORE = {
+        "excellent": 20,
+        "stable": 16,
+        "usually-ok": 10,
+        "limited": 4,
+        "broken": 0,
+        "usable-only": 6,
+    }
+    MIMO_SCORE = {"1x1": 0, "2x2": 5, "4x4": 10}
+
+    # ------------------------------------------------------------------
+    # Audit
+    # ------------------------------------------------------------------
+    @classmethod
     def audit(cls) -> dict:
-        """Vollstaendige Analyse: Was hast du? Was fehlt?"""
+        import glob as _glob
         import shutil as _sh
         import subprocess as _sp
 
@@ -81847,167 +84635,550 @@ class HardwareAdvisor:
             "missing_roles": [],
             "recommendations": [],
             "kernel": "",
+            "kernel_major": 0,
+            "kernel_warnings": [],
+            "eol_warnings": [],
+            "driver_warnings": [],
+            "unknown_usb": [],
+            "role_coverage": {
+                "monitor": False,
+                "injection": False,
+                "ap": False,
+                "active_monitor": False,
+                "bt": False,
+                "gps": False,
+                "wifi6e": False,
+            },
         }
 
+        # Kernel
         try:
-            r = _sp.run(["uname", "-r"], capture_output=True, text=True, timeout=3)
+            r = _sp.run(
+                ["uname", "-r"], capture_output=True, text=True, timeout=3
+            )
             out["kernel"] = (r.stdout or "").strip()
+            try:
+                out["kernel_major"] = int(out["kernel"].split(".")[0])
+            except (ValueError, IndexError):
+                out["kernel_major"] = 0
         except (FileNotFoundError, _sp.TimeoutExpired, OSError):
             pass
 
+        # USB-Scan
         try:
-            r = _sp.run(["lsusb"], capture_output=True, text=True, timeout=3)
+            r = _sp.run(
+                ["lsusb"], capture_output=True, text=True, timeout=3
+            )
             for line in (r.stdout or "").splitlines():
                 low = line.lower()
+                matched = False
                 for usb_id, info in WiFiAdapterCatalog.KNOWN.items():
                     if usb_id.lower() in low:
                         out["own_adapters"].append((usb_id, info))
+                        matched = True
                         break
+                if not matched:
+                    if any(
+                        kw in low
+                        for kw in ("wireless", "wlan", "802.11", "wifi")
+                    ):
+                        parts = line.split()
+                        if len(parts) >= 6:
+                            out["unknown_usb"].append(
+                                parts[5] + " " + parts[6]
+                            )
         except (FileNotFoundError, _sp.TimeoutExpired, OSError):
             pass
 
+        # Bluetooth
         out["has_bt"] = (
-            _sh.which("bluetoothctl") is not None and _sh.which("hcitool") is not None
+            _sh.which("bluetoothctl") is not None
+            and _sh.which("hcitool") is not None
         )
         try:
-            r = _sp.run(["hcitool", "dev"], capture_output=True, text=True, timeout=3)
-            if not (r.stdout or "").strip():
+            r = _sp.run(
+                ["hcitool", "dev"], capture_output=True, text=True, timeout=3
+            )
+            # hcitool gibt auch ohne Adapter die Kopfzeile "Devices:" aus
+            lines = [
+                ln for ln in (r.stdout or "").splitlines()
+                if ln.strip()
+                and not ln.strip().lower().startswith("devices")
+            ]
+            if not lines:
                 out["has_bt"] = False
         except (FileNotFoundError, _sp.TimeoutExpired, OSError):
             out["has_bt"] = False
 
-        import glob as _glob
+        # GPS
+        out["has_gps"] = bool(
+            _glob.glob("/dev/ttyUSB*") + _glob.glob("/dev/ttyACM*")
+        )
 
-        out["has_gps"] = bool(_glob.glob("/dev/ttyUSB*") + _glob.glob("/dev/ttyACM*"))
-
+        # Adapter klassifizieren
         wifi_adapters = [
-            a
-            for a in out["own_adapters"]
-            if "wifi_gen" in a[1] and not a[1]["wifi_gen"].startswith("Bluetooth")
+            a for a in out["own_adapters"]
+            if "wifi_gen" in a[1]
+            and not a[1]["wifi_gen"].startswith("Bluetooth")
+            and a[1]["wifi_gen"] != "GPS"
         ]
+        bt_adapters = [
+            a for a in out["own_adapters"]
+            if a[1].get("wifi_gen", "").startswith("Bluetooth")
+        ]
+        gps_adapters = [
+            a for a in out["own_adapters"]
+            if a[1].get("wifi_gen") == "GPS"
+        ]
+
+        # Rollen-Coverage
+        for _uid, info in wifi_adapters:
+            if info.get("monitor"):
+                out["role_coverage"]["monitor"] = True
+            if info.get("injection"):
+                out["role_coverage"]["injection"] = True
+            if info.get("ap_mode"):
+                out["role_coverage"]["ap"] = True
+            if info.get("active_monitor"):
+                out["role_coverage"]["active_monitor"] = True
+            if "6" in info.get("bands", []):
+                out["role_coverage"]["wifi6e"] = True
+        out["role_coverage"]["bt"] = out["has_bt"] or bool(bt_adapters)
+        out["role_coverage"]["gps"] = out["has_gps"] or bool(gps_adapters)
+
+        # Kernel-Warnungen + EOL + Treiber
+        for usb_id, info in out["own_adapters"]:
+            ks = info.get("kernel_since", "")
+            if ks and out["kernel_major"]:
+                try:
+                    ks_major = int(ks.split(".")[0].rstrip("+"))
+                except (ValueError, IndexError):
+                    ks_major = 0
+                if ks_major and out["kernel_major"] < ks_major:
+                    out["kernel_warnings"].append(
+                        f"{info['model']} (USB {usb_id}): "
+                        f"benoetigt Kernel >= {ks}, "
+                        f"aktuell {out['kernel']}"
+                    )
+            if info.get("eol"):
+                out["eol_warnings"].append(
+                    f"{info['model']} (USB {usb_id}): "
+                    "nicht mehr produziert"
+                )
+            src = info.get("driver_source", "")
+            if src == "dkms":
+                out["driver_warnings"].append(
+                    f"{info['model']} (USB {usb_id}): "
+                    f"DKMS-Treiber '{info.get('driver')}' - "
+                    "nicht im Mainline-Kernel, Kompilierung "
+                    "bei jedem Kernel-Update noetig"
+                )
+            elif src == "staging":
+                out["driver_warnings"].append(
+                    f"{info['model']} (USB {usb_id}): "
+                    f"Staging-Treiber '{info.get('driver')}' - "
+                    "unvollstaendig, Injection/AP oft nicht moeglich"
+                )
+            if info.get("multi_state"):
+                out["driver_warnings"].append(
+                    f"{info['model']} (USB {usb_id}): "
+                    "MULTI-STATE - usb_modeswitch erforderlich"
+                )
+            rec = info.get("buy_recommendation", "")
+            if rec.startswith("NICHT"):
+                out["driver_warnings"].append(
+                    f"{info['model']} (USB {usb_id}): "
+                    "vom Kauf abgeraten!"
+                )
+
+        # Fehlende Rollen
         if len(wifi_adapters) < 2:
             out["missing_roles"].append(
-                "Nur 1 WLAN-Adapter — Monitor + Injection koennen NICHT "
-                "parallel laufen"
+                f"Nur {len(wifi_adapters)} WLAN-Adapter - "
+                "Monitor + AP koennen NICHT parallel laufen"
             )
-        if not out["has_bt"]:
-            out["missing_roles"].append("Kein Bluetooth — BLE-Scan fehlt")
-        if not out["has_gps"]:
-            out["missing_roles"].append("Kein GPS — Wardriving nur manuell")
-
-        has_wifi_6e = any("6" in a[1].get("bands", []) for a in wifi_adapters)
-        if len(wifi_adapters) < 2:
-            out["recommendations"].append(
-                {
-                    "kind": "2. WLAN-Adapter (parallel)",
-                    "recommendation": "Alfa AWUS036ACM",
-                    "usb_id": "0e8d:7612",
-                    "reason": "Treiber im Kernel, stabil auf jedem Linux, "
-                    "45 EUR, sehr zuverlaessig fuer Injection",
-                    "price_eur": 45,
-                }
+        if not out["role_coverage"]["monitor"]:
+            out["missing_roles"].append(
+                "Kein Adapter mit Monitor-Mode erkannt"
             )
-        if not out["has_bt"]:
-            out["recommendations"].append(
-                {
-                    "kind": "Bluetooth-Adapter",
-                    "recommendation": "CSR 4.0 USB-Dongle",
-                    "usb_id": "0a12:0001",
-                    "reason": "BLE + Classic, funktioniert mit bleak/bluez, " "10 EUR",
-                    "price_eur": 10,
-                }
+        if not out["role_coverage"]["injection"]:
+            out["missing_roles"].append(
+                "Kein Adapter mit Packet-Injection erkannt"
             )
-        if not out["has_gps"]:
-            out["recommendations"].append(
-                {
-                    "kind": "GPS-Empfaenger",
-                    "recommendation": "u-blox NEO-6M USB",
-                    "usb_id": "1546:01a7",
-                    "reason": "NMEA-Standard, gpsd-kompatibel, 15 EUR",
-                    "price_eur": 15,
-                }
+        if not out["role_coverage"]["ap"]:
+            out["missing_roles"].append(
+                "Kein Adapter mit AP-Modus erkannt - "
+                "Evil Twin nicht moeglich"
             )
-        if not has_wifi_6e:
-            out["recommendations"].append(
-                {
-                    "kind": "WiFi 6E-Adapter (optional)",
-                    "recommendation": "Alfa AWUS036AXML",
-                    "usb_id": "0e8d:7961",
-                    "reason": "WiFi 6E mit 6 GHz — fuer moderne Netze, 70 EUR",
-                    "price_eur": 70,
-                }
+        if not out["role_coverage"]["active_monitor"]:
+            out["missing_roles"].append(
+                "Kein Adapter mit Active Monitor Mode - "
+                "Channel-Hopping eingeschraenkt"
+            )
+        if not out["role_coverage"]["bt"]:
+            out["missing_roles"].append(
+                "Kein Bluetooth - BLE-Scan/Classic-Sniffing fehlt"
+            )
+        if not out["role_coverage"]["gps"]:
+            out["missing_roles"].append(
+                "Kein GPS - Wardriving nur mit manueller Position"
             )
 
-        for usb_id, info in out["own_adapters"]:
-            warn = info.get("kernel_warning")
-            if warn and out["kernel"]:
-                major = 0
-                try:
-                    major = int(out["kernel"].split(".")[0])
-                except (ValueError, IndexError):
-                    pass
-                ok_kernels = info.get("kernel_ok", [])
-                kernel_ok = any(
-                    k.startswith(str(major) + ".") or k == f"{major}.x"
-                    for k in ok_kernels
-                )
-                if not kernel_ok:
-                    out.setdefault("kernel_warnings", []).append(
-                        f"{info['model']} (USB {usb_id}): {warn}"
-                    )
-
+        out["recommendations"] = cls._build_recommendations(
+            wifi_adapters, bt_adapters, gps_adapters, out
+        )
         return out
 
+    # ------------------------------------------------------------------
+    # Empfehlungs-Engine
+    # ------------------------------------------------------------------
+    @classmethod
+    def _build_recommendations(
+        cls, wifi_adapters, bt_adapters, gps_adapters, audit
+    ) -> list:
+        recs = []
+        n_wifi = len(wifi_adapters)
+
+        if n_wifi == 0:
+            recs.append({
+                "priority": "critical",
+                "kind": "1. WLAN-Adapter (Pentest-Basis)",
+                "usb_id": "0e8d:7610",
+                "reason": (
+                    "AWUS036ACHM: In-Kernel-Treiber (mt76x0u), "
+                    "Active Monitor, Injection, AP-Modus, "
+                    "beste Reichweite. Top-Empfehlung 2025/2026."
+                ),
+            })
+        elif n_wifi == 1:
+            own_id, own_info = wifi_adapters[0]
+            own_chipset = own_info.get("chipset", "")
+            if "MT7610U" in own_chipset:
+                recs.append({
+                    "priority": "high",
+                    "kind": "2. WLAN-Adapter (paralleles Deauth)",
+                    "usb_id": "0e8d:7612",
+                    "reason": (
+                        "AWUS036ACM: 2x2 MIMO, USB 3.0, "
+                        "mehr Durchsatz fuer parallele Captures. "
+                        "Ergaenzt den ACHM (Reichweite) perfekt."
+                    ),
+                })
+            elif "MT7612U" in own_chipset:
+                recs.append({
+                    "priority": "high",
+                    "kind": "2. WLAN-Adapter (Reichweite)",
+                    "usb_id": "0e8d:7610",
+                    "reason": (
+                        "AWUS036ACHM: bessere Reichweite, "
+                        "ergaenzt den ACM (Durchsatz) perfekt."
+                    ),
+                })
+            else:
+                recs.append({
+                    "priority": "high",
+                    "kind": "2. WLAN-Adapter (Upgrade auf In-Kernel)",
+                    "usb_id": "0e8d:7610",
+                    "reason": (
+                        "AWUS036ACHM: In-Kernel, Active Monitor, "
+                        "Injection, sehr gute Reichweite. "
+                        "Ersetzt/protzt DKMS-Risiko-Adapter."
+                    ),
+                })
+            if own_info.get("eol"):
+                recs.append({
+                    "priority": "medium",
+                    "kind": f"Ersatz fuer EOL-Adapter "
+                            f"({own_info.get('model', '?')})",
+                    "usb_id": "0e8d:7612",
+                    "reason": (
+                        "EOL-Adapter technisch veraltet. "
+                        "AWUS036ACM als moderner Ersatz "
+                        "(In-Kernel, 2x2 MIMO)."
+                    ),
+                })
+            elif own_info.get("driver_source") == "dkms":
+                recs.append({
+                    "priority": "medium",
+                    "kind": "Upgrade auf In-Kernel-Treiber",
+                    "usb_id": "0e8d:7610",
+                    "reason": (
+                        "Adapter nutzt DKMS-Treiber - "
+                        "ACHM hat In-Kernel-Treiber (mt76x0u), "
+                        "kein Kompilieren mehr noetig."
+                    ),
+                })
+
+        if not audit["has_bt"] and not bt_adapters:
+            recs.append({
+                "priority": "medium",
+                "kind": "Bluetooth-Adapter",
+                "usb_id": "0bda:8771",
+                "reason": (
+                    "RTL8761B (BT 5.0): guenstig, in-kernel, "
+                    "BLE + Classic, funktioniert mit bluez/bleak. "
+                    "morrownr empfiehlt: 'very reliable, very long range'."
+                ),
+            })
+
+        if not audit["has_gps"] and not gps_adapters:
+            recs.append({
+                "priority": "low",
+                "kind": "GPS-Empfaenger",
+                "usb_id": "1546:01a7",
+                "reason": (
+                    "u-blox NEO-6M: NMEA-Standard, "
+                    "gpsd-kompatibel, guenstig."
+                ),
+            })
+
+        if not audit["role_coverage"]["wifi6e"]:
+            recs.append({
+                "priority": "optional",
+                "kind": "WiFi 6E (6 GHz) - aktuell NICHT empfohlen",
+                "usb_id": "",
+                "reason": (
+                    "AWUS036AXML (MT7921AU) hat Stand 2025/2026 "
+                    "defekten Monitor-Mode (morrownr). Warten bis "
+                    "der Treiber stabil ist."
+                ),
+            })
+
+        return recs
+
+    # ------------------------------------------------------------------
+    # Score
+    # ------------------------------------------------------------------
+    @classmethod
+    def score_adapter(cls, usb_id: str) -> dict:
+        info = WiFiAdapterCatalog.lookup(usb_id)
+        if not info:
+            return {"usb_id": usb_id, "score": 0, "breakdown": {}}
+
+        breakdown = {}
+        feature_score = 0
+        for key, weight in cls.SCORE_WEIGHTS.items():
+            if info.get(key):
+                feature_score += weight
+                breakdown[key] = weight
+            else:
+                breakdown[key] = 0
+
+        driver_score = cls.DRIVER_SOURCE_SCORE.get(
+            info.get("driver_source", ""), 0
+        )
+        breakdown["driver_source"] = driver_score
+
+        rel_score = cls.RELIABILITY_SCORE.get(
+            info.get("reliability", ""), 0
+        )
+        breakdown["reliability"] = rel_score
+
+        mimo_score = cls.MIMO_SCORE.get(info.get("mimo", "1x1"), 0)
+        breakdown["mimo"] = mimo_score
+
+        total = feature_score + driver_score + rel_score + mimo_score
+
+        penalties = 0
+        if info.get("eol"):
+            penalties += 10
+            breakdown["eol_penalty"] = -10
+        if info.get("driver_source") == "staging":
+            penalties += 15
+            breakdown["staging_penalty"] = -15
+        if info.get("multi_state"):
+            penalties += 10
+            breakdown["multi_state_penalty"] = -10
+        rec = info.get("buy_recommendation", "")
+        if rec.startswith("NICHT"):
+            penalties += 30
+            breakdown["avoid_penalty"] = -30
+        elif rec.startswith("VERALTET") or rec.startswith("EOL"):
+            penalties += 8
+            breakdown["legacy_penalty"] = -8
+        elif rec.startswith("Bedingt"):
+            penalties += 5
+            breakdown["caution_penalty"] = -5
+
+        score = max(0, min(100, total - penalties))
+        return {
+            "usb_id": usb_id,
+            "model": info.get("model", "?"),
+            "score": score,
+            "breakdown": breakdown,
+            "rating": cls._score_to_rating(score),
+        }
+
+    @staticmethod
+    def _score_to_rating(score: int) -> str:
+        if score >= 85:
+            return "***** Exzellent"
+        if score >= 70:
+            return "****  Sehr gut"
+        if score >= 55:
+            return "***   Gut"
+        if score >= 40:
+            return "**    Bedingt"
+        if score >= 20:
+            return "*     Schwach"
+        return "      Ungeeignet"
+
+    # ------------------------------------------------------------------
+    # Upgrade-Pfad
+    # ------------------------------------------------------------------
+    @classmethod
+    def suggest_upgrade(cls, current_usb_id: str) -> dict:
+        cur = WiFiAdapterCatalog.lookup(current_usb_id)
+        if not cur:
+            return {"found": False}
+
+        cur_score = cls.score_adapter(current_usb_id)["score"]
+        candidates = []
+        for uid, info in WiFiAdapterCatalog.KNOWN.items():
+            if uid == current_usb_id:
+                continue
+            if not info.get("monitor") or not info.get("injection"):
+                continue
+            s = cls.score_adapter(uid)
+            if s["score"] > cur_score:
+                candidates.append({
+                    "usb_id": uid,
+                    "model": info["model"],
+                    "score": s["score"],
+                    "delta": s["score"] - cur_score,
+                    "reason": info.get("buy_recommendation", ""),
+                })
+        candidates.sort(key=lambda x: -x["score"])
+        return {
+            "found": True,
+            "current_score": cur_score,
+            "current_model": cur["model"],
+            "upgrades": candidates[:5],
+        }
+
+    # ------------------------------------------------------------------
+    # Report-Formatierung
+    # ------------------------------------------------------------------
     @classmethod
     def format_audit(cls, audit: dict) -> str:
-        lines = ["=" * 72, "HARDWARE-BERATER", "=" * 72, ""]
+        lines = ["=" * 72, "  HARDWARE-BERATER", "=" * 72, ""]
+
         lines.append("-- Eigene Adapter --")
         if audit.get("own_adapters"):
             for usb_id, info in audit["own_adapters"]:
-                lines.append(f"  OK  {info['model']}  (USB {usb_id})")
-                lines.append(f"      Chipset:  {info['chipset']}")
-                lines.append(f"      Baender:  {', '.join(info['bands'])}")
-                lines.append(f"      WiFi:     {info['wifi_gen']}")
+                sc = cls.score_adapter(usb_id)
+                lines.append("")
+                lines.append(f"  > {info['model']}  (USB {usb_id})")
                 lines.append(
-                    f"      Monitor:  {'ja' if info['monitor'] else 'nein'}"
-                    f"   Injection: {'ja' if info['injection'] else 'nein'}"
+                    f"      Score:       {sc['score']}/100  "
+                    f"{sc['rating']}"
                 )
                 lines.append(
-                    f"      USB:      {info['usb']}   "
-                    f"TX-max: {info['tx_max_dbm']} dBm"
+                    f"      Chipset:     {info.get('chipset', '?')}"
                 )
-                lines.append(f"      Preis:    ~{info['price_eur']} EUR")
-                for p in info.get("pros", []):
+                lines.append(
+                    f"      Treiber:     {info.get('driver', '?')} "
+                    f"({info.get('driver_source', '?')}, "
+                    f"seit Kernel {info.get('kernel_since', '?')})"
+                )
+                lines.append(
+                    f"      Baender:     "
+                    f"{', '.join(info.get('bands', []))}"
+                )
+                lines.append(
+                    f"      WiFi-Gen:    {info.get('wifi_gen', '?')}"
+                )
+                lines.append(
+                    f"      MIMO:        {info.get('mimo', '?')}"
+                )
+                lines.append(
+                    f"      USB:         {info.get('usb', '?')}"
+                )
+                lines.append(
+                    f"      Monitor:     "
+                    f"{'OK' if info.get('monitor') else 'X'}"
+                    f"   Active: "
+                    f"{'OK' if info.get('active_monitor') else 'X'}"
+                    f"   Injection: "
+                    f"{'OK' if info.get('injection') else 'X'}"
+                )
+                lines.append(
+                    f"      AP-Modus:    "
+                    f"{'OK' if info.get('ap_mode') else 'X'}"
+                    f"   VIF: {'OK' if info.get('vif') else 'X'}"
+                    f"   AP+Monitor: "
+                    f"{'OK' if info.get('ap_plus_monitor') else 'X'}"
+                )
+                lines.append(
+                    f"      TX-Max:      "
+                    f"{info.get('tx_max_dbm', '?')} dBm "
+                    f"({info.get('tx_max_mw', '?')} mW)"
+                )
+                lines.append(
+                    f"      Antenne:     {info.get('antenna', '?')}"
+                )
+                lines.append(
+                    f"      Release:     {info.get('release_date', '?')}"
+                    f"   EOL: {'ja' if info.get('eol') else 'nein'}"
+                )
+                lines.append(
+                    f"      Zuverlaessig: "
+                    f"{info.get('reliability', '?')}"
+                )
+                for p in info.get("pros", [])[:4]:
                     lines.append(f"      + {p}")
-                for c in info.get("cons", []):
+                for c in info.get("cons", [])[:4]:
                     lines.append(f"      - {c}")
                 if info.get("known_issues"):
                     lines.append("      ! Bekannte Probleme:")
-                    for k in info["known_issues"]:
-                        lines.append(f"          * {k}")
-                rel = info.get("reliability")
-                if rel:
-                    lines.append(f"      Zuverlaessigkeit: {rel}")
-                rec = info.get("recommendation")
+                    for ki in info["known_issues"][:3]:
+                        lines.append(f"          * {ki}")
+                rec = info.get("buy_recommendation", "")
                 if rec:
-                    lines.append(f"      Bewertung: {rec}")
-                if info.get("kernel_warning"):
-                    lines.append(f"      ! {info['kernel_warning']}")
+                    lines.append(f"      > {rec}")
         else:
             lines.append("  (keine bekannten Adapter erkannt)")
 
+        if audit.get("unknown_usb"):
+            lines.append("")
+            lines.append("-- Unbekannte USB-Geraete (WiFi-Verdacht) --")
+            for u in audit["unknown_usb"][:10]:
+                lines.append(f"  ? {u}")
+
         lines.append("")
         lines.append("-- Umgebung --")
-        lines.append(f"  Kernel:    {audit.get('kernel', '?')}")
-        lines.append(f"  BT:        {'ja' if audit.get('has_bt') else 'NEIN'}")
-        lines.append(f"  GPS:       {'ja' if audit.get('has_gps') else 'NEIN'}")
+        lines.append(f"  Kernel:     {audit.get('kernel', '?')}")
+        lines.append(
+            f"  Bluetooth:  "
+            f"{'OK' if audit.get('has_bt') else 'X'}"
+        )
+        lines.append(
+            f"  GPS:        "
+            f"{'OK' if audit.get('has_gps') else 'X'}"
+        )
+
+        rc = audit.get("role_coverage", {})
+        if rc:
+            lines.append("")
+            lines.append("-- Rollen-Abdeckung --")
+            for role, ok in rc.items():
+                lines.append(f"  {'OK' if ok else 'X'} {role}")
 
         if audit.get("kernel_warnings"):
             lines.append("")
             lines.append("-- Kernel-Warnungen --")
             for w in audit["kernel_warnings"]:
                 lines.append(f"  ! {w}")
-
+        if audit.get("driver_warnings"):
+            lines.append("")
+            lines.append("-- Treiber-Warnungen --")
+            for w in audit["driver_warnings"]:
+                lines.append(f"  ! {w}")
+        if audit.get("eol_warnings"):
+            lines.append("")
+            lines.append("-- EOL-Warnungen --")
+            for w in audit["eol_warnings"]:
+                lines.append(f"  ! {w}")
         if audit.get("missing_roles"):
             lines.append("")
             lines.append("-- Fehlende Faehigkeiten --")
@@ -82017,107 +85188,373 @@ class HardwareAdvisor:
         if audit.get("recommendations"):
             lines.append("")
             lines.append("-- Empfehlungen --")
-            total = 0
-            for r in audit["recommendations"]:
-                total += r.get("price_eur", 0)
-                lines.append(
-                    f"  * {r['kind']}: {r['recommendation']} "
-                    f"(~{r['price_eur']} EUR)"
+            order = {"critical": 0, "high": 1, "medium": 2,
+                     "low": 3, "optional": 4}
+            recs = sorted(
+                audit["recommendations"],
+                key=lambda r: order.get(r.get("priority", "low"), 9),
+            )
+            for r in recs:
+                prio = r.get("priority", "low").upper()
+                usb_id = r.get("usb_id", "")
+                info = (WiFiAdapterCatalog.lookup(usb_id)
+                        if usb_id else {})
+                price = (
+                    f"~{info.get('price_eur')} EUR" if info else "-"
                 )
-                lines.append(f"      Warum: {r['reason']}")
-            lines.append(f"  Gesamt-Empfehlung: ~{total} EUR")
+                lines.append(f"  [{prio}] {r['kind']}")
+                lines.append(
+                    f"      > {r.get('usb_id', '')} "
+                    f"{info.get('model', '')}  ({price})"
+                )
+                lines.append(f"      {r['reason']}")
 
         return "\n".join(lines)
 
     @classmethod
     def compare_with(cls, usb_id: str) -> str:
-        """Vergleicht einen Adapter mit Alternativen in derselben Klasse."""
         target = WiFiAdapterCatalog.lookup(usb_id)
         if not target:
             return f"Adapter {usb_id} nicht im Katalog."
-        lines = [f"=== Vergleich: {target['model']} ==="]
-        lines.append(
-            f"  Chipset: {target['chipset']}  " f"Baender: {', '.join(target['bands'])}"
-        )
-        lines.append("")
-        lines.append("  Alternativen:")
+
+        target_bands = set(target.get("bands", []))
+        target_score = cls.score_adapter(usb_id)
+
+        lines = [
+            "=" * 72,
+            f"  VERGLEICH: {target['model']}",
+            "=" * 72,
+            "",
+            f"  Referenz-Score: {target_score['score']}/100 "
+            f"({target_score['rating']})",
+            f"  Chipset:        {target.get('chipset', '?')}",
+            f"  Baender:        "
+            f"{', '.join(target.get('bands', []))}",
+            f"  MIMO:           {target.get('mimo', '?')}",
+            f"  Preis:          ~{target.get('price_eur', '?')} EUR",
+            "",
+            "  -- Alternativen (gleiche Baender) --",
+        ]
+
+        alts = []
         for alt_id, alt in WiFiAdapterCatalog.KNOWN.items():
             if alt_id == usb_id:
                 continue
-            if set(alt["bands"]) & set(target["bands"]):
+            alt_bands = set(alt.get("bands", []))
+            if not (alt_bands & target_bands):
+                continue
+            if not alt.get("monitor") or not alt.get("injection"):
+                continue
+            sc = cls.score_adapter(alt_id)
+            alts.append((sc["score"], alt_id, alt, sc))
+
+        alts.sort(key=lambda x: -x[0])
+        for score, alt_id, alt, sc in alts[:8]:
+            delta = score - target_score["score"]
+            sign = "+" if delta >= 0 else ""
+            lines.append(
+                f"    {alt['model']:<32} "
+                f"{alt.get('chipset', '?'):<12} "
+                f"Score {score:>3}/100 ({sign}{delta})  "
+                f"~{alt.get('price_eur', '?')} EUR"
+            )
+
+        return "\n".join(lines)
+
+    # ── P9.4: Antennen-Empfehlung (HW-E) ────────────────────────────
+
+    @classmethod
+    def antenna_recommendation(cls, usb_id: str,
+                               freq_ghz: float = 5.0,
+                               budget_eur: float | None = None) -> list:
+        """Liefert sortierte Antennen-Empfehlungen fuer einen Adapter.
+
+        Args:
+          usb_id:     Adapter-USB-ID (z.B. "0e8d:7610")
+          freq_ghz:   Zielfrequenz fuer Gewichtsbewertung (2.4/5.0/6.0)
+          budget_eur: Optionales Limit fuer den Antennenpreis.
+
+        Rueckgabe: Liste von dicts mit
+          model, gain_dbi, effective_gain_dbi, price_eur,
+          needs_adapter, needs_cable, fits, warnings
+        Sortiert nach effective_gain_dbi absteigend.
+        """
+        results = []
+        for key, ant in AntennaCatalog.ANTENNAS.items():
+            if ant.antenna_type == "cable":
+                continue
+            if ant.price_eur <= 0:
+                # Stock-Antennen sind kein "Kauf"
+                continue
+            if budget_eur is not None and ant.price_eur > budget_eur:
+                continue
+            rep = AntennaCompatibility.check(usb_id, key)
+            if not rep.fits:
+                continue
+            # Cable-Laenge: 0 fuer Indoor, 3m fuer Outdoor-Antennen
+            cable_m = 3.0 if ant.outdoor else 0.0
+            eff = AntennaCompatibility.total_effective_gain(
+                key, freq_ghz, cable_m
+            )
+            results.append({
+                "model": key,
+                "gain_dbi": (
+                    ant.gain_2g_dbi if freq_ghz < 3.0
+                    else ant.gain_5g_dbi if freq_ghz < 5.5
+                    else ant.gain_6g_dbi
+                ),
+                "effective_gain_dbi": round(eff, 2),
+                "price_eur": ant.price_eur,
+                "needs_adapter": rep.needs_adapter,
+                "needs_cable": rep.needs_cable,
+                "fits": rep.fits,
+                "warnings": list(rep.warnings),
+            })
+        # Sortierung: Omni zuerst, dann Gain, dann Preis.
+        # Begruendung: Panel-Richtantennen (APA-M25) haben oft 2-3 dBi
+        # mehr als Omni (ARS-25-57A), sind aber fuer breites Monitoring
+        # durch die 66-Grad-Keule ungeeignet.
+        type_rank = {"omni": 0, "dipole": 1, "panel": 2}
+        def _rank(r):
+            ant = AntennaCatalog.lookup(r["model"])
+            t = ant.antenna_type if ant else "omni"
+            return (
+                type_rank.get(t, 3),
+                -r["effective_gain_dbi"],
+                r["price_eur"],
+            )
+        results.sort(key=_rank)
+        return results
+
+    @classmethod
+    def full_recommendation(cls, usb_id: str,
+                            freq_ghz: float = 5.0,
+                            prefer: str = "direct_mount") -> dict:
+        """Adapter + beste Antenne + Gesamtpreis + realer Restgewinn.
+
+        Args:
+          prefer: "direct_mount" (Default), "with_cable", "highest_gain"
+                  Default ist direct_mount, weil eine teure Aussenantenne
+                  fuer einen Indoor-Adapter selten sinnvoll ist.
+
+        Rueckgabe: dict mit zusaetzlichem Feld
+          category: bevorzugte Kategorie
+        """
+        score = cls.score_adapter(usb_id) or {}
+        cat = cls.antenna_recommendation_categorized(usb_id, freq_ghz)
+        if prefer == "highest_gain":
+            recs = cat["high_gain"]
+        elif prefer == "with_cable":
+            recs = cat["with_cable"] or cat["direct_mount"] or cat["high_gain"]
+        else:
+            recs = cat["direct_mount"] or cat["high_gain"]
+        adapter_price = 0.0
+        try:
+            cat_entry = WiFiAdapterCatalog.lookup(usb_id)
+            if cat_entry is not None:
+                # lookup() liefert dict, kein Objekt
+                if isinstance(cat_entry, dict):
+                    adapter_price = float(
+                        cat_entry.get("price_eur") or 0.0
+                    )
+                else:
+                    adapter_price = float(
+                        getattr(cat_entry, "price_eur", 0.0) or 0.0
+                    )
+        except (AttributeError, NameError, ValueError, TypeError):
+            adapter_price = 0.0
+
+        if not recs:
+            return {
+                "adapter_usb_id": usb_id,
+                "adapter_score": score.get("score"),
+                "adapter_rating": score.get("rating"),
+                "antenna_model": None,
+                "antenna_gain_dbi": 0.0,
+                "antenna_effective_dbi": 0.0,
+                "antenna_price_eur": 0.0,
+                "total_price_eur": round(adapter_price, 2),
+                "needs_adapter": False,
+                "needs_cable": False,
+                "notes": ["Keine passende Antenne gefunden."],
+                "category": "none",
+            }
+        best = recs[0]
+        notes = []
+        if best["needs_adapter"]:
+            notes.append("N-Adapter auf RP-SMA noetig (ca. 5 EUR extra).")
+        if best["needs_cable"]:
+            notes.append(
+                "Koaxialkabel empfohlen (3m ca. 5,66 EUR, "
+                "Daempfung bereits eingerechnet)."
+            )
+        return {
+            "adapter_usb_id": usb_id,
+            "adapter_score": score.get("score"),
+            "adapter_rating": score.get("rating"),
+            "antenna_model": best["model"],
+            "antenna_gain_dbi": best["gain_dbi"],
+            "antenna_effective_dbi": best["effective_gain_dbi"],
+            "antenna_price_eur": best["price_eur"],
+            "total_price_eur": round(
+                adapter_price + best["price_eur"], 2
+            ),
+            "needs_adapter": best["needs_adapter"],
+            "needs_cable": best["needs_cable"],
+            "notes": notes,
+            "category": prefer,
+        }
+
+    @classmethod
+    def audit_with_antennas(cls, usb_ids: list,
+                            freq_ghz: float = 5.0) -> dict:
+        """Wie audit(), aber mit Antennenempfehlung pro Adapter."""
+        per_adapter = []
+        for uid in usb_ids:
+            rec = cls.full_recommendation(uid, freq_ghz)
+            per_adapter.append(rec)
+        total_price = sum(r["total_price_eur"] for r in per_adapter)
+        return {
+            "freq_ghz": freq_ghz,
+            "adapters": per_adapter,
+            "total_price_eur": round(total_price, 2),
+            "count": len(per_adapter),
+        }
+
+    @classmethod
+    def format_antenna_recommendation(cls, usb_id: str,
+                                      freq_ghz: float = 5.0) -> str:
+        """Textausgabe der Empfehlung fuer einen Adapter.
+
+        Zeigt Default-Empfehlung (direct_mount) und Alternativen
+        (with_cable) deutlich getrennt.
+        """
+        rec = cls.full_recommendation(usb_id, freq_ghz)
+        cat = cls.antenna_recommendation_categorized(usb_id, freq_ghz)
+        lines = [
+            "=" * 66,
+            "ANTENNEN-EMPFEHLUNG fuer " + str(usb_id)
+            + "  (Frequenz " + str(freq_ghz) + " GHz)",
+            "=" * 66,
+        ]
+        if rec["adapter_score"] is not None:
+            lines.append(
+                "Adapter-Score : " + str(rec["adapter_score"])
+                + " / 100  (" + str(rec["adapter_rating"]) + ")"
+            )
+        if rec["antenna_model"]:
+            lines.append(
+                "Empfehlung    : " + rec["antenna_model"]
+                + "  (" + str(rec["antenna_gain_dbi"]) + " dBi)"
+            )
+            lines.append(
+                "  Kategorie   : " + str(rec.get("category", "?"))
+            )
+            lines.append(
+                "  effektiv    : " + str(rec["antenna_effective_dbi"])
+                + " dBi"
+            )
+            lines.append(
+                "  Preis       : " + str(rec["antenna_price_eur"]) + " EUR"
+            )
+        else:
+            lines.append("  Keine passende Antenne gefunden.")
+        lines.append(
+            "Gesamtpreis   : " + str(rec["total_price_eur"]) + " EUR"
+        )
+        if cat["with_cable"]:
+            lines.append("")
+            lines.append("MIT KABEL/ADAPTER (mehr Aufwand, mehr Reichweite):")
+            for a in cat["with_cable"][:2]:
                 lines.append(
-                    f"    {alt['model']:<32} "
-                    f"({alt['chipset']:<12} {alt['usb']:<6} "
-                    f"{alt['price_eur']} EUR)"
+                    "  " + a["model"] + "  ("
+                    + str(a["effective_gain_dbi"]) + " dBi eff., "
+                    + str(a["price_eur"]) + " EUR)"
                 )
+        for n in rec["notes"]:
+            lines.append("  - " + n)
+        lines.append("=" * 66)
         return "\n".join(lines)
 
 
-def _hw_advisor_cli(compare_id: str = "") -> int:
-    if compare_id:
-        print(HardwareAdvisor.compare_with(compare_id))
-        return 0
-    audit = HardwareAdvisor.audit()
-    print(HardwareAdvisor.format_audit(audit))
-    return 0
+    @classmethod
+    def antenna_recommendation_categorized(cls, usb_id: str,
+                                           freq_ghz: float = 5.0) -> dict:
+        """Liefert Empfehlungen in drei Kategorien.
 
+        Rueckgabe: dict mit
+          direct_mount: list (ohne Kabel, ohne N-Adapter -> direkt)
+          with_cable:   list (Outdoor oder N-Anschluss -> Kabel noetig)
+          high_gain:    list (alle Empfehlungen sortiert nach eff. Gain)
+          best:         dict | None (Default = direct_mount[0])
 
-def _hw_catalog_cli() -> int:
-    """v37-R14: --hw-catalog — alle bekannten Adapter."""
-    lines = ["=== WiFi-Adapter-Katalog ==="]
-    for vendor in WiFiAdapterCatalog.all_vendors():
-        lines.append(f"\n-- {vendor} --")
-        for usb_id, info in sorted(
-            WiFiAdapterCatalog.KNOWN.items(), key=lambda x: x[1]["model"]
-        ):
-            if info["vendor"] != vendor:
-                continue
-            rec = info.get("recommendation", "")
-            flag = ""
-            if info.get("reliability") == "flaky":
-                flag = " [!]"
-            elif info.get("reliability") == "usable-only":
-                flag = " [eingeschraenkt]"
-            lines.append(
-                f"  {info['model']:<32} {usb_id:<12} "
-                f"{info['chipset']:<12} {info['price_eur']} EUR{flag}"
-            )
-            if rec:
-                lines.append(f"      -> {rec}")
-    print("\n".join(lines))
-    return 0
+        Hintergrund: Eine 60-EUR-Aussenantenne fuer einen 37-EUR-Adapter
+        ist selten sinnvoll, besonders wenn sie nur 5 GHz kann. Der
+        Default-Default ist deshalb direct_mount.
+        """
+        all_recs = cls.antenna_recommendation(usb_id, freq_ghz)
+        direct = [
+            r for r in all_recs
+            if not r["needs_cable"] and not r["needs_adapter"]
+        ]
+        with_cable = [
+            r for r in all_recs
+            if r["needs_cable"] or r["needs_adapter"]
+        ]
+        best = direct[0] if direct else (all_recs[0] if all_recs else None)
+        return {
+            "direct_mount": direct,
+            "with_cable": with_cable,
+            "high_gain": all_recs,
+            "best": best,
+        }
 
 
 class AdapterCompare:
-    """v37-R16: Vergleich mehrerer WLAN-Adapter (CPU-/GPU-Monkey-Stil)."""
+    """v37-R16: Vergleich mehrerer WLAN-Adapter (tabellarisch)."""
 
     ROWS = [
-        ("model", "Modell", None),
-        ("vendor", "Hersteller", None),
-        ("chipset", "Chipset", None),
-        ("wifi_gen", "WiFi-Generation", None),
-        ("bands", "Baender", "join"),
-        ("usb", "USB", None),
-        ("antenna", "Antenne", None),
-        ("tx_max_dbm", "TX-max (dBm)", "high"),
-        ("monitor", "Monitor-Mode", "bool"),
-        ("injection", "Injection", "bool"),
-        ("price_eur", "Preis (EUR)", "low"),
-        ("reliability", "Zuverlaessigkeit", None),
-        ("kernel_ok", "Kernel-Support", "join"),
-        ("kernel_warning", "Kernel-Warnung", None),
-        ("recommendation", "Empfehlung", None),
+        ("model", "Modell", None, "Hardware"),
+        ("vendor", "Hersteller", None, "Hardware"),
+        ("chipset", "Chipset", None, "Hardware"),
+        ("mimo", "MIMO", None, "Hardware"),
+        ("bands", "Baender", "join", "Hardware"),
+        ("wifi_gen", "WiFi-Generation", None, "Hardware"),
+        ("usb", "USB", None, "Hardware"),
+        ("interface", "Schnittstelle", None, "Hardware"),
+        ("max_rate_mbps", "Max. Rate (Mbps)", "high", "Hardware"),
+        ("antenna", "Antenne", None, "Hardware"),
+        ("tx_max_dbm", "TX-max (dBm)", "high", "Hardware"),
+
+        ("monitor", "Monitor-Mode", "bool", "Features"),
+        ("active_monitor", "Active Monitor", "bool", "Features"),
+        ("injection", "Packet-Injection", "bool", "Features"),
+        ("ap_mode", "AP-Modus", "bool", "Features"),
+        ("vif", "VIF", "bool", "Features"),
+        ("ap_plus_monitor", "AP + Monitor", "bool", "Features"),
+        ("p2p_go", "P2P-GO", "bool", "Features"),
+
+        ("driver", "Treiber", None, "Software"),
+        ("driver_source", "Treiber-Quelle", None, "Software"),
+        ("kernel_since", "Kernel seit", None, "Software"),
+        ("release_date", "Release", None, "Software"),
+        ("eol", "EOL", "bool", "Software"),
+        ("reliability", "Zuverlaessigkeit", None, "Software"),
+
+        ("price_eur", "Preis (EUR)", "low", "Kauf"),
+        ("price_tier", "Preisklasse", None, "Kauf"),
+        ("buy_recommendation", "Kaufempfehlung", None, "Kauf"),
     ]
 
     @classmethod
     def _fmt_cell(cls, value, fmt):
         if value is None or value == "":
-            return "—"
+            return "-"
         if fmt == "bool":
             if value is True:
-                return "ja"
+                return "OK"
             if value is False:
-                return "nein"
+                return "X"
             if isinstance(value, str):
                 return value
             return "?"
@@ -82127,22 +85564,24 @@ class AdapterCompare:
 
     @classmethod
     def compare(cls, usb_ids: list) -> dict:
-        """Erzeugt Vergleichsmatrix für die angegebenen USB-IDs."""
         cols = []
         for uid in usb_ids:
             info = WiFiAdapterCatalog.lookup(uid)
             if not info:
                 continue
-            cols.append((uid, info))
+            score = HardwareAdvisor.score_adapter(uid)
+            cols.append((uid, info, score))
         if not cols:
-            return {"columns": [], "rows": [], "best": {}}
+            return {
+                "columns": [], "rows": [], "best": {}, "scores": [],
+            }
 
         best = {}
-        for f_key, _lbl, fmt in cls.ROWS:
+        for f_key, _lbl, fmt, _grp in cls.ROWS:
             if fmt not in ("high", "low"):
                 continue
             vals = []
-            for _uid, info in cols:
+            for _uid, info, _sc in cols:
                 v = info.get(f_key)
                 if v is not None:
                     try:
@@ -82156,23 +85595,33 @@ class AdapterCompare:
                     best[f_key] = min(vals)[1]
 
         rows = []
-        for f_key, lbl, fmt in cls.ROWS:
+        current_group = None
+        for f_key, lbl, fmt, group in cls.ROWS:
+            if group != current_group:
+                rows.append({"type": "group", "label": group})
+                current_group = group
             cells = []
-            for uid, info in cols:
+            for uid, info, _sc in cols:
                 raw = info.get(f_key)
-                cells.append(
-                    {
-                        "usb_id": uid,
-                        "value": raw,
-                        "text": cls._fmt_cell(raw, fmt),
-                        "best": (f_key in best and best[f_key] == uid),
-                    }
-                )
-            rows.append({"field": f_key, "label": lbl, "cells": cells})
+                cells.append({
+                    "usb_id": uid,
+                    "value": raw,
+                    "text": cls._fmt_cell(raw, fmt),
+                    "best": (f_key in best and best[f_key] == uid),
+                })
+            rows.append({
+                "type": "data",
+                "field": f_key,
+                "label": lbl,
+                "cells": cells,
+            })
+
         return {
-            "columns": [(u, i["model"]) for u, i in cols],
+            "columns": [(u, i["model"]) for u, i, _s in cols],
             "rows": rows,
             "best": best,
+            "scores": [(u, i["model"], s["score"], s["rating"])
+                       for u, i, s in cols],
         }
 
     @classmethod
@@ -82180,27 +85629,5235 @@ class AdapterCompare:
         cmp = cls.compare(usb_ids)
         if not cmp["columns"]:
             return "Keine passenden Adapter gefunden."
+
         names = [n for _uid, n in cmp["columns"]]
-        max_name = max([len(n) for n in names] + [20])
-        col_w = min(max(max_name + 2, 24), 34)
-        label_w = 20
-        total_w = label_w + (col_w + 2) * len(names) + 4
-        lines = ["=" * total_w, "ADAPTER-VERGLEICH", "=" * total_w, ""]
+        col_w = min(max(max(len(n) for n in names) + 2, 22), 32)
+        label_w = 22
+        total_w = label_w + (col_w + 2) * len(names) + 2
+
+        lines = ["=" * total_w, "  ADAPTER-VERGLEICH", "=" * total_w]
+        lines.append("")
+        score_line = "Score".ljust(label_w)
+        for _uid, _name, score, _rating in cmp["scores"]:
+            score_line += "| " + f"{score}/100".ljust(col_w)
+        lines.append(score_line)
+        rating_line = "".ljust(label_w)
+        for _uid, _name, _score, rating in cmp["scores"]:
+            rating_line += "| " + rating[:col_w].ljust(col_w)
+        lines.append(rating_line)
+        lines.append("-" * total_w)
+
         header = "Merkmal".ljust(label_w)
         for _uid, name in cmp["columns"]:
             header += "| " + name[:col_w].ljust(col_w)
         lines.append(header)
-        lines.append("-" * len(header))
+        lines.append("-" * total_w)
+
         for row in cmp["rows"]:
+            if row["type"] == "group":
+                pad = total_w - len(row["label"]) - 5
+                lines.append(f"-- {row['label']} " + "-" * max(0, pad))
+                continue
             line = row["label"][: label_w - 1].ljust(label_w)
             for cell in row["cells"]:
                 marker = " *" if cell["best"] else "  "
                 val = cell["text"][: col_w - 2]
                 line += "| " + val.ljust(col_w - 2) + marker
             lines.append(line)
-        lines.append("")
+
+        lines.append("-" * total_w)
         lines.append("(* = bester Wert in der Zeile)")
         return "\n".join(lines)
+
+
+class BluetoothCatalog:
+    """v37-R16: Katalog bekannter Bluetooth-Dongles fuer Linux.
+
+    Analog zu WiFiAdapterCatalog. Empfehlung: separate BT-Dongles statt
+    Combo-Adapter (WLAN+BT), weil Combo-Treiber historisch instabil sind
+    (morrownr/USB-WiFi).
+    """
+
+    KNOWN = {
+        "0a12:0001": {
+            "model": "CSR 4.0 USB-Dongle (BCM20702)",
+            "vendor": "CSR/Generic",
+            "chipset": "BCM20702",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "3.x",
+            "release_date": "2012-01",
+            "eol": False,
+            "bt_version": "4.0",
+            "ble": True,
+            "classic": True,
+            "range": "short",
+            "price_eur": 10,
+            "price_tier": "budget",
+            "pros": [
+                "BLE + Classic",
+                "Kompakt",
+                "Sehr guenstig",
+                "Funktioniert mit bluez/bleak",
+                "In-Kernel-Treiber (btusb)",
+            ],
+            "cons": [
+                "Kurze Reichweite",
+                "Nur BT 4.0 (kein 5.x)",
+            ],
+            "known_issues": [],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Solide Wahl fuer BLE-Sniffing/Classic - guenstig, "
+                "aber kurze Reichweite."
+            ),
+        },
+        "0bda:8771": {
+            "model": "Realtek RTL8761B (generisch)",
+            "vendor": "Realtek",
+            "chipset": "RTL8761B",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.4 (2019)",
+            "release_date": "2020-03",
+            "eol": False,
+            "bt_version": "5.0",
+            "ble": True,
+            "classic": True,
+            "range": "long",
+            "price_eur": 12,
+            "price_tier": "budget",
+            "pros": [
+                "BLE 5.0 (schneller, laenger)",
+                "Guenstig",
+                "Sehr gute Treiberqualitaet",
+                "In-Kernel ab 5.4",
+                "Long-Range-Empfang",
+            ],
+            "cons": ["Kernel 5.4+ noetig"],
+            "known_issues": [],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Gute Wahl fuer BLE 5.0 - morrownr empfiehlt RTL8761B "
+                "fuer 'very long range'."
+            ),
+        },
+        "2357:0604": {
+            "model": "TP-Link UB500 Plus",
+            "vendor": "TP-Link",
+            "chipset": "RTL8761BU",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "6.8+",
+            "release_date": "2023-08",
+            "eol": False,
+            "bt_version": "5.3",
+            "ble": True,
+            "classic": True,
+            "range": "long",
+            "price_eur": 20,
+            "price_tier": "budget",
+            "pros": [
+                "BT 5.3 (neueste Version)",
+                "Long-Range (>3 Etagen getestet)",
+                "Plug & Play ab Kernel 6.8",
+                "RTL8761BU-Chip (sehr guter Linux-Support)",
+            ],
+            "cons": ["Kernel 6.8+ zwingend notwendig"],
+            "known_issues": [
+                "Auf Kernel < 6.8 nicht zuverlaessig",
+            ],
+            "reliability": "excellent",
+            "buy_recommendation": (
+                "Beste Wahl fuer Kernel 6.8+ - BT 5.3, Long-Range, "
+                "In-Kernel. Sonst EDUP EP-B3536 nehmen."
+            ),
+        },
+        "0bda:b00c": {
+            "model": "EDUP EP-B3536",
+            "vendor": "EDUP",
+            "chipset": "RTL8761BU",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.14+",
+            "release_date": "2021-05",
+            "eol": False,
+            "bt_version": "5.1",
+            "ble": True,
+            "classic": True,
+            "range": "long",
+            "price_eur": 10,
+            "price_tier": "budget",
+            "pros": [
+                "BT 5.1",
+                "Long-Range (morrownr: 'very reliable')",
+                "Ab Kernel 5.14",
+                "Sehr guenstig",
+                "In-Kernel",
+            ],
+            "cons": ["Kein BT 5.3 (nur 5.1)"],
+            "known_issues": [],
+            "reliability": "excellent",
+            "buy_recommendation": (
+                "Empfehlung fuer Kernel 5.14-6.7 - sehr zuverlaessig, "
+                "lange Reichweite, guenstig."
+            ),
+        },
+        "8087:0029": {
+            "model": "Intel AX200 (BT-Anteil)",
+            "vendor": "Intel",
+            "chipset": "AX200-BT",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.1+",
+            "release_date": "2019-04",
+            "eol": False,
+            "bt_version": "5.1",
+            "ble": True,
+            "classic": True,
+            "range": "medium",
+            "price_eur": 20,
+            "price_tier": "budget",
+            "pros": [
+                "BT 5.1",
+                "In-Kernel",
+                "Bereits in vielen Laptops verbaut",
+            ],
+            "cons": [
+                "Nur intern verbaubar (PCIe/USB-Combo)",
+                "Fest verbaut - nicht extern nutzbar",
+            ],
+            "known_issues": [
+                "btusb kann sich mit anderen Bluetooth-Dongles "
+                "in die Quere kommen (nur einer gleichzeitig aktiv)",
+            ],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Nur wenn bereits vorhanden - externer RTL8761B-Dongle "
+                "ist zuverlaessiger und flexibler."
+            ),
+        },
+        "8087:0033": {
+            "model": "Intel AX210 (BT-Anteil)",
+            "vendor": "Intel",
+            "chipset": "AX210-BT",
+            "driver": "btusb",
+            "driver_source": "in-kernel",
+            "kernel_since": "5.10+",
+            "release_date": "2020-10",
+            "eol": False,
+            "bt_version": "5.2",
+            "ble": True,
+            "classic": True,
+            "range": "medium",
+            "price_eur": 25,
+            "price_tier": "budget",
+            "pros": ["BT 5.2", "In-Kernel"],
+            "cons": [
+                "Nur intern verbaubar",
+                "Fest verbaut",
+            ],
+            "known_issues": [
+                "Wie AX200 - Kollision mit anderen BT-Dongles moeglich",
+            ],
+            "reliability": "stable",
+            "buy_recommendation": (
+                "Nur wenn vorhanden - externer Dongle bevorzugen."
+            ),
+        },
+    }
+
+    @classmethod
+    def lookup(cls, usb_id: str) -> dict:
+        if not usb_id:
+            return {}
+        return cls.KNOWN.get(usb_id.lower(), {})
+
+    @classmethod
+    def all_usb_ids(cls) -> set:
+        return set(cls.KNOWN.keys())
+
+    @classmethod
+    def all_vendors(cls) -> list:
+        return sorted(set(v["vendor"] for v in cls.KNOWN.values()))
+
+    @classmethod
+    def find_ble(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("ble")
+        ]
+
+    @classmethod
+    def find_in_kernel(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("driver_source") == "in-kernel"
+        ]
+
+    @classmethod
+    def find_long_range(cls) -> list:
+        return [
+            (uid, info) for uid, info in cls.KNOWN.items()
+            if info.get("range") == "long"
+        ]
+
+    @classmethod
+    def recommended(cls) -> list:
+        out = []
+        for uid, info in cls.KNOWN.items():
+            rec = info.get("buy_recommendation", "")
+            if rec.startswith(("Beste", "Empfehlung", "Gute", "Solide")):
+                out.append((uid, info))
+        return out
+
+    @classmethod
+    def summary(cls) -> dict:
+        total = len(cls.KNOWN)
+        return {
+            "total": total,
+            "ble": len(cls.find_ble()),
+            "in_kernel": len(cls.find_in_kernel()),
+            "long_range": len(cls.find_long_range()),
+            "recommended": len(cls.recommended()),
+            "vendors": len(cls.all_vendors()),
+        }
+
+    @classmethod
+    def render_full_report(cls) -> str:
+        lines = [
+            "=" * 72,
+            "  BLUETOOTH-DONGLE KATALOG",
+            "=" * 72,
+            "",
+        ]
+        s = cls.summary()
+        lines.append(f"Dongles gesamt:   {s['total']}")
+        lines.append(f"BLE-faehig:       {s['ble']}")
+        lines.append(f"In-Kernel:        {s['in_kernel']}")
+        lines.append(f"Long-Range:       {s['long_range']}")
+        lines.append(f"Empfohlen:        {s['recommended']}")
+        lines.append(f"Hersteller:       {s['vendors']}")
+        lines.append("")
+        for uid, info in sorted(
+            cls.KNOWN.items(), key=lambda x: x[1].get("model", "")
+        ):
+            lines.append("-" * 72)
+            lines.append(f"{info['model']} ({uid})")
+            lines.append(
+                f"  Chipset:     {info.get('chipset', '?')}"
+            )
+            lines.append(
+                f"  Treiber:     {info.get('driver', '?')} "
+                f"({info.get('driver_source', '?')}, "
+                f"seit Kernel {info.get('kernel_since', '?')})"
+            )
+            lines.append(
+                f"  BT-Version:  {info.get('bt_version', '?')}"
+            )
+            lines.append(
+                f"  BLE/Classic: "
+                f"{'OK' if info.get('ble') else 'X'} / "
+                f"{'OK' if info.get('classic') else 'X'}"
+            )
+            lines.append(f"  Range:       {info.get('range', '?')}")
+            lines.append(
+                f"  Preis:       ~{info.get('price_eur', '?')} EUR"
+            )
+            lines.append(
+                f"  Reliability: {info.get('reliability', '?')}"
+            )
+            rec = info.get("buy_recommendation", "")
+            if rec:
+                lines.append(f"  Empfehlung:  {rec}")
+            for ki in info.get("known_issues", []):
+                lines.append(f"  ! {ki}")
+            lines.append("")
+        return "\n".join(lines)
+
+
+class HardwareVerifier:
+    """v37-R17: Empirische Verifikation von Adapter-Behauptungen.
+
+    Fuehrt echte Hardware-Tests durch und vergleicht mit den Katalog-
+    Angaben. Jeder Test liefert:
+        status: "ok" | "deviation" | "skip"
+        claimed:  Katalog-Behauptung
+        observed: Real gemessen
+        detail:   Klartext-Erklaerung
+
+    SICHERHEIT:
+    - Nur auf explizite CLI-Anforderung (--hw-verify), NICHT im Auto-Start
+    - State-Save/Restore pro Interface (auch bei Fehler)
+    - Ohne root: Test liefert status="skip" (kein stiller Fail)
+    """
+
+    # Timeout fuer einzelne iw-Aufrufe
+    CMD_TIMEOUT = 5.0
+
+    def __init__(self, logger=None):
+        self.logger = logger or logging.getLogger(
+            "wlan_ultimate.HardwareVerifier"
+        )
+
+    # ------------------------------------------------------------------
+    # Cmd-Helper
+    # ------------------------------------------------------------------
+    @classmethod
+    def _run(cls, cmd: list, timeout: float = 5.0) -> tuple:
+        """Fuehrt cmd aus, gibt (rc, stdout, stderr) zurueck."""
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+            return r.returncode, (r.stdout or ""), (r.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            return -1, "", ""
+
+    @classmethod
+    def _is_root(cls) -> bool:
+        try:
+            return os.geteuid() == 0
+        except (OSError, AttributeError):
+            return False
+
+    @classmethod
+    def _is_rfkill_blocked(cls, iface: str) -> bool:
+        """Prueft, ob das Interface per rfkill blockiert ist.
+
+        Nutzt /sys/class/rfkill/-Baum oder iw-Fehlertext.
+        """
+        # Schneller Weg: iw dev <iface> info versuchen
+        rc, _out, err = cls._run(["iw", "dev", iface, "info"])
+        if rc == 0:
+            return False
+        if "rf-kill" in (err or "").lower() or "rfkill" in (err or "").lower():
+            return True
+        # Fallback: rfkill list
+        rc2, out2, _ = cls._run(["rfkill", "list"])
+        if rc2 != 0:
+            return False
+        # Wir suchen den phy-Namen des Interfaces
+        phy = cls._get_phy(iface)
+        if not phy:
+            return False
+        for line in out2.splitlines():
+            if phy in line and "blocked" in line.lower():
+                # Naechste Zeile auswerten
+                idx = out2.splitlines().index(line)
+                block_lines = out2.splitlines()[idx:idx + 3]
+                for bl in block_lines:
+                    if "soft blocked: yes" in bl.lower():
+                        return True
+                    if "hard blocked: yes" in bl.lower():
+                        return True
+        return False
+
+    @classmethod
+    def _get_phy(cls, iface: str) -> str:
+        """Ermittelt den phy-Namen eines Interfaces."""
+        try:
+            p = Path("/sys/class/net") / iface / "phy80211"
+            if p.exists():
+                return p.resolve().name
+        except OSError:
+            pass
+        rc, out, _ = cls._run(["iw", "dev", iface, "info"])
+        if rc == 0:
+            for line in out.splitlines():
+                if "wiphy" in line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return "phy" + parts[1]
+        return ""
+
+    # ------------------------------------------------------------------
+    # Interface-State
+    # ------------------------------------------------------------------
+    @classmethod
+    def _read_mode(cls, iface: str) -> str:
+        """Liest aktuellen Modus via iw dev <iface> info."""
+        rc, out, _ = cls._run(["iw", "dev", iface, "info"])
+        if rc != 0:
+            return ""
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("type "):
+                return line.split(None, 1)[1].strip()
+        return ""
+
+    @classmethod
+    def _read_state(cls, iface: str) -> str:
+        """Liest Interface-Status: up/down/unknown."""
+        try:
+            p = Path("/sys/class/net") / iface / "operstate"
+            if p.exists():
+                return p.read_text().strip()
+        except OSError:
+            pass
+        return "unknown"
+
+    @classmethod
+    def _set_mode(cls, iface: str, mode: str) -> tuple:
+        """Setzt Interface-Modus. Returns (ok, msg)."""
+        rc, _out, err = cls._run(
+            ["iw", "dev", iface, "set", "type", mode]
+        )
+        if rc == 0:
+            return True, ""
+        return False, (err or f"rc={rc}")[:200]
+
+    @classmethod
+    def _set_up(cls, iface: str) -> bool:
+        rc, _, _ = cls._run(["ip", "link", "set", iface, "up"])
+        return rc == 0
+
+    @classmethod
+    def _set_down(cls, iface: str) -> bool:
+        rc, _, _ = cls._run(["ip", "link", "set", iface, "down"])
+        return rc == 0
+
+    # ------------------------------------------------------------------
+    # Einzelne Tests
+    # ------------------------------------------------------------------
+    @classmethod
+    def _get_driver_name(cls, iface: str) -> str:
+        """Ermittelt den aktuell geladenen Treiber-Namen eines Interfaces.
+
+        Nutzt zuerst /sys/class/net/<iface>/device/driver, dann
+        ethtool -i als Fallback.
+        """
+        # 1. sysfs
+        try:
+            link = Path("/sys/class/net") / iface / "device" / "driver"
+            if link.is_symlink():
+                return os.path.basename(os.path.realpath(str(link)))
+        except OSError:
+            pass
+        # 2. ethtool
+        rc, out, _ = cls._run(["ethtool", "-i", iface])
+        if rc == 0:
+            for line in out.splitlines():
+                lo = line.lower()
+                if lo.startswith("driver:"):
+                    return line.split(":", 1)[1].strip()
+        return ""
+
+    def _test_driver_source(self, iface: str, claimed: dict) -> dict:
+        """Prueft: stimmt Katalog-Quelle mit tatsaechlicher ueberein?
+
+        Vergleicht claimed['driver_source'] mit der Live-Erkennung via
+        HardwareScanner._detect_driver_source. NIEMALS invasiv.
+        """
+        claimed_src = claimed.get("driver_source", "")
+        if not claimed_src:
+            return self._skip(
+                "driver_source",
+                "Keine Treiber-Quelle im Katalog",
+                claimed=claimed_src,
+            )
+        drv = self._get_driver_name(iface)
+        if not drv:
+            return self._skip(
+                "driver_source",
+                "Treiber-Name nicht ermittelbar",
+                claimed=claimed_src,
+            )
+        try:
+            detected = HardwareScanner._detect_driver_source(drv)
+        except Exception as e:
+            return self._skip(
+                "driver_source",
+                f"Detection-Fehler: {str(e)[:100]}",
+                claimed=claimed_src,
+            )
+        if detected == "unknown":
+            return self._skip(
+                "driver_source",
+                f"Erkennung unklar fuer Treiber '{drv}'",
+                claimed=claimed_src,
+            )
+        status = "ok" if detected == claimed_src else "deviation"
+        return {
+            "test": "driver_source",
+            "claimed": claimed_src,
+            "observed": detected,
+            "status": status,
+            "detail": (
+                "" if status == "ok" else
+                f"Katalog={claimed_src}, real={detected} "
+                f"(Treiber: {drv})"
+            ),
+        }
+
+    def _test_driver_loaded(self, iface: str, claimed: dict) -> dict:
+        """Prueft, ob der Katalog-Treiber geladen ist.
+
+        Case-insensitive, breiterer Match: 'rtl88XXau (aircrack-ng)'
+        matcht Modul '88XXau' oder 'rtl88XXau'.
+        """
+        claimed_drv_raw = claimed.get("driver", "")
+        claimed_drv = claimed_drv_raw.split()[0].lower()
+        if not claimed_drv:
+            return self._skip("driver", "Kein Treiber im Katalog")
+
+        rc, out, _ = self._run(["lsmod"])
+        if rc != 0:
+            return self._skip("driver", "lsmod fehlgeschlagen")
+
+        # Kandidaten: vollstaendiger Name, ohne 'rtl'-Prefix, ohne '_aircrack'
+        candidates = {claimed_drv}
+        if claimed_drv.startswith("rtl"):
+            candidates.add(claimed_drv[3:])  # ohne 'rtl'
+        # lsmod-Zeilen sammeln (erste Spalte = Modulname)
+        mod_names = [
+            ln.split()[0].lower()
+            for ln in out.splitlines()[1:]
+            if ln.strip() and ln.split()
+        ]
+        loaded = False
+        matched_name = ""
+        for cand in candidates:
+            if not cand:
+                continue
+            for mn in mod_names:
+                if mn == cand or mn.startswith(cand) or cand in mn:
+                    loaded = True
+                    matched_name = mn
+                    break
+            if loaded:
+                break
+
+        return {
+            "test": "driver",
+            "claimed": claimed_drv_raw,
+            "observed": (
+                f"geladen ({matched_name})" if loaded
+                else "nicht geladen"
+            ),
+            "status": "ok" if loaded else "deviation",
+            "detail": "" if loaded else (
+                f"Treiber '{claimed_drv}' nicht in lsmod - "
+                f"Adapter evtl. nicht aktiv. "
+                f"Gefundene Module: "
+                f"{', '.join(m for m in mod_names if 'rtl' in m or '88' in m)}"
+            ),
+        }
+
+    def _test_monitor(self, iface: str, claimed: dict) -> dict:
+        claimed_val = bool(claimed.get("monitor"))
+        return self._test_mode(iface, "monitor", claimed_val)
+
+    def _test_ap(self, iface: str, claimed: dict) -> dict:
+        claimed_val = bool(claimed.get("ap_mode"))
+        return self._test_mode(iface, "AP", claimed_val)
+
+    def _test_ibss(self, iface: str, claimed: dict) -> dict:
+        claimed_val = bool(claimed.get("ibss"))
+        return self._test_mode(iface, "IBSS", claimed_val)
+
+    def _test_mode(self, iface: str, mode: str, claimed_val: bool) -> dict:
+        """Generischer Test: kann Interface in <mode> wechseln?
+
+        Probiert bei AP auch '__ap' (aeltere iw-Syntax).
+        """
+        if not self._is_root():
+            return self._skip(
+                f"mode_{mode.lower()}",
+                f"Root noetig fuer {mode}-Wechsel",
+                claimed=claimed_val,
+            )
+        if self._is_rfkill_blocked(iface):
+            return self._skip(
+                f"mode_{mode.lower()}",
+                "Adapter rfkill-blockiert - sudo rfkill unblock all",
+                claimed=claimed_val,
+            )
+
+        original = self._read_mode(iface)
+        state = self._read_state(iface)
+        was_up = state == "up"
+
+        # Kandidaten fuer Modus-Name (AP -> auch __ap)
+        candidates = [mode]
+        if mode == "AP":
+            candidates.append("__ap")
+
+        try:
+            if was_up:
+                self._set_down(iface)
+
+            ok = False
+            err = ""
+            for cand in candidates:
+                ok, err = self._set_mode(iface, cand)
+                if ok:
+                    break
+
+            # Restore
+            if original:
+                self._set_mode(iface, original)
+            if was_up:
+                self._set_up(iface)
+
+            if ok:
+                return {
+                    "test": f"mode_{mode.lower()}",
+                    "claimed": claimed_val,
+                    "observed": True,
+                    "status": "ok" if claimed_val else "deviation",
+                    "detail": (
+                        "" if claimed_val else
+                        f"Modus {mode} funktioniert, Katalog sagt False"
+                    ),
+                }
+            # EBUSY (-16) ist kein Katalog-Fehler, sondern Test-Interferenz
+            if "-16" in (err or "") or "busy" in (err or "").lower():
+                return self._skip(
+                    f"mode_{mode.lower()}",
+                    f"Interface busy ({err}) - Test-Interferenz, "
+                    f"nicht bewertbar",
+                    claimed=claimed_val,
+                )
+            return {
+                "test": f"mode_{mode.lower()}",
+                "claimed": claimed_val,
+                "observed": False,
+                "status": "ok" if not claimed_val else "deviation",
+                "detail": (
+                    "" if not claimed_val else
+                    f"Modus {mode} NICHT unterstuetzt: {err}"
+                ),
+            }
+        except Exception as e:
+            if original:
+                try:
+                    self._set_mode(iface, original)
+                except Exception:
+                    pass
+            return self._skip(
+                f"mode_{mode.lower()}",
+                f"Test-Fehler: {str(e)[:120]}",
+                claimed=claimed_val,
+            )
+
+    def _test_active_monitor(self, iface: str, claimed: dict) -> dict:
+        """Active Monitor ist nur indirekt testbar.
+
+        Es gibt kein eindeutiges Userspace-Kriterium. Wir pruefen:
+        - Monitor-Mode verfuegbar?
+        - Kanal-Wechsel moeglich?
+        - Frames koennen empfangen werden (dmesg)?
+
+        Da das Ergebnis unsicher ist, markieren wir es als "skip"
+        mit Hinweis - NIEMALS als "deviation". So verhindern wir
+        False Positives.
+        """
+        claimed_val = bool(claimed.get("active_monitor"))
+
+        if not self._is_root():
+            return self._skip(
+                "active_monitor",
+                "Root noetig fuer Monitor-Test",
+                claimed=claimed_val,
+            )
+        if self._is_rfkill_blocked(iface):
+            return self._skip(
+                "active_monitor",
+                "Adapter rfkill-blockiert",
+                claimed=claimed_val,
+            )
+        if not claimed.get("monitor"):
+            return self._skip(
+                "active_monitor",
+                "Monitor nicht unterstuetzt im Katalog",
+                claimed=claimed_val,
+            )
+
+        # Nur ein Indikator: laesst sich Monitor-Mode setzen?
+        original = self._read_mode(iface)
+        state = self._read_state(iface)
+        was_up = state == "up"
+
+        try:
+            if was_up:
+                self._set_down(iface)
+            ok_mon, _ = self._set_mode(iface, "monitor")
+            if original:
+                self._set_mode(iface, original)
+            if was_up:
+                self._set_up(iface)
+
+            if not ok_mon:
+                return self._skip(
+                    "active_monitor",
+                    "Monitor-Wechsel fehlgeschlagen - Test nicht moeglich",
+                    claimed=claimed_val,
+                )
+
+            # Kein eindeutiges Kriterium fuer "active" - ehrlich als SKIP
+            return self._skip(
+                "active_monitor",
+                (
+                    f"Nicht eindeutig testbar. Katalog sagt "
+                    f"{claimed_val}. Hinweis: pruefe manuell mit "
+                    f"'iw dev <iface> set type monitor' und "
+                    f"'tcpdump -i <iface>'"
+                ),
+                claimed=claimed_val,
+            )
+        except Exception as e:
+            if original:
+                try:
+                    self._set_mode(iface, original)
+                    if was_up:
+                        self._set_up(iface)
+                except Exception:
+                    pass
+            return self._skip(
+                "active_monitor",
+                f"Test-Fehler: {str(e)[:120]}",
+                claimed=claimed_val,
+            )
+
+    def _test_vif(self, iface: str, claimed: dict) -> dict:
+        """Prueft VIF via interface add/del.
+
+        WICHTIG: Manche Treiber erlauben interface add nur, wenn
+        das Hauptinterface DOWN ist. Wir setzen es temporaer down.
+        """
+        claimed_val = bool(claimed.get("vif"))
+        if not self._is_root():
+            return self._skip(
+                "vif",
+                "Root noetig fuer VIF-Test",
+                claimed=claimed_val,
+            )
+        if self._is_rfkill_blocked(iface):
+            return self._skip(
+                "vif",
+                "Adapter rfkill-blockiert",
+                claimed=claimed_val,
+            )
+
+        # State speichern
+        state = self._read_state(iface)
+        was_up = state == "up"
+
+        test_name = f"viftest{abs(hash(iface)) % 10000}"
+
+        try:
+            # Interface runter (Voraussetzung bei vielen Treibern)
+            if was_up:
+                self._set_down(iface)
+
+            # Versuch 1: interface add type monitor
+            rc_add, _, err_add = self._run(
+                ["iw", "dev", iface, "interface", "add",
+                 test_name, "type", "monitor"]
+            )
+            observed = rc_add == 0
+
+            if observed:
+                # Aufraeumen
+                self._run(["iw", "dev", test_name, "del"])
+
+            # Restore
+            if was_up:
+                self._set_up(iface)
+
+            return {
+                "test": "vif",
+                "claimed": claimed_val,
+                "observed": observed,
+                "status": (
+                    "ok" if observed == claimed_val else "deviation"
+                ),
+                "detail": (
+                    "" if observed == claimed_val else
+                    f"Katalog={claimed_val}, real={observed} "
+                    f"({(err_add or '')[:120]})"
+                ),
+            }
+        except Exception as e:
+            # Best-effort Cleanup
+            try:
+                self._run(["iw", "dev", test_name, "del"])
+                if was_up:
+                    self._set_up(iface)
+            except Exception:
+                pass
+            return self._skip(
+                "vif",
+                f"Test-Fehler: {str(e)[:120]}",
+                claimed=claimed_val,
+            )
+
+    @classmethod
+    def _is_rfkill_blocked(cls, iface: str) -> bool:
+        """Prueft, ob das Interface per rfkill blockiert ist.
+
+        Parst `rfkill list` und matcht den phy-Namen des Interfaces.
+        Bei Fehlern konservativ False (nicht blockiert).
+        """
+        try:
+            rc, out, _ = cls._run(["rfkill", "list"])
+        except (AttributeError, TypeError, OSError):
+            return False
+        if rc != 0:
+            return False
+
+        # phy des Interfaces ermitteln
+        phy = None
+        try:
+            rc2, iwout, _ = cls._run(["iw", "dev", iface, "info"])
+            if rc2 == 0:
+                for line in iwout.splitlines():
+                    if "wiphy" in line:
+                        parts = line.split()
+                        if parts:
+                            phy = "phy" + parts[-1].strip()
+                        break
+        except (AttributeError, TypeError, OSError):
+            pass
+        if not phy:
+            return False
+
+        lines = out.splitlines()
+        for i, line in enumerate(lines):
+            if phy in line and "Wireless LAN" in line:
+                for j in range(i, min(i + 3, len(lines))):
+                    low = lines[j].lower()
+                    if ("soft blocked: yes" in low
+                            or "hard blocked: yes" in low):
+                        return True
+        return False
+
+    def _test_injection(self, iface: str, claimed: dict) -> dict:
+        """Injection-Test - NICHT invasiv: `aireplay-ng --test`.
+
+        ACHTUNG: --test ist ein kurzer Testframe, kein Flood. Sollte
+        nur auf explizite Anforderung laufen.
+        """
+        claimed_val = bool(claimed.get("injection"))
+        if not self._is_root():
+            return self._skip(
+                "injection",
+                "Root noetig fuer Injection-Test",
+                claimed=claimed_val,
+            )
+        if not shutil.which("aireplay-ng"):
+            return self._skip(
+                "injection",
+                "aireplay-ng nicht installiert",
+                claimed=claimed_val,
+            )
+
+        # rfkill-Check: blockierte Interfaces liefern False-Positives
+        # (Injection schlaegt fehl, obwohl die Hardware kann).
+        if self._is_rfkill_blocked(iface):
+            return self._skip(
+                "injection",
+                "Interface per rfkill blockiert (soft/hard). "
+                "Bitte 'sudo rfkill unblock all' und erneut versuchen.",
+                claimed=claimed_val,
+            )
+
+        # Wir setzen Monitor, machen --test, restore
+        original = self._read_mode(iface)
+        state = self._read_state(iface)
+        was_up = state == "up"
+
+        try:
+            if was_up:
+                self._set_down(iface)
+            self._set_mode(iface, "monitor")
+            self._set_up(iface)
+            rc, out, err = self._run(
+                ["aireplay-ng", "--test", iface],
+                timeout=15.0,
+            )
+            # --test gibt bei Erfolg "Injection is working!" o.ae. aus
+            text = (out + err).lower()
+            observed = (
+                rc == 0
+                or "injection is working" in text
+                or ("injection test" in text and "ok" in text)
+            )
+            # Restore
+            if original:
+                self._set_down(iface)
+                self._set_mode(iface, original)
+                if was_up:
+                    self._set_up(iface)
+            return {
+                "test": "injection",
+                "claimed": claimed_val,
+                "observed": observed,
+                "status": (
+                    "ok" if observed == claimed_val else "deviation"
+                ),
+                "detail": (
+                    "" if observed == claimed_val else
+                    f"Katalog={claimed_val}, real={observed} "
+                    f"(rc={rc})"
+                ),
+            }
+        except Exception as e:
+            if original:
+                try:
+                    self._set_mode(iface, original)
+                    if was_up:
+                        self._set_up(iface)
+                except Exception:
+                    pass
+            return self._skip(
+                "injection",
+                f"Test-Fehler: {str(e)[:120]}",
+                claimed=claimed_val,
+            )
+
+    @staticmethod
+    def _skip(test: str, msg: str, claimed=None) -> dict:
+        return {
+            "test": test,
+            "claimed": claimed,
+            "observed": None,
+            "status": "skip",
+            "detail": msg,
+        }
+
+    # ------------------------------------------------------------------
+    # Aggregation
+    # ------------------------------------------------------------------
+    def verify_adapter(self, iface: str, claimed: dict) -> dict:
+        """Fuehrt alle Tests fuer einen Adapter aus.
+
+        Returns: {
+            iface, model, root,
+            tests: [ {test, claimed, observed, status, detail}, ... ],
+            summary: {ok, deviation, skip, total},
+            deviations: [ ... ],
+        }
+        """
+        tests = []
+
+        # Immer machbar (kein root):
+        tests.append(self._test_driver_loaded(iface, claimed))
+        tests.append(self._test_driver_source(iface, claimed))
+
+        # Root-Tests
+        tests.append(self._test_monitor(iface, claimed))
+        tests.append(self._test_ap(iface, claimed))
+        tests.append(self._test_active_monitor(iface, claimed))
+        tests.append(self._test_vif(iface, claimed))
+        # Injection nur wenn angefordert (Parameter)
+        tests.append(self._test_injection(iface, claimed))
+
+        summary = {"ok": 0, "deviation": 0, "skip": 0, "total": len(tests)}
+        deviations = []
+        for t in tests:
+            st = t.get("status")
+            if st == "ok":
+                summary["ok"] += 1
+            elif st == "deviation":
+                summary["deviation"] += 1
+                deviations.append(t)
+            else:
+                summary["skip"] += 1
+
+        return {
+            "iface": iface,
+            "model": claimed.get("model", claimed.get("catalog_model", "?")),
+            "root": self._is_root(),
+            "tests": tests,
+            "summary": summary,
+            "deviations": deviations,
+        }
+
+    def verify_all(self, adapters: list) -> dict:
+        """Verifiziert alle uebergebenen Adapter.
+
+        adapters: Liste von {iface, claimed_dict} oder
+                  Liste von Tupeln (iface, claimed_dict).
+        """
+        results = []
+        for item in adapters or []:
+            if isinstance(item, tuple) and len(item) == 2:
+                iface, claimed = item
+            elif isinstance(item, dict):
+                iface = item.get("iface")
+                claimed = item.get("claimed") or item
+            else:
+                continue
+            if not iface:
+                continue
+            try:
+                results.append(self.verify_adapter(iface, claimed))
+            except Exception as e:
+                results.append({
+                    "iface": iface,
+                    "error": str(e)[:200],
+                })
+        return {
+            "root": self._is_root(),
+            "adapters": results,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    # ------------------------------------------------------------------
+    # Report-Formatierung
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _icon(status: str) -> str:
+        return {
+            "ok": "OK",
+            "deviation": "!!",
+            "skip": "??",
+        }.get(status, "?")
+
+    def format_report(self, report: dict) -> str:
+        lines = [
+            "=" * 72,
+            "  HARDWARE-VERIFIKATION",
+            "=" * 72,
+            "",
+        ]
+        if not report.get("root"):
+            lines.append(
+                "! Kein Root - viele Tests werden uebersprungen."
+            )
+            lines.append(
+                "  Fuer vollstaendige Verifikation: sudo "
+                "python3 w.py --hw-verify"
+            )
+            lines.append("")
+
+        for a in report.get("adapters", []):
+            if "error" in a:
+                lines.append(f"  {a['iface']}: FEHLER {a['error']}")
+                continue
+            summ = a.get("summary", {})
+            lines.append(f"-- {a['iface']}  ({a.get('model', '?')}) --")
+            lines.append(
+                f"   OK={summ.get('ok', 0)}  "
+                f"Abweichungen={summ.get('deviation', 0)}  "
+                f"Uebersprungen={summ.get('skip', 0)}"
+            )
+            for t in a.get("tests", []):
+                icon = self._icon(t.get("status", "?"))
+                lines.append(
+                    f"   [{icon}] {t['test']:<18} "
+                    f"claimed={t.get('claimed')!s:<6} "
+                    f"observed={t.get('observed')!s:<6}"
+                )
+                if t.get("detail"):
+                    lines.append(f"        {t['detail']}")
+            lines.append("")
+
+        # Zusammenfassung
+        total_dev = sum(
+            a.get("summary", {}).get("deviation", 0)
+            for a in report.get("adapters", [])
+            if "error" not in a
+        )
+        if total_dev:
+            lines.append(
+                f"!! {total_dev} Abweichung(en) zwischen Katalog und "
+                f"Realitaet gefunden."
+            )
+            lines.append(
+                "   Bitte Bug-Report mit --hw-dump erstellen."
+            )
+        else:
+            lines.append("OK - Keine Abweichungen zwischen Katalog und Realitaet.")
+        return "\n".join(lines)
+
+
+class KernelCompatMatrix:
+    """v37-R18: Kernel-Kompatibilitaetsmatrix fuer WLAN-Adapter.
+
+    Zeigt pro Adapter, welcher Treiber in welchem Kernel-Bereich
+    verfuegbar ist und welche Faehigkeiten (monitor, injection,
+    vif, active_monitor) verfuegbar sind.
+
+    Hintergrund: Adapter wie RTL8812AU wechseln mit dem Kernel-
+    Update von DKMS auf In-Kernel (rtw88) und verlieren dabei
+    manche Faehigkeiten. Statt zu raten, dokumentieren wir.
+    """
+
+    # ------------------------------------------------------------------
+    # Daten pro Adapter: Liste von Bereichen
+    # ------------------------------------------------------------------
+    # Range-Syntax:
+    #   "5.15-6.12"  -> major.minor >= 5.15 UND <= 6.12
+    #   ">=6.15"     -> major.minor >= 6.15
+    #   "any"        -> jede Version
+    MATRIX = {
+        # ==============================================================
+        # ALFA / REALTEK RTL8812AU (ACH-C, ACH)
+        # ==============================================================
+        "0bda:8812": [
+            {
+                "range": "5.15-6.12",
+                "driver": "rtl88XXau (DKMS, aircrack-ng)",
+                "source": "dkms",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "DKMS-Standard. HW-Verify (Kernel 5.16) hat "
+                         "vif=False verifiziert.",
+            },
+            {
+                "range": "6.13-6.14",
+                "driver": "rtw88 (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "DKMS baut nicht mehr. In-Kernel-Treiber "
+                         "verwenden. Pruefe ob USB-ID gemergt ist.",
+            },
+            {
+                "range": ">=6.15",
+                "driver": "rtw88 (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": "unsicher",
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "USB-ID 0bda:8812 ggf. nicht vollstaendig "
+                         "gemergt. Pruefe 'modinfo rtw88_8812au' "
+                         "und 'lsusb'.",
+            },
+        ],
+        "0bda:881a": [
+            {
+                "range": "5.15-6.12",
+                "driver": "rtl88XXau (DKMS, aircrack-ng)",
+                "source": "dkms",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "Wie 0bda:8812 (aeltere Revision).",
+            },
+            {
+                "range": ">=6.13",
+                "driver": "rtw88 (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": "unsicher",
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "Wie 0bda:8812. USB-ID pruefen.",
+            },
+        ],
+        "0bda:8813": [
+            {
+                "range": "5.15-6.12",
+                "driver": "rtl8814au (DKMS)",
+                "source": "dkms",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "Stromhunger, instabiler als rtl8812au.",
+            },
+            {
+                "range": ">=6.13",
+                "driver": "rtw88_8814au (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": "unsicher",
+                "injection": "unsicher",
+                "ap_mode": "unsicher",
+                "vif": False,
+                "active_monitor": False,
+                "notes": "In-Kernel-Support fuer 8814au ist duenn. "
+                         "DKMS auf Kernel 6.x oft nicht baubar.",
+            },
+        ],
+
+        # ==============================================================
+        # ALFA / REALTEK RTL8187 (AWUS036H)
+        # ==============================================================
+        "0bda:8187": [
+            {
+                "range": "any",
+                "driver": "rtl8187 (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": False,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "EOL-Adapter. HW-Verify (Kernel 5.16): "
+                         "monitor=OK, injection=OK, ap_mode=False, "
+                         "vif=True. Nur 802.11b/g.",
+            },
+        ],
+
+        # ==============================================================
+        # ALFA / MEDIATEK MT7610U/MT7612U (ACHM, ACM)
+        # ==============================================================
+        "0e8d:7610": [
+            {
+                "range": ">=4.19",
+                "driver": "mt76x0u (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": True,
+                "notes": "Sehr stabil. Active Monitor verfuegbar. "
+                         "Top-Empfehlung fuer Kernel 5.x-7.x.",
+            },
+        ],
+        "0e8d:7612": [
+            {
+                "range": ">=4.19",
+                "driver": "mt76x2u (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": True,
+                "notes": "Sehr stabil. 2x2 MIMO + USB 3.0. "
+                         "Top-Empfehlung fuer Durchsatz.",
+            },
+        ],
+
+        # ==============================================================
+        # MEDIATEK MT7921AU (AXML - Monitor-Mode BROKEN)
+        # ==============================================================
+        "0e8d:7961": [
+            {
+                "range": "5.16-6.11",
+                "driver": "mt7921u (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": "unsicher",
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "Monitor-Mode instabil. NICHT fuer Pentest.",
+            },
+            {
+                "range": ">=6.12",
+                "driver": "mt7921u (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": "broken",
+                "injection": "broken",
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "KRITISCH: Monitor-Mode nachweislich defekt "
+                         "(morrownr). NICHT KAUFEN bis gefixt.",
+            },
+        ],
+
+        # ==============================================================
+        # RALINK rt2800usb (AWUS051NH, Tube-U, PAU09)
+        # ==============================================================
+        "148f:3572": [
+            {
+                "range": "any",
+                "driver": "rt2800usb (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "EOL. Stabil, aber technisch veraltet.",
+            },
+        ],
+        "148f:3070": [
+            {
+                "range": "any",
+                "driver": "rt2800usb (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "EOL. Outdoor-Adapter.",
+            },
+        ],
+        "148f:5572": [
+            {
+                "range": "any",
+                "driver": "rt2800usb (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "EOL. Panda PAU09.",
+            },
+        ],
+
+        # ==============================================================
+        # ATHEROS AR9271 (AWUS036NHA, TL-WN722N v1)
+        # ==============================================================
+        "148f:5370": [
+            {
+                "range": "any",
+                "driver": "ath9k_htc (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "EOL. Sehr stabil, aber veraltet.",
+            },
+        ],
+        "2357:0101": [
+            {
+                "range": "any",
+                "driver": "ath9k_htc (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": False,
+                "notes": "EOL. Nur v1 (2357:0101). v2/v3 = unbrauchbar.",
+            },
+        ],
+
+        # ==============================================================
+        # REALTEK RTL8188EUS Staging (TL-WN722N v2/v3)
+        # ==============================================================
+        "2357:010c": [
+            {
+                "range": ">=4.4",
+                "driver": "r8188eu (staging)",
+                "source": "staging",
+                "monitor": "eingeschraenkt",
+                "injection": False,
+                "ap_mode": False,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "UNBRAUCHBAR fuer Injection/AP. "
+                         "NICHT KAUFEN - v1 nehmen.",
+            },
+        ],
+
+        # ==============================================================
+        # REALTEK RTL8812BU/8821AU (T3U Plus, T2U)
+        # ==============================================================
+        "2357:0138": [
+            {
+                "range": "5.15-6.12",
+                "driver": "rtl88x2bu (DKMS)",
+                "source": "dkms",
+                "monitor": True,
+                "injection": "dkms",
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "1x1, kein MIMO. DFS-Kanaele eingeschraenkt.",
+            },
+            {
+                "range": ">=6.13",
+                "driver": "rtw88_8822bu (In-Kernel, sobald gemergt)",
+                "source": "in-kernel",
+                "monitor": "unsicher",
+                "injection": "unsicher",
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "In-Kernel-Support fuer RTL8812BU ist in "
+                         "Arbeit. USB-ID pruefen.",
+            },
+        ],
+        "2357:011f": [
+            {
+                "range": "5.15-6.12",
+                "driver": "rtl88x2bu (DKMS)",
+                "source": "dkms",
+                "monitor": True,
+                "injection": "dkms",
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "Intern ohne externe Antenne. T3U Plus ist "
+                         "besser.",
+            },
+        ],
+        "2357:0120": [
+            {
+                "range": "5.15-6.12",
+                "driver": "rtl8821au (DKMS)",
+                "source": "dkms",
+                "monitor": True,
+                "injection": "dkms",
+                "ap_mode": True,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "USB 2.0, 1x1. Nur fuer 2.4 GHz zu empfehlen.",
+            },
+        ],
+
+        # ==============================================================
+        # NETGEAR A6210
+        # ==============================================================
+        "0846:9011": [
+            {
+                "range": ">=4.19",
+                "driver": "mt76x2u (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": True,
+                "injection": True,
+                "ap_mode": True,
+                "vif": True,
+                "active_monitor": True,
+                "notes": "EOL. Stabile In-Kernel-Option ohne externe "
+                         "Antennen.",
+            },
+        ],
+
+        # ==============================================================
+        # INTEL (PCIe - kein Injection)
+        # ==============================================================
+        "8086:2723": [
+            {
+                "range": ">=5.1",
+                "driver": "iwlwifi (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": "eingeschraenkt",
+                "injection": False,
+                "ap_mode": False,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "Intel-Firmware-Lock. NICHT fuer Pentest.",
+            },
+        ],
+        "8086:2725": [
+            {
+                "range": ">=5.10",
+                "driver": "iwlwifi (In-Kernel)",
+                "source": "in-kernel",
+                "monitor": "eingeschraenkt",
+                "injection": False,
+                "ap_mode": False,
+                "vif": False,
+                "active_monitor": False,
+                "notes": "Wie AX200. NICHT fuer Pentest.",
+            },
+        ],
+    }
+
+    # ------------------------------------------------------------------
+    # Hilfsfunktionen
+    # ------------------------------------------------------------------
+    @staticmethod
+    def parse_kernel(version_str: str):
+        """Zerlegt 'Kernel-Version' in (major, minor).
+
+        Akzeptiert: '5.16.0-kali7-amd64', '6.12.4', '5.15',
+                    '7.2.7-arch1-1'.
+        Returns: (int, int) oder None bei Parse-Fehler.
+        """
+        if not version_str:
+            return None
+        s = str(version_str).strip()
+        # Nur erste zwei Ziffern-Bloecke
+        parts = s.split(".")[:2]
+        try:
+            major = int("".join(c for c in parts[0] if c.isdigit()) or "0")
+            minor = 0
+            if len(parts) >= 2:
+                # Nur führende Ziffern aus dem zweiten Block
+                digits = ""
+                for c in parts[1]:
+                    if c.isdigit():
+                        digits += c
+                    else:
+                        break
+                minor = int(digits or "0")
+            return (major, minor)
+        except (ValueError, IndexError):
+            return None
+
+    @staticmethod
+    def _parse_range(range_str: str):
+        """Zerlegt Range-Syntax in (lo, hi) als (major, minor)-Tupel.
+
+        'any'         -> (None, None)
+        '>=6.15'      -> ((6,15), None)
+        '5.15-6.12'   -> ((5,15), (6,12))
+        """
+        if not range_str or range_str.strip().lower() == "any":
+            return (None, None)
+        r = range_str.strip()
+        if r.startswith(">="):
+            lo = KernelCompatMatrix.parse_kernel(r[2:].strip())
+            return (lo, None)
+        if r.startswith("<="):
+            hi = KernelCompatMatrix.parse_kernel(r[2:].strip())
+            return (None, hi)
+        if "-" in r:
+            lo_s, hi_s = r.split("-", 1)
+            lo = KernelCompatMatrix.parse_kernel(lo_s.strip())
+            hi = KernelCompatMatrix.parse_kernel(hi_s.strip())
+            return (lo, hi)
+        # Einzelversion
+        v = KernelCompatMatrix.parse_kernel(r)
+        return (v, v)
+
+    @classmethod
+    def _matches(cls, kernel_tuple, range_str: str) -> bool:
+        """Prueft, ob kernel_tuple in range_str passt."""
+        if kernel_tuple is None:
+            return False
+        lo, hi = cls._parse_range(range_str)
+        if lo is None and hi is None:
+            return True  # "any"
+        if lo is not None and kernel_tuple < lo:
+            return False
+        if hi is not None and kernel_tuple > hi:
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Lookup
+    # ------------------------------------------------------------------
+    @classmethod
+    def for_kernel(cls, usb_id: str, kernel_str: str):
+        """Findet passenden Matrix-Eintrag.
+
+        Returns: dict oder None.
+        """
+        if not usb_id:
+            return None
+        entries = cls.MATRIX.get(usb_id.lower())
+        if not entries:
+            return None
+        kt = cls.parse_kernel(kernel_str)
+        if kt is None:
+            return None
+        for entry in entries:
+            if cls._matches(kt, entry.get("range", "")):
+                return dict(entry)
+        return None
+
+    @classmethod
+    def current(cls, usb_id: str):
+        """Eintrag passend zur aktuellen Kernel-Version.
+
+        Nutzt platform.release().
+        """
+        import platform as _p
+        return cls.for_kernel(usb_id, _p.release())
+
+    @classmethod
+    def known_usb_ids(cls) -> list:
+        return sorted(cls.MATRIX.keys())
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+    @classmethod
+    def render_matrix(cls, usb_id: str) -> str:
+        """Textreport fuer einen Adapter."""
+        entries = cls.MATRIX.get(usb_id.lower())
+        if not entries:
+            return f"Keine Matrix fuer Adapter {usb_id}."
+
+        import platform as _p
+        cur = cls.current(usb_id)
+        cur_kernel = _p.release()
+
+        lines = [
+            "=" * 72,
+            f"  KERNEL-MATRIX: {usb_id}",
+            "=" * 72,
+            f"  Aktueller Kernel: {cur_kernel}",
+        ]
+        if cur:
+            lines.append(
+                f"  Treffer:         {cur.get('driver', '?')} "
+                f"({cur.get('source', '?')})"
+            )
+        else:
+            lines.append("  Treffer:         (kein Eintrag passt)")
+        lines.append("")
+
+        for entry in entries:
+            lines.append("-" * 72)
+            lines.append(f"  Kernel-Bereich:  {entry.get('range', '?')}")
+            lines.append(f"  Treiber:         {entry.get('driver', '?')}")
+            lines.append(f"  Quelle:          {entry.get('source', '?')}")
+            caps = []
+            for key in ("monitor", "injection", "ap_mode",
+                        "vif", "active_monitor"):
+                val = entry.get(key)
+                if val is True:
+                    caps.append(f"{key}=OK")
+                elif val is False:
+                    caps.append(f"{key}=nein")
+                elif val is None:
+                    continue
+                else:
+                    caps.append(f"{key}={val}")
+            lines.append(f"  Faehigkeiten:    {', '.join(caps)}")
+            notes = entry.get("notes", "")
+            if notes:
+                lines.append(f"  Notiz:           {notes}")
+        return "\n".join(lines)
+
+    @classmethod
+    def render_all(cls) -> str:
+        """Vollstaendiger Report aller Adapter."""
+        import platform as _p
+        lines = [
+            "=" * 72,
+            "  KERNEL-KOMPATIBILITAETS-MATRIX",
+            "=" * 72,
+            f"  Kernel: {_p.release()}",
+            f"  Adapter: {len(cls.MATRIX)}",
+            "",
+        ]
+        for usb_id in cls.known_usb_ids():
+            lines.append(cls.render_matrix(usb_id))
+            lines.append("")
+        return "\n".join(lines)
+
+    @classmethod
+    def annotated(cls, usb_id: str, kernel_str: str | None = None) -> dict | None:
+        """P9.3c: Wie current()/for_kernel(), aber mit Zusatzfeldern.
+
+        Neue Felder im zurueckgegebenen dict:
+          driver_module : erwarteter Modulname fuer `modinfo`
+          verify_cmd    : Shell-Kommando zur Live-Verifikation
+          is_in_kernel  : bool
+        Aendert keine bestehenden Methoden.
+        """
+        if kernel_str is None:
+            entry = cls.current(usb_id)
+        else:
+            entry = cls.for_kernel(usb_id, kernel_str)
+        if entry is None:
+            return None
+        result = dict(entry)
+        src = (entry.get("source") or "").lower()
+        drv = entry.get("driver") or ""
+        drv_lower = drv.lower()
+
+        if src == "dkms":
+            result["driver_module"] = "88XXau"
+            result["verify_cmd"] = "modinfo 88XXau"
+            result["is_in_kernel"] = False
+        elif src == "in-kernel":
+            if "rtw88" in drv_lower:
+                # Modulname aus USB-ID ableiten - der driver-String in
+                # der MATRIX ist zu generisch ("rtw88 (In-Kernel)").
+                mid = (usb_id or "").lower()
+                if mid in ("0bda:8812", "0bda:881a", "0bda:881b"):
+                    result["driver_module"] = "rtw88_8812au"
+                elif mid in ("0bda:8821", "0bda:8822"):
+                    result["driver_module"] = "rtw88_8821au"
+                else:
+                    result["driver_module"] = "rtw88"
+                result["verify_cmd"] = (
+                    "modinfo " + result["driver_module"]
+                    + " && lsmod | grep rtw88"
+                )
+            else:
+                first = drv.split()[0] if drv else "unknown"
+                result["driver_module"] = first
+                result["verify_cmd"] = "lsmod | grep " + first
+            result["is_in_kernel"] = True
+        else:
+            first = drv.split()[0] if drv else "unknown"
+            result["driver_module"] = first
+            result["verify_cmd"] = "modinfo " + first
+            result["is_in_kernel"] = False
+        return result
+
+
+
+
+
+
+
+
+def _hw_antenna_cli(model_filter: str = "", for_usb_id: str = "") -> int:
+    """CLI: Antennen-Katalog + Empfehlung fuer einen Adapter.
+
+    Modi:
+      --antenna              -> Katalog
+      --antenna ARS          -> Katalog gefiltert
+      --antenna --for ID     -> Empfehlung fuer Adapter ID
+    """
+    try:
+        if for_usb_id:
+            print(HardwareAdvisor.format_antenna_recommendation(
+                for_usb_id, 5.0
+            ))
+            return
+        if model_filter:
+            flt = model_filter.upper()
+            matched = [
+                k for k in AntennaCatalog.all_models() if flt in k.upper()
+            ]
+            if not matched:
+                print("Keine Antenne passt zu Filter '" + model_filter + "'.")
+                return
+            for k in matched:
+                a = AntennaCatalog.lookup(k)
+                gain = []
+                if a.gain_2g_dbi:
+                    gain.append(str(a.gain_2g_dbi) + " dBi @2.4")
+                if a.gain_5g_dbi:
+                    gain.append(str(a.gain_5g_dbi) + " dBi @5")
+                if a.gain_6g_dbi:
+                    gain.append(str(a.gain_6g_dbi) + " dBi @6")
+                gain_s = ", ".join(gain) if gain else "(kein Gain)"
+                print("  " + k)
+                print("    " + gain_s + " | " + a.connector
+                      + " | " + str(a.price_eur) + " EUR")
+                if a.notes:
+                    print("    " + a.notes)
+            return
+        # Default: voller Katalog
+        print(AntennaCatalog.render_full_report())
+    except (AttributeError, NameError) as exc:
+        print("Antennen-CLI Fehler: " + str(exc))
+        return 1
+    return 0
+
+
+def _hw_advisor_cli(compare_id: str = "") -> int:
+    """v37-R15: --hw-advisor [usb_id]."""
+    if compare_id:
+        print(HardwareAdvisor.compare_with(compare_id))
+        return 0
+    audit = HardwareAdvisor.audit()
+    print(HardwareAdvisor.format_audit(audit))
+    return 0
+
+
+def _hw_catalog_cli(filter_str: str = "") -> int:
+    """v37-R15: --hw-catalog [filter] - alle bekannten Adapter."""
+    lines = ["=" * 88, "  WiFi-Adapter-Katalog", "=" * 88, ""]
+    summ = WiFiAdapterCatalog.summary()
+    lines.append(f"Adapter gesamt:    {summ['total']}")
+    lines.append(f"  davon WLAN:      {summ['wifi']}")
+    lines.append(f"  davon BT/GPS:    {summ['bt_gps']}")
+    lines.append(f"In-Kernel:         {summ['in_kernel']}")
+    lines.append(f"DKMS:              {summ['dkms']}")
+    lines.append(f"Pentest-faehig:    {summ['pentest_capable']}")
+    lines.append(f"Active Monitor:    {summ['active_monitor']}")
+    lines.append(f"EOL:               {summ['eol']}")
+    lines.append("")
+
+    filt = (filter_str or "").lower()
+    for vendor in WiFiAdapterCatalog.all_vendors():
+        vendor_models = []
+        for uid, info in WiFiAdapterCatalog.KNOWN.items():
+            if info["vendor"] != vendor:
+                continue
+            if filt:
+                blob = " ".join([
+                    info.get("model", ""),
+                    info.get("chipset", ""),
+                    info.get("wifi_gen", ""),
+                    uid,
+                    " ".join(info.get("pros", [])),
+                ]).lower()
+                if filt not in blob:
+                    continue
+            vendor_models.append((uid, info))
+        if not vendor_models:
+            continue
+        lines.append(f"-- {vendor} --")
+        for uid, info in sorted(
+            vendor_models, key=lambda x: x[1]["model"]
+        ):
+            sc = HardwareAdvisor.score_adapter(uid)
+            rec = info.get("buy_recommendation", "")
+            marker = ""
+            if rec.startswith("TOP"):
+                marker = " <TOP>"
+            elif rec.startswith("Gute") or rec.startswith("Solide"):
+                marker = " <OK>"
+            elif rec.startswith("Bedingt"):
+                marker = " <?>"
+            elif rec.startswith("NICHT"):
+                marker = " <X>"
+            price = info.get("price_eur", "?")
+            lines.append(
+                f"  {info['model']:<34} {uid:<12} "
+                f"{info.get('chipset', '?'):<12} "
+                f"Score {sc['score']:>3}/100  "
+                f"~{price:>3} EUR{marker}"
+            )
+            if rec:
+                lines.append(f"      > {rec}")
+        lines.append("")
+    print("\n".join(lines))
+    return 0
+
+
+def _hw_score_cli(usb_id: str) -> int:
+    """v37-R15: --hw-score <usb_id> - Score-Breakdown fuer einen Adapter."""
+    sc = HardwareAdvisor.score_adapter(usb_id)
+    if sc["score"] == 0 and not sc.get("breakdown"):
+        print(f"Adapter {usb_id} nicht im Katalog.")
+        return 1
+    print(f"Modell:  {sc.get('model', '?')}")
+    print(f"Score:   {sc['score']}/100")
+    print(f"Rating:  {sc['rating']}")
+    print("")
+    print("Breakdown:")
+    for k, v in sc["breakdown"].items():
+        print(f"  {k:<22} {v:+d}")
+    return 0
+
+
+def _hw_upgrade_cli(usb_id: str) -> int:
+    """v37-R15: --hw-upgrade <usb_id> - Upgrade-Pfad vorschlagen."""
+    up = HardwareAdvisor.suggest_upgrade(usb_id)
+    if not up.get("found"):
+        print(f"Adapter {usb_id} nicht im Katalog.")
+        return 1
+    print(
+        f"Aktuell: {up['current_model']} - "
+        f"Score {up['current_score']}/100"
+    )
+    print("")
+    if not up["upgrades"]:
+        print("Keine Upgrades mit hoeherem Score verfuegbar.")
+        return 0
+    print("Upgrade-Kandidaten:")
+    for u in up["upgrades"]:
+        print(
+            f"  {u['model']:<34} Score {u['score']:>3}/100 "
+            f"(+{u['delta']})  {u['usb_id']}"
+        )
+        if u["reason"]:
+            print(f"      > {u['reason']}")
+    return 0
+
+
+def _hw_scan_cli(fmt: str = "text") -> int:
+    """v37-R15: --hw-scan [text|json|yaml]."""
+    scanner = HardwareScanner()
+    report = scanner.full_report()
+    if fmt == "json":
+        print(scanner.report_to_json(report))
+    elif fmt == "yaml":
+        print(scanner.report_to_yaml(report))
+    else:
+        print(scanner.format_report(report))
+    return 0
+
+
+def _hw_verify_cli(iface: str = "") -> int:
+    """v37-R17: --hw-verify [iface] - empirische Adapter-Verifikation.
+
+    Wenn iface leer: alle erkannten WLAN-Adapter pruefen.
+    """
+    scanner = HardwareScanner()
+    adapters = scanner.scan_wlan()
+    if not adapters:
+        print("Keine WLAN-Adapter erkannt - nichts zu verifizieren.")
+        return 1
+
+    # Wenn iface angegeben: nur diesen pruefen
+    if iface:
+        adapters = [a for a in adapters if a.get("iface") == iface]
+        if not adapters:
+            print(f"Interface '{iface}' nicht erkannt.")
+            return 1
+
+    # Verifier bauen
+    verifier = HardwareVerifier()
+
+    # Adapter-Liste mit Katalog-Info kombinieren
+    pairs = []
+    for a in adapters:
+        usb_id = a.get("usb_id", "")
+        claimed = WiFiAdapterCatalog.lookup(usb_id)
+        if not claimed:
+            # Fallback: nur generische Info, keine Verifikation
+            claimed = {
+                "model": a.get("catalog_model") or a.get("iface", "?"),
+                "monitor": a.get("supports_monitor", False),
+                "injection": a.get("supports_injection", False),
+                "ap_mode": a.get("supports_ap", False),
+                "active_monitor": a.get("supports_active_monitor", False),
+                "vif": a.get("supports_vif", False),
+                "driver": a.get("driver", ""),
+            }
+        pairs.append((a.get("iface", ""), claimed))
+
+    print("=" * 72)
+    print("  HARDWARE-VERIFIKATION")
+    print("=" * 72)
+    print("")
+    if not verifier._is_root():
+        print("!! Kein Root - invasive Tests werden uebersprungen.")
+        print("   Fuer vollstaendige Tests:")
+        print("   sudo python3 w.py --hw-verify")
+        print("")
+
+    report = verifier.verify_all(pairs)
+    print(verifier.format_report(report))
+    return 0
+
+
+def _hw_kernel_cli(usb_id: str = "") -> int:
+    """v37-R18: --hw-kernel [USB_ID] - Kernel-Matrix anzeigen."""
+    if usb_id:
+        print(KernelCompatMatrix.render_matrix(usb_id))
+        return 0
+    print(KernelCompatMatrix.render_all())
+    return 0
+
+
+def _scan_once_pick_iface() -> str:
+    """v38: Erstes WLAN-Interface mit Monitor-Support (sonst erstes WLAN)."""
+    try:
+        adapters = HardwareScanner().scan_wlan()
+    except (OSError, AttributeError, RuntimeError, ValueError):
+        adapters = []
+    for a in adapters:
+        if a.get("supports_monitor") or a.get("monitor"):
+            iface = a.get("iface") or a.get("name")
+            if iface:
+                return str(iface)
+    for a in adapters:
+        iface = a.get("iface") or a.get("name")
+        if iface:
+            return str(iface)
+    return ""
+
+
+def _scan_multi_pick_ifaces() -> tuple:
+    """7e: Waehlt (managed_iface, monitor_iface) fuer Multi-Adapter-Scan.
+
+    Sucht zwei unterschiedliche WLAN-Interfaces via HardwareScanner.
+    managed_iface bevorzugt einen Adapter OHNE Monitor-Support
+    (haelt die Rolle frei), monitor_iface einen MIT Monitor-Support.
+
+    Rueckgabe:
+      ("wlanX", "wlanY")  zwei Interfaces verfuegbar
+      ("wlanX", "")       nur eines verfuegbar
+      ("", "")            keines verfuegbar oder Scanner-Fehler
+
+    Defensiv: jeder HardwareScanner-Fehler -> ("", "").
+    Keine Seiteneffekte, kein Mode-Switch.
+    """
+    try:
+        adapters = HardwareScanner().scan_wlan()
+    except (OSError, AttributeError, RuntimeError, ValueError):
+        return ("", "")
+    entries: list = []
+    for a in adapters or []:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("iface") or a.get("name")
+        if not name:
+            continue
+        entries.append((
+            str(name),
+            bool(a.get("supports_monitor") or a.get("monitor")),
+        ))
+    if not entries:
+        return ("", "")
+    if len(entries) == 1:
+        return (entries[0][0], "")
+    non_mon = [n for n, m in entries if not m]
+    mon = [n for n, m in entries if m]
+    if non_mon and mon:
+        return (non_mon[0], mon[0])
+    if len(mon) >= 2:
+        return (mon[0], mon[1])
+    return (entries[0][0], entries[1][0])
+
+
+def _scan_multi_prepare_modes(managed: str = "",
+                              monitor: str = "") -> tuple:
+    """7e: Setzt zwei Interfaces auf ihre Ziel-Modi fuer Multi-Adapter-Scan.
+
+    managed: str — Interface, das in managed-Modus soll (iw scan).
+    monitor: str — Interface, das in monitor-Modus soll (Scapy).
+                   Leer = Rolle wird uebersprungen (Single-Adapter-Fallback).
+
+    Rueckgabe (ok: bool, msg: str).
+
+    Fehlerfaelle:
+      - beide leer -> (False, "Keine Interfaces angegeben.")
+      - managed == monitor (nicht-leer) -> (False, "... identisch ...")
+      - Mode-Switch schlaegt fehl -> (False, "<Rolle> <iface>: <msg>")
+
+    Setzt IMMER auto_switch=True. Kein Rollback bei Teil-Erfolg — das
+    uebernimmt der Aufrufer (7e-4) im finally-Block.
+    """
+    managed = (managed or "").strip()
+    monitor = (monitor or "").strip()
+    if not managed and not monitor:
+        return (False, "Keine Interfaces angegeben.")
+    if managed and monitor and managed == monitor:
+        return (False, f"managed und monitor identisch: {managed}")
+    msgs: list = []
+    if managed:
+        ok, msg = _scan_iw_ensure_managed(managed, auto_switch=True)
+        if not ok:
+            return (False, f"managed {managed}: {msg}")
+        if msg:
+            msgs.append(msg)
+    if monitor:
+        ok, msg = _scan_live_ensure_monitor(monitor)
+        if not ok:
+            return (False, f"monitor {monitor}: {msg}")
+        if msg:
+            msgs.append(msg)
+    return (True, "; ".join(msgs) if msgs else "")
+
+
+def _scan_multi_merge(iw_nets: list, scapy_nets: list) -> list:
+    """7e: Fuehrt Netz-Listen aus `iw scan` und Scapy-Sniffer per BSSID zusammen.
+
+    - BSSID-Union beider Quellen, iw-Eintraege als Basis
+    - decoded_ies: Union (IE-IDs aus beiden Quellen)
+    - signal_samples: konkateniert
+    - Signal/Channel/Frequenz: iw hat Vorrang, Scapy fuellt Luecken
+    - ssid/encryption: bevorzugt nicht-leere, nicht-"UNKNOWN"-Werte
+    - neues Feld ``sources``: Liste mit "iw" und/oder "scapy"
+
+    Defensiv: ungueltige Eintraege (kein dict, kein bssid) werden
+    uebersprungen. Leere/None-Eingaben -> leere Liste.
+    """
+    if not isinstance(iw_nets, list):
+        iw_nets = []
+    if not isinstance(scapy_nets, list):
+        scapy_nets = []
+
+    by_bssid: dict = {}
+
+    def _key(n):
+        if not isinstance(n, dict):
+            return ""
+        b = n.get("bssid")
+        return str(b).lower() if b else ""
+
+    for n in iw_nets:
+        k = _key(n)
+        if not k:
+            continue
+        entry = dict(n)
+        entry["sources"] = ["iw"]
+        if not isinstance(entry.get("signal_samples"), list):
+            entry["signal_samples"] = []
+        by_bssid[k] = entry
+
+    for n in scapy_nets:
+        k = _key(n)
+        if not k:
+            continue
+        if k not in by_bssid:
+            entry = dict(n)
+            entry["sources"] = ["scapy"]
+            if not isinstance(entry.get("signal_samples"), list):
+                entry["signal_samples"] = []
+            by_bssid[k] = entry
+            continue
+        base = by_bssid[k]
+        # decoded_ies Union
+        base_ies = base.get("decoded_ies")
+        if not isinstance(base_ies, dict):
+            base_ies = {}
+        new_ies = n.get("decoded_ies")
+        if isinstance(new_ies, dict):
+            for ie_id, payload in new_ies.items():
+                if ie_id not in base_ies:
+                    base_ies[ie_id] = payload
+        base["decoded_ies"] = base_ies
+        # signal_samples poolen
+        base_samples = base.get("signal_samples")
+        if not isinstance(base_samples, list):
+            base_samples = []
+        add_samples = n.get("signal_samples")
+        if isinstance(add_samples, list):
+            base_samples.extend(add_samples)
+        base["signal_samples"] = base_samples
+        # ssid / encryption: nicht-leere Werte bevorzugen
+        for _attr in ("ssid", "encryption"):
+            cur = base.get(_attr)
+            new = n.get(_attr)
+            if new and (not cur or cur in ("UNKNOWN", "")):
+                base[_attr] = new
+        # channel / frequency: Scapy fuellt nur Luecken
+        for _attr in ("channel", "frequency_mhz", "band"):
+            if not base.get(_attr) and n.get(_attr):
+                base[_attr] = n[_attr]
+        # signal: iw hat Vorrang, Scapy nur wenn iw leer/Nullwert
+        if not base.get("signal") or base.get("signal") in (0, -100):
+            if n.get("signal") is not None:
+                base["signal"] = n["signal"]
+        # Vendor/HT/VHT/HE: bevorzugt Wahrheit
+        for flag in ("ht_capable", "vht_capable", "he_capable"):
+            if n.get(flag):
+                base[flag] = True
+        if "scapy" not in base["sources"]:
+            base["sources"].append("scapy")
+
+    return list(by_bssid.values())
+
+
+def _scan_multi_cli(iface_managed: str = "",
+                    iface_monitor: str = "",
+                    repeats: int = 1,
+                    seconds: int = 10,
+                    dump_ies: bool = False,
+                    out_file: str = "",
+                    dump_signals: bool = False,
+                    dump_full: bool = False,
+                    label: str = "") -> int:
+    """7e-4: --scan-multi — paralleler iw + Scapy Scan auf zwei Adaptern.
+
+    Ablauf:
+      1. Adapter-Pick (7e-1) falls nicht uebergeben.
+      2. Mode-Switch (7e-2): managed-Adapter -> managed, monitor -> monitor.
+      3. Scapy-Sniffer im Daemon-Thread auf monitor-Adapter.
+      4. `iw scan` synchron auf managed-Adapter (repeats Runden).
+      5. Sniffer stoppen, danach `seconds` Nachlauf.
+      6. Merge (7e-3) per BSSID.
+      7. Envelope mode="multi" oder Tabelle.
+
+    Fallback: nur ein Adapter -> reiner iw-Pfad mit Warnung.
+    """
+    if not SCAPY_VERFÜGBAR:
+        _say("Scapy nicht verfuegbar - --scan-multi nicht moeglich.",
+              file=sys.stderr)
+        return 1
+
+    iface_managed = (iface_managed or "").strip()
+    iface_monitor = (iface_monitor or "").strip()
+    if not iface_managed and not iface_monitor:
+        iface_managed, iface_monitor = _scan_multi_pick_ifaces()
+    if not iface_managed and not iface_monitor:
+        _say("Kein WLAN-Interface gefunden. Bitte --scan-iface angeben.",
+              file=sys.stderr)
+        return 1
+
+    if not iface_monitor:
+        _say("[scan-multi] WARNUNG: nur ein Adapter verfuegbar — "
+              "Fallback auf iw-only.", file=sys.stderr)
+
+    ok, msg = _scan_multi_prepare_modes(iface_managed, iface_monitor)
+    if not ok:
+        print(f"[scan-multi] {msg}", file=sys.stderr)
+        return 1
+    if msg:
+        print(f"[scan-multi] {msg}", file=sys.stderr)
+
+    try:
+        repeats = max(1, int(repeats))
+    except (TypeError, ValueError):
+        repeats = 1
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        seconds = 10
+
+    started = time.time()
+
+    processor = PacketProcessor(dedupe=False)
+    scapy_seen: dict = {}
+    scapy_lock = threading.Lock()
+
+    def _collect(pkt) -> None:
+        try:
+            result = processor.process(pkt)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return
+        if not result:
+            return
+        bssid = result.get("bssid")
+        if not bssid:
+            return
+        key = str(bssid).lower()
+        _raw_sig = result.get("signal")
+        try:
+            _sig_int = int(_raw_sig) if _raw_sig is not None else None
+        except (TypeError, ValueError):
+            _sig_int = None
+        with scapy_lock:
+            ex = scapy_seen.get(key)
+            if ex is not None:
+                if _sig_int is not None:
+                    ex.setdefault("signal_samples", []).append(_sig_int)
+                if _raw_sig is not None:
+                    ex["signal"] = _raw_sig
+                _new_ies = result.get("decoded_ies") or {}
+                if _new_ies:
+                    ex["decoded_ies"] = _new_ies
+                return
+            scapy_seen[key] = {
+                "bssid": bssid,
+                "ssid": result.get("ssid", ""),
+                "channel": result.get("channel", 0),
+                "signal": result.get("signal", -100),
+                "encryption": result.get("encryption", "UNKNOWN"),
+                "decoded_ies": result.get("decoded_ies") or {},
+                "signal_samples": [_sig_int] if _sig_int is not None else [],
+                "sources": ["scapy"],
+            }
+
+    sniffer = None
+    if iface_monitor:
+        try:
+            sniffer = scapy.AsyncSniffer(
+                iface=iface_monitor, prn=_collect, store=False,
+            )
+            sniffer.start()
+            _say(f"[scan-multi] Scapy-Sniffer auf {iface_monitor}",
+                  file=sys.stderr)
+        except (OSError, RuntimeError, AttributeError, ValueError) as exc:
+            _say(f"[scan-multi] Sniffer-Start fehlgeschlagen: {exc}",
+                  file=sys.stderr)
+            sniffer = None
+
+    iw_aggregated: dict = {}
+    scan_ok_count = 0
+    if iface_managed:
+        for i in range(repeats):
+            ok_run, text = _scan_iw_run(iface_managed)
+            if not ok_run:
+                _say(f"[scan-multi] iw-Runde {i+1}/{repeats}: {text}",
+                      file=sys.stderr)
+                continue
+            scan_ok_count += 1
+            for n in _scan_iw_parse(text):
+                b = n.get("bssid")
+                if not b:
+                    continue
+                kb = b.lower()
+                if kb not in iw_aggregated:
+                    iw_aggregated[kb] = dict(n)
+                    iw_aggregated[kb]["signal_samples"] = []
+                agg = iw_aggregated[kb]
+                if n.get("signal") is not None:
+                    agg["signal_samples"].append(int(n["signal"]))
+                if n.get("decoded_ies"):
+                    ex_ies = agg.setdefault("decoded_ies", {})
+                    for _ie_id, _payload in n["decoded_ies"].items():
+                        ex_ies.setdefault(_ie_id, _payload)
+            if i < repeats - 1:
+                time.sleep(1)
+
+    if sniffer is not None and seconds > 0:
+        try:
+            time.sleep(seconds)
+        except KeyboardInterrupt:
+            print("[scan-multi] Abbruch durch Benutzer.", file=sys.stderr)
+    if sniffer is not None:
+        try:
+            sniffer.stop()
+        except (OSError, RuntimeError, AttributeError):
+            pass
+
+    ended = time.time()
+
+    iw_nets = list(iw_aggregated.values())
+    with scapy_lock:
+        scapy_nets = list(scapy_seen.values())
+
+    nets = _scan_multi_merge(iw_nets, scapy_nets)
+    if not nets:
+        print("[scan-multi] Keine Netzwerke gefunden.", file=sys.stderr)
+        return 0
+
+    for n in nets:
+        samples = n.get("signal_samples") or []
+        samples_int = [int(s) for s in samples if s is not None]
+        if samples_int:
+            n["signal_samples"] = samples_int
+            _scan_once_derive_stats(n, started, ended)
+        else:
+            n["n_sightings"] = 0
+        if not n.get("channel") and n.get("frequency_mhz"):
+            n["channel"] = _scan_iw_parse_freq_to_channel(
+                n["frequency_mhz"]
+            )
+        n["band"] = _scan_once_band_of(n.get("channel"))
+        n["frequency_mhz"] = _scan_once_freq_mhz(n.get("channel"))
+        n["hidden"] = not bool(n.get("ssid"))
+
+    _scan_once_assign_families(nets)
+
+    if not dump_signals:
+        for n in nets:
+            n.pop("signal_samples", None)
+
+    _ch_obs = [
+        int(n.get("channel") or 0) for n in nets
+        if int(n.get("channel") or 0) > 0
+    ]
+    _total = sum(int(n.get("n_sightings", 0)) for n in nets)
+
+    if dump_ies:
+        try:
+            if out_file:
+                with open(out_file, "w", encoding="utf-8") as fh:
+                    json.dump(nets, fh, indent=2, default=str,
+                              ensure_ascii=False)
+                try:
+                    os.chmod(out_file, 0o644)
+                except OSError:
+                    pass
+                _say(f"[scan-out] {len(nets)} Netzwerke: {out_file}",
+                      file=sys.stderr)
+            else:
+                print(json.dumps(nets, indent=2, default=str,
+                                 ensure_ascii=False))
+        except (OSError, TypeError, ValueError) as exc:
+            _say(f"JSON-Serialisierung fehlgeschlagen: {exc}",
+                  file=sys.stderr)
+            return 1
+        return 0
+
+    env = _scan_once_envelope(
+        nets, iface_managed or iface_monitor, [],
+        started, ended, 0.0, _total, _ch_obs,
+    )
+    env["scan"]["mode"] = "multi"
+    env["scan"]["iface_managed"] = iface_managed
+    env["scan"]["iface_monitor"] = iface_monitor
+    env["scan"]["repeats"] = repeats
+    env["scan"]["repeats_ok"] = scan_ok_count
+    if label:
+        env["scan"]["label"] = str(label)
+
+    if dump_full or out_file:
+        if out_file:
+            try:
+                with open(out_file, "w", encoding="utf-8") as fh:
+                    json.dump(env, fh, indent=2, default=str,
+                              ensure_ascii=False)
+                try:
+                    os.chmod(out_file, 0o644)
+                except OSError:
+                    pass
+                _say(f"[scan-multi] Envelope geschrieben: {out_file}",
+                      file=sys.stderr)
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"scan-multi out Fehler: {exc}", file=sys.stderr)
+                return 1
+            return 0
+        try:
+            print(json.dumps(env, indent=2, default=str,
+                             ensure_ascii=False))
+        except (TypeError, ValueError) as exc:
+            print(f"scan-multi JSON: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    _say("=" * 96)
+    _lbl = f" [{label}]" if label else ""
+    _say(f"  SCAN-MULTI ({len(nets)} Netzwerke, "
+          f"managed={iface_managed or chr(45)}, "
+          f"monitor={iface_monitor or chr(45)}){_lbl}")
+    _say("=" * 96)
+    _say(f"  {'SSID':<22} {'BSSID':<18} {'Ch':>3} {'dBm':>4} "
+          f"{'Src':<14} {'Enc':<14}")
+    _say("  " + "-" * 92)
+
+    def _key(x):
+        v = x.get("signal_median") or x.get("signal")
+        return -int(v) if v is not None else 100
+
+    for n in sorted(nets, key=_key):
+        ssid = ("<hidden>" if n.get("hidden")
+                else str(n.get("ssid") or "")[:22])
+        ch = int(n.get("channel") or 0)
+        sig = n.get("signal_median") or n.get("signal")
+        sig_i = int(sig) if sig is not None else -100
+        enc = str(n.get("encryption") or "?")[:13]
+        srcs = ",".join(n.get("sources") or [])
+        _say(f"  {ssid:<22} {n.get('bssid', '?')!s:<18} "
+              f"{ch:>3} {sig_i:>4} {srcs:<14} {enc:<14}")
+    _say("=" * 96)
+    return 0
+
+
+def _scan_quality_bar(dbm) -> str:
+    """Gibt ein 3-Zeichen-Qualitaetsbaelkchen fuer dBm zurueck."""
+    if dbm is None:
+        return "   "
+    try:
+        v = int(dbm)
+    except (TypeError, ValueError):
+        return "   "
+    if v > -45:
+        return "\u2593\u2593\u2593"  # ▓▓▓  sehr stark
+    if v > -55:
+        return "\u2593\u2593\u2591"  # ▓▓░  stark
+    if v > -65:
+        return "\u2593\u2591\u2591"  # ▓░░  mittel
+    if v > -75:
+        return "\u2591\u2591\u2591"  # ░░░  schwach
+    return "..."
+
+
+# ─────────────────────────────────────────────────────────────────
+# OUI → Hersteller (offline-Tabelle, ~200 Eintraege)
+# Format: 3 Bytes OUI (6 hex, lowercase) -> Herstellername
+# Quelle: IEEE OUI-Datenbank, manuell kuratiert fuer DE/EU-Relevanz
+# ─────────────────────────────────────────────────────────────────
+_OUI_VENDORS = {
+    # AVM / FRITZ!Box
+    "04a222": "AVM GmbH", "0896d7": "AVM GmbH", "0c8063": "AVM GmbH",
+    "140c76": "AVM GmbH", "18e829": "AVM GmbH", "1ced6f": "AVM GmbH",
+    "246511": "AVM GmbH", "2c3ae8": "AVM GmbH", "3431c4": "AVM GmbH",
+    "382c4a": "AVM GmbH", "3ca62f": "AVM GmbH", "444e6d": "AVM GmbH",
+    "4c1744": "AVM GmbH", "5c4979": "AVM GmbH", "6c3b6b": "AVM GmbH",
+    "7cff4d": "AVM GmbH", "80691a": "AVM GmbH", "846419": "AVM GmbH",
+    "880355": "AVM GmbH", "989bcb": "AVM GmbH", "9cc7a6": "AVM GmbH",
+    "a05391": "AVM GmbH", "a42bb0": "AVM GmbH", "a82c3e": "AVM GmbH",
+    "ac220b": "AVM GmbH", "bc0543": "AVM GmbH", "c80e14": "AVM GmbH",
+    "ccce1e": "AVM GmbH", "d424dd": "AVM GmbH", "dc15c8": "AVM GmbH",
+    "e0286d": "AVM GmbH", "e8df70": "AVM GmbH", "ec9b5b": "AVM GmbH",
+    "f09fc2": "AVM GmbH",
+    # Deutsche Telekom
+    "c4eb42": "Deutsche Telekom AG", "082b9c": "Deutsche Telekom AG",
+    "30f33a": "Deutsche Telekom AG", "5492be": "Deutsche Telekom AG",
+    "80ea96": "Deutsche Telekom AG", "b0f208": "Deutsche Telekom AG",
+    # Vodafone
+    "a0957f": "Vodafone GmbH", "6c5ab5": "Vodafone GmbH",
+    "c0a8f0": "Vodafone GmbH", "34e894": "Vodafone GmbH",
+    # Realtek (Chips in vielen Adaptern)
+    "525400": "Realtek Semiconductor", "5cf370": "Realtek Semiconductor",
+    "00c0ca": "Alfa Networks",
+    # Alpha Networks / Alfa
+    "0026f2": "Alpha Networks", "30b5c2": "Alpha Networks",
+    # Intel (Client-Chips)
+    "001b21": "Intel Corporate", "001e64": "Intel Corporate",
+    "0024d6": "Intel Corporate", "28b2bd": "Intel Corporate",
+    "346288": "Intel Corporate", "34e12d": "Intel Corporate",
+    "3c9509": "Intel Corporate", "448500": "Intel Corporate",
+    "4ceb42": "Intel Corporate", "58917a": "Intel Corporate",
+    "5ce0c5": "Intel Corporate", "60213d": "Intel Corporate",
+    "6c8814": "Intel Corporate", "74e50b": "Intel Corporate",
+    "7c7a91": "Intel Corporate", "801934": "Intel Corporate",
+    "8468ec": "Intel Corporate", "8c1645": "Intel Corporate",
+    "94c691": "Intel Corporate", "9c7bef": "Intel Corporate",
+    "a0a8cd": "Intel Corporate", "a4c494": "Intel Corporate",
+    "ac7ba1": "Intel Corporate", "b49691": "Intel Corporate",
+    "b808cf": "Intel Corporate", "c0e434": "Intel Corporate",
+    "c4d987": "Intel Corporate", "d0577b": "Intel Corporate",
+    "dc5360": "Intel Corporate", "e4a471": "Intel Corporate",
+    "e82aea": "Intel Corporate", "f8e43b": "Intel Corporate",
+    # Apple (iPhones, Macs)
+    "001451": "Apple Inc.", "001b63": "Apple Inc.", "001cb3": "Apple Inc.",
+    "001e52": "Apple Inc.", "001f5b": "Apple Inc.", "0021e9": "Apple Inc.",
+    "002332": "Apple Inc.", "002500": "Apple Inc.", "002608": "Apple Inc.",
+    "003065": "Apple Inc.", "0050e4": "Apple Inc.", "0090f1": "Apple Inc.",
+    "109add": "Apple Inc.", "28e02c": "Apple Inc.", "3c0754": "Apple Inc.",
+    "40d32d": "Apple Inc.", "44d884": "Apple Inc.", "48e9f1": "Apple Inc.",
+    "5855ca": "Apple Inc.", "604826": "Apple Inc.", "6c4008": "Apple Inc.",
+    "7831c1": "Apple Inc.", "7cd1c3": "Apple Inc.", "843835": "Apple Inc.",
+    "8c5877": "Apple Inc.", "98fe94": "Apple Inc.", "a45e60": "Apple Inc.",
+    "acbc32": "Apple Inc.", "b8c111": "Apple Inc.", "bc9fef": "Apple Inc.",
+    "c82a14": "Apple Inc.", "d0e140": "Apple Inc.", "dc2b2a": "Apple Inc.",
+    "e8802e": "Apple Inc.", "f0d1a9": "Apple Inc.", "f4f15a": "Apple Inc.",
+    # Samsung
+    "0012fb": "Samsung Electronics", "0015b9": "Samsung Electronics",
+    "0016db": "Samsung Electronics", "0017c9": "Samsung Electronics",
+    "001a8a": "Samsung Electronics", "001d25": "Samsung Electronics",
+    "001df6": "Samsung Electronics", "001e7d": "Samsung Electronics",
+    "0021d1": "Samsung Electronics", "0023d6": "Samsung Electronics",
+    "002454": "Samsung Electronics", "002637": "Samsung Electronics",
+    "00265f": "Samsung Electronics", "08373d": "Samsung Electronics",
+    "0c715d": "Samsung Electronics", "1077b1": "Samsung Electronics",
+    "14568e": "Samsung Electronics", "1c5a3e": "Samsung Electronics",
+    "2013e0": "Samsung Electronics", "28bab5": "Samsung Electronics",
+    "2c4402": "Samsung Electronics", "38aa3c": "Samsung Electronics",
+    "3c5a37": "Samsung Electronics", "40d3ae": "Samsung Electronics",
+    "5001bb": "Samsung Electronics", "5492be": "Samsung Electronics",
+    "5c0a5b": "Samsung Electronics", "6c2f2c": "Samsung Electronics",
+    "781fdb": "Samsung Electronics", "8425db": "Samsung Electronics",
+    "8c7712": "Samsung Electronics", "943bb0": "Samsung Electronics",
+    "a00798": "Samsung Electronics", "ac3613": "Samsung Electronics",
+    "b0c4e7": "Samsung Electronics", "b8d9ce": "Samsung Electronics",
+    "bc4486": "Samsung Electronics", "c81479": "Samsung Electronics",
+    "d0176a": "Samsung Electronics", "d487d8": "Samsung Electronics",
+    "dc7144": "Samsung Electronics", "e8039a": "Samsung Electronics",
+    "f49f54": "Samsung Electronics", "fc8f90": "Samsung Electronics",
+    # Huawei
+    "001e10": "Huawei", "00259e": "Huawei", "0025ec": "Huawei",
+    "005a13": "Huawei", "042758": "Huawei", "086361": "Huawei",
+    "104780": "Huawei", "1408d0": "Huawei", "1c1d67": "Huawei",
+    "247f3c": "Huawei", "283152": "Huawei", "2c55d3": "Huawei",
+    "30d17e": "Huawei", "34cdbe": "Huawei", "38378b": "Huawei",
+    "3cdfbd": "Huawei", "40cba8": "Huawei", "4c1fcc": "Huawei",
+    "54515b": "Huawei", "5c7d5e": "Huawei", "643e8c": "Huawei",
+    "68a0f6": "Huawei", "6cb749": "Huawei", "70723c": "Huawei",
+    "781dba": "Huawei", "7c6097": "Huawei", "80b686": "Huawei",
+    "844765": "Huawei", "88e3ab": "Huawei", "8c34fd": "Huawei",
+    "9017ac": "Huawei", "9cb2b2": "Huawei", "a0f479": "Huawei",
+    "ac4e91": "Huawei", "b41513": "Huawei", "b8bc1b": "Huawei",
+    "bc7670": "Huawei", "c07009": "Huawei", "c4072f": "Huawei",
+    "c8d15e": "Huawei", "cc53b5": "Huawei", "d02db3": "Huawei",
+    "d4612e": "Huawei", "d8490b": "Huawei", "dc094c": "Huawei",
+    "e0247f": "Huawei", "e468a3": "Huawei", "ec233d": "Huawei",
+    "f4559c": "Huawei", "f83dff": "Huawei", "fc48ef": "Huawei",
+    # Xiaomi
+    "0c1daf": "Xiaomi Communications", "102ab3": "Xiaomi Communications",
+    "14f65a": "Xiaomi Communications", "185936": "Xiaomi Communications",
+    "20824b": "Xiaomi Communications", "23a2dd": "Xiaomi Communications",
+    "28e31f": "Xiaomi Communications", "34ce00": "Xiaomi Communications",
+    "3cbd3e": "Xiaomi Communications", "44c344": "Xiaomi Communications",
+    "50ec50": "Xiaomi Communications", "584498": "Xiaomi Communications",
+    "64b473": "Xiaomi Communications", "64cc2e": "Xiaomi Communications",
+    "742344": "Xiaomi Communications", "7802f8": "Xiaomi Communications",
+    "78b5a2": "Xiaomi Communications", "7c1dd9": "Xiaomi Communications",
+    "891b8a": "Xiaomi Communications", "8cbeb6": "Xiaomi Communications",
+    "9082d0": "Xiaomi Communications", "98f621": "Xiaomi Communications",
+    "9c99a0": "Xiaomi Communications", "a086c6": "Xiaomi Communications",
+    "ac0d1b": "Xiaomi Communications", "ac3c0b": "Xiaomi Communications",
+    "b0e235": "Xiaomi Communications", "c46ab7": "Xiaomi Communications",
+    "d4970b": "Xiaomi Communications", "e4aa5d": "Xiaomi Communications",
+    "f0b429": "Xiaomi Communications", "f48b32": "Xiaomi Communications",
+    # TP-Link
+    "001d0f": "TP-Link", "001e8c": "TP-Link", "002127": "TP-Link",
+    "0023cd": "TP-Link", "002586": "TP-Link", "10feed": "TP-Link",
+    "14cc20": "TP-Link", "186bff": "TP-Link", "1c3bf3": "TP-Link",
+    "1cfa68": "TP-Link", "30b5c2": "TP-Link", "34e894": "TP-Link",
+    "3c46d8": "TP-Link", "40169f": "TP-Link", "50c7bf": "TP-Link",
+    "54c80f": "TP-Link", "5c63bf": "TP-Link", "60a4b7": "TP-Link",
+    "64e599": "TP-Link", "6c5ab0": "TP-Link", "74da88": "TP-Link",
+    "784476": "TP-Link", "80717a": "TP-Link", "84d81b": "TP-Link",
+    "882593": "TP-Link", "8cd48e": "TP-Link", "94d9b3": "TP-Link",
+    "9813d2": "TP-Link", "9cb6d0": "TP-Link", "a0f3c1": "TP-Link",
+    "a42bb0": "TP-Link", "a8574e": "TP-Link", "ac84c6": "TP-Link",
+    "b0487a": "TP-Link", "b0958e": "TP-Link", "b4b024": "TP-Link",
+    "bc4699": "TP-Link", "c006c3": "TP-Link", "c025e9": "TP-Link",
+    "c04a00": "TP-Link", "c46e1f": "TP-Link", "c4e984": "TP-Link",
+    "c8d3a3": "TP-Link", "cc32e5": "TP-Link", "d0176a": "TP-Link",
+    "d46e0e": "TP-Link", "d84789": "TP-Link", "dc9fdb": "TP-Link",
+    "e005c5": "TP-Link", "e4c146": "TP-Link", "e8de27": "TP-Link",
+    "ec086b": "TP-Link", "f0f336": "TP-Link", "f4ec38": "TP-Link",
+    "f81a67": "TP-Link", "fcd733": "TP-Link",
+    # Netgear
+    "000fb5": "Netgear", "00095b": "Netgear", "20e52a": "Netgear",
+    "2c3033": "Netgear", "30469a": "Netgear", "44944a": "Netgear",
+    "4c60de": "Netgear", "6cb0ce": "Netgear", "841b5e": "Netgear",
+    "9c3dcf": "Netgear", "a00460": "Netgear", "b03956": "Netgear",
+    "c03f0e": "Netgear", "c40415": "Netgear", "e0469a": "Netgear",
+    "e8fcaf": "Netgear", "e091f5": "Netgear",
+    # Ubiquiti
+    "002722": "Ubiquiti Networks", "0418d6": "Ubiquiti Networks",
+    "24a43c": "Ubiquiti Networks", "44d9e7": "Ubiquiti Networks",
+    "687251": "Ubiquiti Networks", "74acb9": "Ubiquiti Networks",
+    "788a20": "Ubiquiti Networks", "802aa8": "Ubiquiti Networks",
+    "b4fbe4": "Ubiquiti Networks", "dc9fdb": "Ubiquiti Networks",
+    "e063da": "Ubiquiti Networks", "f09fc2": "Ubiquiti Networks",
+    "fcecda": "Ubiquiti Networks",
+    # Cisco / Linksys
+    "000142": "Cisco Systems", "00000c": "Cisco Systems",
+    "0014a9": "Cisco Systems", "0018f8": "Cisco Systems",
+    "002155": "Cisco Systems", "00260b": "Cisco Systems",
+    "048c9a": "Cisco Systems", "08cc68": "Cisco Systems",
+    "18e7f4": "Cisco Systems", "1ce85d": "Cisco Systems",
+    "2c3124": "Cisco Systems", "3c5ec3": "Cisco Systems",
+    "48f8b3": "Cisco Systems", "5057a8": "Cisco Systems",
+    "6c416a": "Cisco Systems", "7c69f6": "Cisco Systems",
+    "8c604f": "Cisco Systems", "a0cf5b": "Cisco Systems",
+    "b0aa77": "Cisco Systems", "c067af": "Cisco Systems",
+    "c4b9cd": "Cisco Systems", "d0c789": "Cisco Systems",
+    "e0d173": "Cisco Systems", "f02572": "Cisco Systems",
+    # Deutsche Hersteller
+    "b01921": "Deutsche Telekom AG",  # GNX (Speedport)
+    "b0f208": "Deutsche Telekom AG",
+    "e00855": "AVM GmbH",  # FRITZ!Box 7530 XL Familie
+    # Sonstige populaere AP-Hersteller
+    "000c43": "Ralink Technology", "0024a5": "Ralink Technology",
+    "001349": "Ralink Technology",
+    "209727": "Pirelli Broadband Solutions",
+    "3c846a": "WiFi Solutions SRL",
+    "001e58": "D-Link", "0015e9": "D-Link", "001cf0": "D-Link",
+    "002191": "D-Link", "0022b0": "D-Link", "1cbdb9": "D-Link",
+    "28107b": "D-Link", "340804": "D-Link", "5cd998": "D-Link",
+    "84c9b2": "D-Link", "9c4caa": "D-Link", "ccb255": "D-Link",
+    "f07d68": "D-Link", "fc7516": "D-Link",
+}
+
+
+def _scan_oui_vendor_lookup(mac: str) -> str:
+    """Liefert den Hersteller anhand der OUI (erste 3 MAC-Bytes).
+
+    Normalisiert: 'aa:bb:cc:...' oder 'AA-BB-CC-...' -> 'aabbcc'.
+    Rueckgabe 'Unknown' bei unbekannter OUI oder ungueltigem Format.
+    """
+    if not isinstance(mac, str) or not mac:
+        return "Unknown"
+    key = (
+        mac.replace(":", "").replace("-", "").replace(".", "").lower()
+    )
+    if len(key) < 6:
+        return "Unknown"
+    oui = key[:6]
+    return _OUI_VENDORS.get(oui, "Unknown")
+
+
+def _scan_live_ensure_monitor(iface: str) -> tuple:
+    """Setzt iface in Monitor-Modus. Rueckgabe (ok, msg)."""
+    try:
+        r = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            check=False, timeout=2, capture_output=True, text=True,
+        )
+        cur_mode = "unknown"
+        for raw in (r.stdout or "").split("\n"):
+            line = raw.strip()
+            if line.startswith("type "):
+                cur_mode = line[5:].strip()
+                break
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        return (False, f"iw info fehlgeschlagen: {exc}")
+    if cur_mode == "monitor":
+        return (True, "")
+    steps = [
+        ["ip", "link", "set", iface, "down"],
+        ["iw", "dev", iface, "set", "type", "monitor"],
+        ["ip", "link", "set", iface, "up"],
+    ]
+    for cmd in steps:
+        try:
+            subprocess.run(cmd, check=False, timeout=3, capture_output=True)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return (False, f"Switch fehlgeschlagen {cmd}: {exc}")
+    return (True, f"Auto-Switch: {iface} {cur_mode} -> monitor")
+
+
+def _scan_live_render(nets: list, iface: str, channels: list,
+                      elapsed: float, refresh: float,
+                      total_frames: int) -> None:
+    """Rendert die Live-Tabelle. Loescht Terminal wenn TTY."""
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+    except (OSError, AttributeError):
+        pass
+
+    print("=" * 96)
+    _ch_s = ",".join(str(c) for c in (channels or [])) or "-"
+    print(f"  SCAN-LIVE [{iface}]  t={elapsed:6.1f}s  "
+          f"Kanaele={_ch_s}  Frames={total_frames}  "
+          f"Refresh={refresh:.1f}s  (Strg-C = Ende)")
+    print("=" * 96)
+    print(f"  {'SSID':<22} {'BSSID':<18} {'Vendor':<20} {'Ch':>3} "
+          f"{'dBm':>4} {'n':>5} {'Trend':<10} {'Enc':<14} {'Alter':>6}")
+    print("  " + "-" * 92)
+    if not nets:
+        print("  (keine Frames - warte auf erste Uebertragung ...)")
+
+    now = time.time()
+
+    def _key(x):
+        v = x.get("signal_median")
+        if v is None:
+            v = x.get("signal")
+        try:
+            return -int(v) if v is not None else 100
+        except (TypeError, ValueError):
+            return 100
+
+    for n in sorted(nets, key=_key):
+        ssid_raw = n.get("ssid")
+        ssid = "<hidden>" if not ssid_raw else str(ssid_raw)[:21]
+        bssid = str(n.get("bssid", "?"))[:17]
+        vendor = str(n.get("vendor") or "Unknown")[:19]
+        ch = int(n.get("channel") or 0)
+        sig = n.get("signal_median")
+        if sig is None:
+            sig = n.get("signal")
+        try:
+            sig_i = int(sig) if sig is not None else -100
+        except (TypeError, ValueError):
+            sig_i = -100
+        try:
+            ns = int(n.get("n_sightings") or 0)
+        except (TypeError, ValueError):
+            ns = 0
+        trend = str(n.get("signal_trend") or "?")[:9]
+        enc = str(n.get("encryption") or "?")[:13]
+        _ts = n.get("last_seen_ts")
+        try:
+            alter_s = now - float(_ts) if _ts is not None else 0.0
+        except (TypeError, ValueError):
+            alter_s = 0.0
+        if alter_s < 1.0:
+            alter_str = "jetzt"
+        elif alter_s < 60:
+            alter_str = f"{alter_s:.0f}s"
+        else:
+            alter_str = f"{alter_s/60:.0f}m"
+        print(
+            f"  {ssid:<22} {bssid:<18} {vendor:<20} {ch:>3} "
+            f"{sig_i:>4} {ns:>5} {trend:<10} {enc:<14} {alter_str:>6}"
+        )
+    print("  " + "-" * 92)
+    print(f"  {len(nets)} BSSIDs aktiv")
+    try:
+        sys.stdout.flush()
+    except (OSError, AttributeError):
+        pass
+
+
+def _scan_iw_check_managed(iface: str) -> tuple:
+    """Prueft, ob iface im managed-Modus ist. (ok, modus)."""
+    try:
+        r = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            check=False, timeout=2, capture_output=True, text=True,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return (False, "unknown")
+    for raw in (r.stdout or "").split("\n"):
+        line = raw.strip()
+        if line.startswith("type "):
+            mode = line[5:].strip()
+            return (mode == "managed", mode)
+    return (False, "unknown")
+
+
+def _scan_iw_ensure_managed(iface: str, auto_switch: bool = False) -> tuple:
+    """Stellt sicher, dass iface im managed-Modus ist.
+
+    auto_switch=False: nur pruefen.
+    auto_switch=True:  down -> set type managed -> up, dann verifizieren.
+    Rueckgabe (ok: bool, msg: str).
+    """
+    ok, mode = _scan_iw_check_managed(iface)
+    if ok:
+        return (True, "")
+    if not auto_switch:
+        return (False,
+                f"Interface {iface} ist im Modus '{mode}'. "
+                f"--scan-iw braucht managed.")
+    steps = [
+        ["ip", "link", "set", iface, "down"],
+        ["iw", "dev", iface, "set", "type", "managed"],
+        ["ip", "link", "set", iface, "up"],
+    ]
+    for cmd in steps:
+        try:
+            subprocess.run(cmd, check=False, timeout=3,
+                           capture_output=True)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return (False, f"Auto-Switch fehlgeschlagen bei {cmd}: {exc}")
+    ok2, mode2 = _scan_iw_check_managed(iface)
+    if not ok2:
+        return (False,
+                f"Auto-Switch: {iface} ist nach Umschalten '{mode2}', "
+                f"nicht managed.")
+    return (True, f"Auto-Switch: {iface} {mode} -> managed")
+
+
+def _scan_iw_run(iface: str, timeout: int = 30) -> tuple:
+    """Fuehrt `iw dev X scan` aus. Rueckgabe (ok, stdout_oder_fehler)."""
+    try:
+        r = subprocess.run(
+            ["iw", "dev", iface, "scan"],
+            check=False, timeout=timeout,
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return (False, (r.stderr or "iw scan: rc!=0").strip())
+        return (True, r.stdout or "")
+    except subprocess.TimeoutExpired:
+        return (False, "iw scan: Timeout")
+    except (FileNotFoundError, OSError) as exc:
+        return (False, f"iw scan: {exc}")
+
+
+def _scan_iw_parse_freq_to_channel(freq_mhz) -> int:
+    """Leitet Kanal aus Frequenz in MHz ab."""
+    try:
+        f = float(freq_mhz)
+    except (TypeError, ValueError):
+        return 0
+    if 2483.5 <= f <= 2485.0:
+        return 14
+    if 2400.0 <= f <= 2500.0:
+        return int((f - 2407) // 5)
+    if 5000.0 <= f <= 5900.0:
+        return int((f - 5000) // 5)
+    if 5925.0 <= f <= 7125.0:
+        return int((f - 5950) // 5)
+    return 0
+
+
+def _scan_iw_ies_from_lines(lines) -> dict:
+    """Patch 7d: IE-Sektionen aus iw-scan-Text -> IEEE-Schema.
+
+    Liefert dict[int, dict|list] mit denselben IE-IDs und Keys wie
+    IEEE80211IEParser.parse_ie. Nur Sektionen, deren Inhalt iw als
+    Text ausgibt. RSN/WPA/HT-/VHT-Capabilities brauchen rohe Bytes
+    und werden hier bewusst nicht dekodiert.
+    """
+
+    def _int(tok):
+        try:
+            return int(tok)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_country(sub):
+        first = (sub[0] if sub else "").strip()
+        cc = first.split()[0] if first else ""
+        if not re.fullmatch(r"[A-Z]{2}", cc):
+            return None
+        triplets = []
+        for ln in sub[1:]:
+            m = re.match(
+                r"Channels\s+\[(\d+)\s*-\s*(\d+)\]\s*@\s*(\d+)\s*dBm",
+                ln,
+            )
+            if m:
+                a, b, pwr = (int(x) for x in m.groups())
+                triplets.append({
+                    "first_channel": a,
+                    "num_channels": b - a + 1,
+                    "max_tx_power_dbm": pwr,
+                })
+        return {"country_code": cc, "channel_triplets": triplets}
+
+    def _parse_bss_load(sub):
+        r = {}
+        for ln in sub:
+            low = ln.lower()
+            if low.startswith("station count:"):
+                v = _int(ln.split(":", 1)[1].strip().split()[0])
+                if v is not None:
+                    r["station_count"] = v
+            elif low.startswith("channel utilisation:"):
+                tok = ln.split(":", 1)[1].strip().split("/")[0]
+                v = _int(tok.strip())
+                if v is not None:
+                    r["channel_utilization_pct"] = round(v / 2.55, 2)
+            elif low.startswith("available admission capacity:"):
+                v = _int(ln.split(":", 1)[1].strip().split()[0])
+                if v is not None:
+                    r["admission_capacity"] = v
+        return r or None
+
+    def _parse_power_constraint(sub):
+        for ln in sub:
+            if ln.lower().startswith("power constraint:"):
+                v = _int(ln.split(":", 1)[1].strip().split()[0])
+                if v is not None:
+                    return {"power_constraint_db": v}
+        return None
+
+    def _parse_tpc_report(sub):
+        for ln in sub:
+            if ln.lower().startswith("tpc report:"):
+                r = {}
+                m = re.search(r"tx power:\s*(-?\d+)\s*dBm", ln, re.I)
+                if m:
+                    r["transmit_power_dbm"] = int(m.group(1))
+                m = re.search(r"link margin:\s*(-?\d+)\s*dB", ln, re.I)
+                if m:
+                    r["link_margin_db"] = int(m.group(1))
+                return r or None
+        return None
+
+    def _parse_erp(sub):
+        for ln in sub:
+            if ln.lower().startswith("erp:"):
+                body = ln.split(":", 1)[1].strip().lower()
+                return {
+                    "non_erp_present": "non-erp present" in body,
+                    "use_protection": "use protection" in body,
+                }
+        return None
+
+    def _parse_mobility_domain(sub):
+        r = {}
+        for ln in sub:
+            low = ln.lower()
+            if low.startswith("mdid:"):
+                v = ln.split(":", 1)[1].strip()
+                try:
+                    r["mobility_domain_id"] = int(v, 16)
+                except ValueError:
+                    pass
+            elif low.startswith("ft capability and policy:"):
+                v = ln.split(":", 1)[1].strip()
+                try:
+                    r["ft_capability"] = int(v, 16)
+                except ValueError:
+                    pass
+        return r or None
+
+    def _parse_ht_operation(sub):
+        r = {}
+        for ln in sub:
+            low = ln.lower()
+            if low.startswith("primary channel:"):
+                v = _int(ln.split(":", 1)[1].strip().split()[0])
+                if v is not None:
+                    r["primary_channel"] = v
+            elif low.startswith("secondary channel offset:"):
+                body = ln.split(":", 1)[1].strip().lower()
+                if "above" in body:
+                    r["secondary_channel"] = 1
+                elif "below" in body:
+                    r["secondary_channel"] = 3
+                else:
+                    r["secondary_channel"] = 0
+            elif low.startswith("sta channel width:"):
+                body = ln.split(":", 1)[1].strip().lower()
+                r["channel_width"] = 40 if "40" in body else 20
+        return r or None
+
+    def _parse_vht_operation(sub):
+        r = {}
+        for ln in sub:
+            low = ln.lower()
+            if low.startswith("channel width:"):
+                body = ln.split(":", 1)[1].strip().lower()
+                if "160" in body:
+                    r["channel_width"] = 160
+                elif "80" in body:
+                    r["channel_width"] = 80
+                elif "40" in body:
+                    r["channel_width"] = 40
+                else:
+                    r["channel_width"] = 20
+            elif low.startswith("center freq segment 1:"):
+                v = _int(ln.split(":", 1)[1].strip().split()[0])
+                if v is not None:
+                    r["center_freq_seg0"] = v
+            elif low.startswith("center freq segment 2:"):
+                v = _int(ln.split(":", 1)[1].strip().split()[0])
+                if v is not None:
+                    r["center_freq_seg1"] = v
+        return r or None
+
+    _RM_KEYS = (
+        ("neighbor report:", "neighbor_report"),
+        ("link measurement:", "link_measurement"),
+        ("link trace:", "link_trace"),
+        ("channel usage:", "channel_usage"),
+        ("bss average access delay:", "bss_avg_access_delay"),
+        ("bss available admission:", "bss_available_admission"),
+        ("bss max idle period:", "bss_max_idle_period"),
+        ("measurement pilot:", "measurement_pilot"),
+    )
+
+    def _parse_rm_enabled(sub):
+        r = {}
+        for ln in sub:
+            low = ln.lower()
+            for prefix, key in _RM_KEYS:
+                if low.startswith(prefix):
+                    r[key] = "not " not in low
+                    break
+        return r or None
+
+    _EC_NAMES = (
+        ("bss transition", "bss_transition_19"),
+        ("ssid list", "ssid_list_31"),
+        ("extended sleep", "extended_sleep_47"),
+        ("multi bssid", "multi_bssid_55"),
+        ("fils", "fils_68"),
+        ("sae h2e", "sae_h2e_70"),
+        ("complete list", "complete_list_71"),
+        ("twt", "twt_75"),
+        ("proxy arp", "proxy_arp_78"),
+        ("wnm sleep", "wnm_sleep_79"),
+    )
+
+    def _parse_extended_cap(sub):
+        r = {}
+        for ln in sub:
+            low = ln.lower().rstrip(",")
+            absent = low.startswith("not ")
+            body = low[4:] if absent else low
+            for name, key in _EC_NAMES:
+                if name in body:
+                    r[key] = not absent
+        return r or None
+
+    def _parse_wmm(_sub):
+        return {"oui": "0050f2", "type": 2, "wmm": {"present": True}}
+
+    def _parse_wps(_sub):
+        return {"oui": "0050f2", "type": 4, "wps_present": True}
+
+    DISPATCH = {
+        "country": (7, _parse_country),
+        "bss load": (11, _parse_bss_load),
+        "power constraint": (32, _parse_power_constraint),
+        "tpc report": (35, _parse_tpc_report),
+        "erp": (42, _parse_erp),
+        "mobility domain": (54, _parse_mobility_domain),
+        "ht operation": (61, _parse_ht_operation),
+        "rm enabled capabilities": (70, _parse_rm_enabled),
+        "extended capabilities": (127, _parse_extended_cap),
+        "vht operation": (192, _parse_vht_operation),
+        "wmm": (221, _parse_wmm),
+        "wmm parameters": (221, _parse_wmm),
+        "wps": (221, _parse_wps),
+    }
+
+    def _head(stripped):
+        if stripped.startswith("*") or ":" not in stripped:
+            return None
+        head = stripped.split(":", 1)[0].strip()
+        return head or None
+
+    def _clean(stripped):
+        if stripped.startswith("*"):
+            return stripped[1:].strip()
+        return stripped
+
+    result = {}
+    state = {"name": None, "sub": [], "depth": 0}
+
+    def _flush():
+        name = state["name"]
+        if name is None:
+            return
+        entry = DISPATCH.get(name.lower())
+        if entry is None:
+            return
+        ie_id, fn = entry
+        try:
+            payload = fn(state["sub"])
+        except (ValueError, IndexError, TypeError, AttributeError):
+            payload = None
+        if payload is None:
+            return
+        if ie_id in result:
+            existing = result[ie_id]
+            if isinstance(existing, list):
+                existing.append(payload)
+            else:
+                result[ie_id] = [existing, payload]
+        else:
+            result[ie_id] = payload
+
+    for raw in lines or []:
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if not stripped:
+            continue
+        depth = 0
+        for c in line:
+            if c == "\t":
+                depth += 8
+            elif c == " ":
+                depth += 1
+            else:
+                break
+        head = _head(stripped)
+        is_new_section = (
+            head is not None
+            and (state["name"] is None or depth <= state["depth"])
+        )
+        if is_new_section:
+            _flush()
+            state["name"] = head if head.lower() in DISPATCH else None
+            state["sub"] = []
+            state["depth"] = depth
+            tail = stripped.split(":", 1)[1].strip()
+            if state["name"] is not None and tail:
+                state["sub"].append(_clean(tail))
+            continue
+        if state["name"] is not None:
+            state["sub"].append(_clean(stripped))
+
+    _flush()
+    return result
+
+
+def _scan_iw_parse(text: str) -> list:
+    """Parst die Ausgabe von `iw dev X scan` zu einer Liste von Netz-Dicts.
+
+    Felder pro Netz: bssid, ssid, signal, frequency_mhz, channel, band,
+    country_code, capability_hex, akm, encryption, rsn, wpa,
+    ht_capable, vht_capable, he_capable, hidden, signal_samples.
+    """
+    if not text:
+        return []
+    nets = []
+    cur = None
+    cur_ie_lines: list = []
+    for raw in text.split("\n"):
+        line = raw.rstrip()
+        if line.startswith("BSS "):
+            if cur is not None:
+                cur["decoded_ies"] = _scan_iw_ies_from_lines(cur_ie_lines)
+                nets.append(cur)
+            cur_ie_lines = []
+            rest = line[4:]
+            paren = rest.find("(")
+            bssid = (rest[:paren] if paren > 0 else rest).strip().lower()
+            cur = {
+                "bssid": bssid, "ssid": "", "signal": None,
+                "frequency_mhz": 0, "channel": 0, "country_code": "",
+                "capability_hex": 0, "akm": [], "encryption": "UNKNOWN",
+                "rsn": False, "wpa": False,
+                "ht_capable": False, "vht_capable": False,
+                "he_capable": False,
+            }
+            continue
+        if cur is None:
+            continue
+        cur_ie_lines.append(raw)
+        st = line.strip()
+        if st.startswith("freq:"):
+            try:
+                cur["frequency_mhz"] = int(float(st[5:].strip()))
+            except (ValueError, IndexError):
+                pass
+        elif st.startswith("signal:"):
+            try:
+                v = st[7:].strip().split()[0]
+                cur["signal"] = round(float(v))
+            except (ValueError, IndexError):
+                pass
+        elif st.startswith("capability:"):
+            try:
+                paren = st.rfind("(0x")
+                if paren > 0:
+                    cur["capability_hex"] = int(
+                        st[paren + 1:].rstrip(")").strip(), 16
+                    )
+            except (ValueError, IndexError):
+                pass
+        elif st.startswith("SSID:"):
+            cur["ssid"] = st[5:].strip()
+        elif st.startswith("DS Parameter set:"):
+            try:
+                cur["channel"] = int(st.split()[-1])
+            except (ValueError, IndexError):
+                pass
+        elif st.startswith("Country:"):
+            try:
+                cur["country_code"] = st[8:].strip().split()[0]
+            except IndexError:
+                pass
+        elif st.startswith("RSN:"):
+            cur["rsn"] = True
+        elif st.startswith("WPA:"):
+            cur["wpa"] = True
+        elif st.startswith("HT capabilities:"):
+            cur["ht_capable"] = True
+        elif st.startswith("VHT capabilities:"):
+            cur["vht_capable"] = True
+        elif st.startswith("HE capabilities:"):
+            cur["he_capable"] = True
+        elif "Authentication suites:" in st:
+            try:
+                akm_str = st.split("Authentication suites:", 1)[1].strip()
+                for akm in akm_str.split():
+                    if akm and akm not in cur["akm"]:
+                        cur["akm"].append(akm)
+            except IndexError:
+                pass
+    if cur is not None:
+        cur["decoded_ies"] = _scan_iw_ies_from_lines(cur_ie_lines)
+        nets.append(cur)
+
+    for n in nets:
+        if not isinstance(n.get("decoded_ies"), dict):
+            n["decoded_ies"] = {}
+        if not n.get("channel") and n.get("frequency_mhz"):
+            n["channel"] = _scan_iw_parse_freq_to_channel(n["frequency_mhz"])
+        n["band"] = _scan_once_band_of(n.get("channel"))
+        akm_str = " ".join(n.get("akm") or []).upper()
+        if "SAE" in akm_str and "PSK" in akm_str:
+            n["encryption"] = "WPA3-TRANSITION"
+        elif "SAE" in akm_str:
+            n["encryption"] = "WPA3"
+        elif "OWE" in akm_str:
+            n["encryption"] = "OWE"
+        elif "802.1X" in akm_str or "SUITEB" in akm_str:
+            n["encryption"] = "ENTERPRISE"
+        elif n.get("rsn"):
+            n["encryption"] = "WPA2"
+        elif n.get("wpa"):
+            n["encryption"] = "WPA"
+        elif n.get("capability_hex", 0) & 0x0010:
+            n["encryption"] = "WEP"
+        elif n.get("capability_hex", 0) & 0x0001:
+            n["encryption"] = "OPEN"
+        n["hidden"] = not bool(n.get("ssid"))
+        n["vendor"] = _scan_oui_vendor_lookup(n.get("bssid", ""))
+        if n.get("signal") is not None:
+            n["signal_samples"] = [int(n["signal"])]
+    return nets
+
+
+def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
+                   refresh: float = 1.0, max_duration: int = 0,
+                   out_file: str = "", log_file: str = "") -> int:
+    """v38: --scan-live — kontinuierlicher Live-Scan im Monitor-Modus.
+
+    Hopping durch channels, Rolling-Statistics pro BSSID, Live-Tabelle.
+    Strg-C beendet und schreibt Envelope nach out_file (falls gesetzt).
+    max_duration=0 -> laeuft bis Strg-C.
+    """
+    if not SCAPY_VERFÜGBAR:
+        print("Scapy nicht verfuegbar - --scan-live nicht moeglich.",
+              file=sys.stderr)
+        return 1
+    iface = (iface or "").strip()
+    if not iface:
+        iface = _scan_once_pick_iface()
+    if not iface:
+        print("Kein WLAN-Interface. Bitte --scan-iface angeben.",
+              file=sys.stderr)
+        return 1
+    ok, msg = _scan_live_ensure_monitor(iface)
+    if not ok:
+        print(msg, file=sys.stderr)
+        return 1
+    if msg:
+        print(f"[scan-live] {msg}", file=sys.stderr)
+
+    _ch_list = list(channels) if channels else [1, 6, 11, 36, 44, 100]
+    try:
+        dwell = max(0.1, float(dwell))
+        refresh = max(0.3, float(refresh))
+    except (TypeError, ValueError):
+        dwell, refresh = 0.3, 1.0
+    try:
+        max_duration = int(max_duration) if max_duration else 0
+    except (TypeError, ValueError):
+        max_duration = 0
+
+    processor = PacketProcessor(dedupe=False)
+    seen: dict = {}
+    clients: dict = {}
+    lock = threading.Lock()
+    started = time.time()
+    frame_count = [0]
+    log_handle = [None]
+    if log_file:
+        try:
+            # Logfile-Handle bleibt ueber die gesamte Scan-Dauer offen;
+            # wird im finally-Block geschlossen. Daher kein `with`.
+            log_handle[0] = open(  # noqa: SIM115
+                log_file, "a", encoding="utf-8"
+            )
+            try:
+                os.chmod(log_file, 0o644)
+            except OSError:
+                pass
+        except OSError as exc:
+            print(f"[scan-live] Logfile: {exc}", file=sys.stderr)
+            log_handle[0] = None
+
+    def _collect(pkt) -> None:
+        frame_count[0] += 1
+
+        # ── Client-Tracking (Data + Probe Request) ────────────
+        try:
+            if pkt is not None and pkt.haslayer(Dot11):
+                _t = int(getattr(pkt, "type", -1))
+                _st = int(getattr(pkt, "subtype", -1))
+                _is_probe_req = (_t == 0 and _st == 4)
+                _is_data = (_t == 2)
+                if _is_probe_req or _is_data:
+                    _cli = getattr(pkt, "addr2", None)
+                    _peer = getattr(pkt, "addr1", None)
+                    if _cli:
+                        _ck = str(_cli).lower()
+                        _pk = str(_peer).lower() if _peer else ""
+                        _now = time.time()
+                        with lock:
+                            cl = clients.get(_ck)
+                            if cl is None:
+                                clients[_ck] = {
+                                    "mac": str(_cli).upper(),
+                                    "vendor": _scan_oui_vendor_lookup(
+                                        str(_cli)
+                                    ),
+                                    "first_seen_ts": _now,
+                                    "last_seen_ts": _now,
+                                    "n_frames": 1,
+                                    "probe_ssids": [],
+                                    "peers": {},
+                                }
+                                cl = clients[_ck]
+                                if _pk:
+                                    cl["peers"][_pk] = 1
+                            else:
+                                cl["last_seen_ts"] = _now
+                                cl["n_frames"] += 1
+                                if _pk:
+                                    cl["peers"][_pk] = (
+                                        cl["peers"].get(_pk, 0) + 1
+                                    )
+                        if _is_probe_req:
+                            _ssid = _scan_live_extract_probe_ssid(pkt)
+                            if _ssid:
+                                with lock:
+                                    _cl = clients.get(_ck)
+                                    if (_cl is not None
+                                            and _ssid not in _cl["probe_ssids"]):
+                                        _cl["probe_ssids"].append(_ssid)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            pass
+
+        # ── Beacon/ProbeResp-Verarbeitung ─────────────────────
+        try:
+            result = processor.process(pkt)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return
+        if not result:
+            return
+        bssid = result.get("bssid")
+        if not bssid:
+            return
+        _now = time.time()
+        _raw_sig = result.get("signal")
+        try:
+            _sig_int = int(_raw_sig) if _raw_sig is not None else None
+        except (TypeError, ValueError):
+            _sig_int = None
+        key = str(bssid).lower()
+        with lock:
+            ex = seen.get(key)
+            if ex is not None:
+                if _raw_sig is not None:
+                    ex["signal"] = _raw_sig
+                if _sig_int is not None:
+                    ex.setdefault("signal_samples", []).append(_sig_int)
+                ex["last_seen_ts"] = _now
+                if not ex.get("ssid"):
+                    _ssid = result.get("ssid")
+                    if _ssid:
+                        ex["ssid"] = _ssid
+                        ex["hidden"] = False
+                if not ex.get("channel") and result.get("channel"):
+                    ex["channel"] = result.get("channel")
+                _new_ies = result.get("decoded_ies") or {}
+                if _new_ies:
+                    ex["decoded_ies"] = _new_ies
+                return
+            seen[key] = {
+                "ssid": result.get("ssid", ""),
+                "bssid": bssid,
+                "channel": result.get("channel", 0),
+                "signal": result.get("signal", -100),
+                "encryption": result.get("encryption", "UNKNOWN"),
+                "decoded_ies": result.get("decoded_ies") or {},
+                "signal_samples": (
+                    [_sig_int] if _sig_int is not None else []
+                ),
+                "first_seen_ts": _now,
+                "last_seen_ts": _now,
+                "vendor": _scan_oui_vendor_lookup(str(bssid)),
+            }
+            if log_handle[0] is not None:
+                try:
+                    log_handle[0].write(
+                        f"{_now:.3f}\t{bssid}\t"
+                        f"{result.get('signal', -100)}\t"
+                        f"{result.get('ssid', '')}\t"
+                        f"{result.get('channel', 0)}\t"
+                        f"{result.get('encryption', '?')}\n"
+                    )
+                    log_handle[0].flush()
+                except OSError:
+                    pass
+
+    stop_hopping = threading.Event()
+    hopper = threading.Thread(
+        target=_scan_once_hopper,
+        args=(iface, _ch_list, dwell, stop_hopping),
+        daemon=True, name="scan_live_hopper",
+    )
+    hopper.start()
+
+    sniffer = None
+    try:
+        sniffer = scapy.AsyncSniffer(iface=iface, prn=_collect, store=False)
+        sniffer.start()
+    except (OSError, RuntimeError, AttributeError, ValueError) as exc:
+        stop_hopping.set()
+        print(f"Sniffer-Start fehlgeschlagen: {exc}", file=sys.stderr)
+        if log_handle[0] is not None:
+            try:
+                log_handle[0].close()
+            except OSError:
+                pass
+        return 1
+
+    print(f"[scan-live] Interface={iface} Kanaele={_ch_list} "
+          f"dwell={dwell}s refresh={refresh}s", file=sys.stderr)
+    if max_duration > 0:
+        print(f"[scan-live] Laufzeit: {max_duration}s", file=sys.stderr)
+    else:
+        print("[scan-live] Unbegrenzt - Strg-C zum Beenden", file=sys.stderr)
+
+    # Lokaler SIGINT-Handler: Strg-C -> sauberer Stop statt globalem "beende"
+    _orig_sigint = None
+    try:
+        _orig_sigint = signal.getsignal(signal.SIGINT)
+
+        def _live_sigint(sig, frame):
+            raise KeyboardInterrupt()
+
+        signal.signal(signal.SIGINT, _live_sigint)
+    except (ValueError, OSError, AttributeError):
+        pass
+
+    try:
+        while True:
+            elapsed = time.time() - started
+            with lock:
+                _snap = [dict(x) for x in seen.values()]
+            # Rolling-Median ueber alle Samples
+            for n in _snap:
+                smp = n.get("signal_samples") or []
+                if smp:
+                    import statistics as _st
+                    n["signal_median"] = int(_st.median(smp))
+                    n["n_sightings"] = len(smp)
+                    try:
+                        n["signal_stdev"] = round(_st.pstdev(smp), 2)
+                    except _st.StatisticsError:
+                        n["signal_stdev"] = 0.0
+                    if len(smp) >= 8:
+                        half = len(smp) // 2
+                        f_m = sum(smp[:half]) / half
+                        s_m = sum(smp[half:]) / (len(smp) - half)
+                        d = s_m - f_m
+                        if d > 2.0:
+                            n["signal_trend"] = "improving"
+                        elif d < -2.0:
+                            n["signal_trend"] = "declining"
+                        else:
+                            n["signal_trend"] = "stable"
+                    else:
+                        n["signal_trend"] = "?"
+            _scan_live_render(_snap, iface, _ch_list, elapsed,
+                              refresh, frame_count[0])
+            if max_duration > 0 and elapsed >= max_duration:
+                break
+            time.sleep(refresh)
+    except KeyboardInterrupt:
+        print("\n[scan-live] Strg-C empfangen - beende.", file=sys.stderr)
+    finally:
+        # SIGINT-Handler wiederherstellen
+        if _orig_sigint is not None:
+            try:
+                signal.signal(signal.SIGINT, _orig_sigint)
+            except (ValueError, OSError, TypeError):
+                pass
+        stop_hopping.set()
+        try:
+            hopper.join(timeout=2)
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            if sniffer is not None:
+                sniffer.stop()
+        except (OSError, RuntimeError, AttributeError):
+            pass
+        if log_handle[0] is not None:
+            try:
+                log_handle[0].close()
+            except OSError:
+                pass
+
+    # Envelope bauen und speichern
+    ended = time.time()
+    with lock:
+        nets = list(seen.values())
+    for n in nets:
+        smp = n.pop("signal_samples", None) or []
+        if smp:
+            import statistics as _st
+            n["signal_median"] = int(_st.median(smp))
+            n["n_sightings"] = len(smp)
+            try:
+                n["signal_stdev"] = round(_st.pstdev(smp), 2)
+            except _st.StatisticsError:
+                n["signal_stdev"] = 0.0
+        n["band"] = _scan_once_band_of(n.get("channel"))
+        n["frequency_mhz"] = _scan_once_freq_mhz(n.get("channel"))
+        n["hidden"] = not bool(n.get("ssid"))
+        if not n.get("vendor"):
+            n["vendor"] = _scan_oui_vendor_lookup(n.get("bssid", ""))
+    _scan_once_assign_families(nets)
+    _ch_obs = [int(n.get("channel") or 0) for n in nets
+               if int(n.get("channel") or 0) > 0]
+    _total_b = sum(int(n.get("n_sightings") or 0) for n in nets)
+    env = _scan_once_envelope(
+        nets, iface, _ch_list, started, ended, dwell, _total_b, _ch_obs,
+    )
+    env["scan"]["mode"] = "live"
+    env["scan"]["duration_s"] = round(ended - started, 2)
+    env["scan"]["total_frames"] = frame_count[0]
+
+    # Client-Tracking: Peers aufraeumen, associated_bssid ableiten
+    with lock:
+        _cli_list = []
+        for _ck, _cl in clients.items():
+            try:
+                _peers = _cl.get("peers") or {}
+                _assoc = ""
+                if _peers:
+                    _assoc = max(_peers.items(), key=lambda x: x[1])[0]
+                _cl["associated_bssid"] = _assoc
+                _cl["n_peers"] = len(_peers)
+                _cl.pop("peers", None)
+                _cli_list.append(_cl)
+            except (AttributeError, TypeError, ValueError):
+                continue
+    env["clients"] = _cli_list
+    env["summary"]["n_clients"] = len(_cli_list)
+
+    if out_file:
+        try:
+            with open(out_file, "w", encoding="utf-8") as fh:
+                json.dump(env, fh, indent=2, default=str, ensure_ascii=False)
+            try:
+                os.chmod(out_file, 0o644)
+            except OSError:
+                pass
+            print(f"[scan-live] Envelope: {out_file}", file=sys.stderr)
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"scan-live out Fehler: {exc}", file=sys.stderr)
+            return 1
+
+    print(f"\n[scan-live] Ende: {len(nets)} BSSIDs, "
+          f"{frame_count[0]} Frames in {ended-started:.1f}s",
+          file=sys.stderr)
+    return 0
+
+
+def _scan_live_extract_probe_ssid(pkt) -> str:
+    """Liefert die SSID aus einem Probe-Request (leer wenn keine)."""
+    try:
+        ie = pkt.getlayer(Dot11Elt)
+    except (AttributeError, TypeError):
+        return ""
+    seen = set()
+    while ie is not None and id(ie) not in seen:
+        seen.add(id(ie))
+        try:
+            if getattr(ie, "ID", None) == 0:
+                raw = getattr(ie, "info", b"")
+                if isinstance(raw, bytes) and raw:
+                    return raw.decode("utf-8", errors="ignore").strip()
+                return ""
+        except (AttributeError, TypeError):
+            return ""
+        try:
+            ie = ie.payload
+        except AttributeError:
+            break
+    return ""
+
+
+def _scan_iw_baseline_cli(iface: str = "", label: str = "",
+                          repeats: int = 5, out_file: str = "",
+                          auto_switch: bool = True) -> int:
+    """v38: --scan-iw-baseline — Konvenienz-Wrapper fuer Antennenvergleiche."""
+    try:
+        repeats = max(3, int(repeats))
+    except (TypeError, ValueError):
+        repeats = 5
+    return _scan_iw_cli(
+        iface=iface, repeats=repeats, dump_full=bool(out_file),
+        out_file=out_file, dump_signals=True,
+        auto_switch=auto_switch, baseline=True, label=label,
+    )
+
+
+def _scan_iw_compare_cli(files_str: str = "", min_sightings: int = 3) -> int:
+    """v38: --scan-iw-compare "A.json,B.json" — Antennenvergleich."""
+    parts = [x.strip() for x in str(files_str or "").split(",") if x.strip()]
+    if len(parts) != 2:
+        print('--scan-iw-compare braucht zwei Dateien: "A.json,B.json"',
+              file=sys.stderr)
+        return 1
+    a_path, b_path = parts
+    try:
+        A_raw = _scan_compare_load(a_path)
+        B_raw = _scan_compare_load(b_path)
+    except (OSError, ValueError) as exc:
+        print(f"Laden fehlgeschlagen: {exc}", file=sys.stderr)
+        return 1
+    try:
+        min_s = max(1, int(min_sightings))
+    except (TypeError, ValueError):
+        min_s = 3
+
+    def _sig(n):
+        v = n.get("signal_median")
+        if v is None:
+            v = n.get("signal")
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _ns(n):
+        try:
+            return int(n.get("n_sightings") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    keep = set()
+    for b, n in A_raw.items():
+        if _ns(n) >= min_s:
+            keep.add(b)
+    for b, n in B_raw.items():
+        if _ns(n) >= min_s:
+            keep.add(b)
+
+    A = {b: A_raw[b] for b in A_raw if b in keep}
+    B = {b: B_raw[b] for b in B_raw if b in keep}
+    common = sorted(set(A) & set(B))
+    only_a = sorted(set(A) - set(B))
+    only_b = sorted(set(B) - set(A))
+
+    print("=" * 100)
+    print("  IW-SCAN VERGLEICH (Antennen-Fokus)")
+    print(f"  A = {a_path}")
+    print(f"  B = {b_path}")
+    print(f"  Filter: n_sightings >= {min_s}")
+    print("=" * 100)
+    print(f"  A: {len(A)} relevante BSSIDs   B: {len(B)}   gemeinsam: {len(common)}")
+    print(f"  Nur in A (verloren): {len(only_a)}   Nur in B (neu): {len(only_b)}")
+    print()
+    print(f"  {'BSSID':<18} {'SSID':<24} {'Band':<5} {'Ch':>4} "
+          f"{'medA':>5} {'medB':>5} {'d':>4}  Status")
+    print("  " + "-" * 92)
+
+    band_deltas = {}
+    for b in common:
+        a, c = A[b], B[b]
+        ma = _sig(a)
+        mb = _sig(c)
+        if ma is None or mb is None:
+            continue
+        d = mb - ma
+        ssid = str(a.get("ssid") or c.get("ssid") or "<hidden>")[:23]
+        band = str(a.get("band") or "?")
+        try:
+            ch = int(a.get("channel") or 0)
+        except (TypeError, ValueError):
+            ch = 0
+        if abs(d) <= 2:
+            st = "gleich (Rauschen)"
+        elif d > 0:
+            st = "B besser"
+        else:
+            st = "B schlechter"
+        band_deltas.setdefault(band, []).append(d)
+        print(f"  {b:<18} {ssid:<24} {band:<5} {ch:>4} "
+              f"{ma:>5} {mb:>5} {d:>+4}  {st}")
+
+    for b in only_a:
+        a = A[b]
+        ma = _sig(a) if _sig(a) is not None else "?"
+        ssid = str(a.get("ssid") or "<hidden>")[:23]
+        band = str(a.get("band") or "?")
+        try:
+            ch = int(a.get("channel") or 0)
+        except (TypeError, ValueError):
+            ch = 0
+        print(f"  {b:<18} {ssid:<24} {band:<5} {ch:>4} "
+              f"{ma:>5} {'-':>5} {'-':>4}  VERLOREN in B")
+
+    for b in only_b:
+        c = B[b]
+        mb = _sig(c) if _sig(c) is not None else "?"
+        ssid = str(c.get("ssid") or "<hidden>")[:23]
+        band = str(c.get("band") or "?")
+        try:
+            ch = int(c.get("channel") or 0)
+        except (TypeError, ValueError):
+            ch = 0
+        print(f"  {b:<18} {ssid:<24} {band:<5} {ch:>4} "
+              f"{'-':>5} {mb:>5} {'-':>4}  NEU in B")
+
+    print("  " + "-" * 92)
+    print()
+    print("  Band-Auswertung (Delta B - A):")
+    for band in sorted(band_deltas.keys()):
+        ds = band_deltas[band]
+        if not ds:
+            continue
+        mean_d = sum(ds) / len(ds)
+        better = sum(1 for d in ds if d > 2)
+        worse = sum(1 for d in ds if d < -2)
+        print(f"    {band:<5}: n={len(ds):>3}  Mittelwert d = {mean_d:+5.2f} dB  "
+              f"(B besser: {better}, B schlechter: {worse})")
+    print()
+    return 0
+
+
+def _scan_iw_cli(iface: str = "", repeats: int = 1,
+                 dump_full: bool = False, out_file: str = "",
+                 dump_signals: bool = False,
+                 auto_switch: bool = False,
+                 baseline: bool = False,
+                 label: str = "",
+                 dump_ies: bool = False) -> int:
+    """v38: --scan-iw [--scan-iface X] [--scan-iw-repeats N].
+
+    Treiber-basierter Scan via `iw dev X scan`. Braucht managed-Modus.
+    Kein Monitor-Modus, kein Kanal-Hopping im Skript.
+    """
+    iface = (iface or "").strip()
+    if not iface:
+        iface = _scan_once_pick_iface()
+    if not iface:
+        _say("Kein WLAN-Interface gefunden. Bitte --scan-iface angeben.",
+              file=sys.stderr)
+        return 1
+
+    ok, msg = _scan_iw_ensure_managed(iface, auto_switch=auto_switch)
+    if not ok:
+        print(msg, file=sys.stderr)
+        print(f"  sudo ip link set {iface} down", file=sys.stderr)
+        print(f"  sudo iw dev {iface} set type managed", file=sys.stderr)
+        print(f"  sudo ip link set {iface} up", file=sys.stderr)
+        return 1
+    if msg:
+        print(f"[scan-iw] {msg}", file=sys.stderr)
+
+    try:
+        repeats = max(1, int(repeats))
+    except (TypeError, ValueError):
+        repeats = 1
+
+    _say(f"[scan-iw] Interface={iface} repeats={repeats}",
+          file=sys.stderr)
+
+    started = time.time()
+    aggregated = {}
+    scan_ok_count = 0
+    for i in range(repeats):
+        ok, text = _scan_iw_run(iface)
+        if not ok:
+            _say(f"[scan-iw] Runde {i+1}/{repeats}: {text}",
+                  file=sys.stderr)
+            continue
+        scan_ok_count += 1
+        for n in _scan_iw_parse(text):
+            b = n["bssid"]
+            if b not in aggregated:
+                aggregated[b] = dict(n)
+                aggregated[b]["decoded_ies"] = dict(
+                    n.get("decoded_ies") or {}
+                )
+                aggregated[b]["signal_samples"] = []
+            agg = aggregated[b]
+            _new_ies = n.get("decoded_ies") or {}
+            if _new_ies:
+                _existing_ies = agg.setdefault("decoded_ies", {})
+                for _ie_id, _payload in _new_ies.items():
+                    if _ie_id not in _existing_ies:
+                        _existing_ies[_ie_id] = _payload
+            if n.get("signal") is not None:
+                agg["signal_samples"].append(int(n["signal"]))
+            if n.get("ssid") and not agg.get("ssid"):
+                agg["ssid"] = n["ssid"]
+            if not agg.get("channel") and n.get("channel"):
+                agg["channel"] = n["channel"]
+            if not agg.get("frequency_mhz") and n.get("frequency_mhz"):
+                agg["frequency_mhz"] = n["frequency_mhz"]
+            if not agg.get("country_code") and n.get("country_code"):
+                agg["country_code"] = n["country_code"]
+            if n.get("ht_capable"):
+                agg["ht_capable"] = True
+            if n.get("vht_capable"):
+                agg["vht_capable"] = True
+            if n.get("he_capable"):
+                agg["he_capable"] = True
+            if not agg.get("akm") and n.get("akm"):
+                agg["akm"] = list(n["akm"])
+            if (agg.get("encryption") in (None, "", "UNKNOWN")
+                    and n.get("encryption") not in (None, "", "UNKNOWN")):
+                agg["encryption"] = n["encryption"]
+        if i < repeats - 1:
+            time.sleep(1)
+    ended = time.time()
+
+    nets = list(aggregated.values())
+    for n in nets:
+        samples = n.get("signal_samples") or []
+        if samples:
+            import statistics as _st
+            n["signal"] = int(_st.median(samples))
+            _scan_once_derive_stats(n, started, ended)
+        n["n_sightings"] = len(samples) if samples else 0
+        if not n.get("channel") and n.get("frequency_mhz"):
+            n["channel"] = _scan_iw_parse_freq_to_channel(n["frequency_mhz"])
+        n["band"] = _scan_once_band_of(n.get("channel"))
+        n["frequency_mhz"] = _scan_once_freq_mhz(n.get("channel"))
+        n["hidden"] = not bool(n.get("ssid"))
+
+    _scan_once_assign_families(nets)
+    _ch_obs = [int(n.get("channel") or 0) for n in nets
+               if int(n.get("channel") or 0) > 0]
+    _total = sum(int(n.get("n_sightings", 0)) for n in nets)
+
+    if not dump_signals:
+        for n in nets:
+            n.pop("signal_samples", None)
+
+    if dump_ies:
+        try:
+            if out_file:
+                with open(out_file, "w", encoding="utf-8") as _fh:
+                    json.dump(nets, _fh, indent=2, default=str,
+                              ensure_ascii=False)
+                try:
+                    os.chmod(out_file, 0o644)
+                except OSError:
+                    pass
+                _say(f"[scan-out] {len(nets)} Netzwerke: {out_file}",
+                      file=sys.stderr)
+            else:
+                print(json.dumps(nets, indent=2, default=str,
+                                 ensure_ascii=False))
+        except (OSError, TypeError, ValueError) as exc:
+            _say(f"JSON-Serialisierung fehlgeschlagen: {exc}",
+                  file=sys.stderr)
+            return 1
+        return 0
+
+    env = _scan_once_envelope(
+        nets, iface, [], started, ended, 0.0, _total, _ch_obs,
+    )
+    env["scan"]["mode"] = "iw"
+    env["scan"]["repeats"] = repeats
+    env["scan"]["repeats_ok"] = scan_ok_count
+    if label:
+        env["scan"]["label"] = str(label)
+    if baseline:
+        env["scan"]["baseline"] = True
+    env["scan"]["consistency"] = {
+        b: len(d.get("signal_samples") or [])
+        for b, d in aggregated.items()
+    }
+
+    if dump_full or out_file:
+        if out_file:
+            try:
+                with open(out_file, "w", encoding="utf-8") as fh:
+                    json.dump(env, fh, indent=2, default=str,
+                              ensure_ascii=False)
+                try:
+                    os.chmod(out_file, 0o644)
+                except OSError:
+                    pass
+                _say(f"[scan-iw] Envelope geschrieben: {out_file}",
+                      file=sys.stderr)
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"scan-iw out Fehler: {exc}", file=sys.stderr)
+                return 1
+            return 0
+        try:
+            print(json.dumps(env, indent=2, default=str,
+                             ensure_ascii=False))
+        except (TypeError, ValueError) as exc:
+            print(f"scan-iw JSON: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if not nets:
+        _say("Keine Netzwerke gefunden.")
+        return 0
+
+    _say("=" * 96)
+    _lbl_suffix = f" [{label}]" if label else ""
+    _say(f"  SCAN-IW ERGEBNIS ({len(nets)} Netzwerke, "
+          f"{scan_ok_count}/{repeats} Runden auf {iface}){_lbl_suffix}")
+    _say("=" * 96)
+    _say(f"  {'SSID':<22} {'BSSID':<18} {'Vendor':<22} "
+          f"{'Ch':>3} {'dBm':>4} {'Enc':<14}")
+    _say("  " + "-" * 92)
+
+    def _key(x):
+        v = x.get("signal_median") or x.get("signal")
+        return -int(v) if v is not None else 100
+
+    for n in sorted(nets, key=_key):
+        ssid = "<hidden>" if n.get("hidden") else str(n.get("ssid") or "")[:23]
+        ch = int(n.get("channel") or 0)
+        sig = n.get("signal")
+        sig_i = int(sig) if sig is not None else -100
+        enc = str(n.get("encryption") or "?")[:13]
+        _vendor = str(n.get("vendor") or "Unknown")[:21]
+        _say(
+            f"  {ssid:<22} {n.get('bssid', '?')!s:<18} "
+            f"{_vendor:<22} {ch:>3} {sig_i:>4} {enc:<14}"
+        )
+    _say("=" * 96)
+    return 0
+
+
+def _scan_compare_load(path: str) -> dict:
+    """Laedt ein Scan-JSON (Envelope oder flache Liste)."""
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if isinstance(data, dict) and "networks" in data:
+        nets = data.get("networks") or []
+    elif isinstance(data, list):
+        nets = data
+    else:
+        return {}
+    out = {}
+    for n in nets:
+        if isinstance(n, dict) and n.get("bssid"):
+            out[str(n["bssid"]).lower()] = n
+    return out
+
+
+def _scan_compare_cli(files_str: str = "") -> int:
+    """v38: --scan-compare "A.json,B.json" — Vergleich zweier Scan-Envelopes."""
+    parts = [p.strip() for p in str(files_str or "").split(",") if p.strip()]
+    if len(parts) != 2:
+        print("--scan-compare braucht zwei Dateien: \"A.json,B.json\"",
+              file=sys.stderr)
+        return 1
+    a_path, b_path = parts
+    try:
+        A = _scan_compare_load(a_path)
+        B = _scan_compare_load(b_path)
+    except (OSError, ValueError) as exc:
+        print(f"Laden fehlgeschlagen: {exc}", file=sys.stderr)
+        return 1
+
+    common = sorted(set(A) & set(B))
+    only_a = sorted(set(A) - set(B))
+    only_b = sorted(set(B) - set(A))
+    deltas = []
+
+    print("=" * 100)
+    print("  SCAN-VERGLEICH")
+    print(f"  A = {a_path}")
+    print(f"  B = {b_path}")
+    print("=" * 100)
+    print(f"  A: {len(A)} BSSIDs   B: {len(B)} BSSIDs   gemeinsam: {len(common)}")
+    print()
+    hdr = (f"  {'BSSID':<18} {'SSID':<22} {'Band':<5} {'Ch':>3} "
+           f"{'medA':>5} {'medB':>5} {'Δ':>4}  Status")
+    print(hdr)
+    print("  " + "-" * 88)
+    for b in common:
+        a, c = A[b], B[b]
+        ma = a.get("signal_median")
+        mb = c.get("signal_median")
+        ssid = str(a.get("ssid") or c.get("ssid") or "<hidden>")[:21]
+        band = str(a.get("band") or "?")
+        try:
+            ch = int(a.get("channel") or 0)
+        except (TypeError, ValueError):
+            ch = 0
+        if ma is None or mb is None:
+            _ma_s = str(ma) if ma is not None else "?"
+            _mb_s = str(mb) if mb is not None else "?"
+            print(f"  {b:<18} {ssid:<22} {band:<5} {ch:>3} "
+                  f"{_ma_s:>5} {_mb_s:>5} {'?':>4}  keine Daten")
+            continue
+        try:
+            d = int(mb) - int(ma)
+        except (TypeError, ValueError):
+            continue
+        deltas.append(d)
+        if abs(d) <= 2:
+            st = "gleich (Rauschen)"
+        elif d > 0:
+            st = "B besser"
+        else:
+            st = "B schlechter"
+        print(f"  {b:<18} {ssid:<22} {band:<5} {ch:>3} "
+              f"{int(ma):>5} {int(mb):>5} {d:>+4}  {st}")
+    for b in only_a:
+        a = A[b]
+        ma = a.get("signal_median")
+        _bnd = a.get("band") or "?"
+        print(f"  {b:<18} {str(a.get('ssid') or '<hidden>')[:21]:<22} "
+              f"{_bnd!s:<5} "
+              f"{int(a.get('channel') or 0):>3} "
+              f"{ma if ma is not None else '?':>5} {'—':>5} {'—':>4}  NUR in A")
+    for b in only_b:
+        c = B[b]
+        mb = c.get("signal_median")
+        _bnd = c.get("band") or "?"
+        print(f"  {b:<18} {str(c.get('ssid') or '<hidden>')[:21]:<22} "
+              f"{_bnd!s:<5} "
+              f"{int(c.get('channel') or 0):>3} "
+              f"{'—':>5} {mb if mb is not None else '?':>5} "
+              f"{'—':>4}  NEU in B")
+    print("  " + "-" * 88)
+    if deltas:
+        mean_d = sum(deltas) / len(deltas)
+        print(f"  Mittelwert Δ (B - A) über {len(deltas)} gemeinsame BSSIDs: "
+              f"{mean_d:+.2f} dB")
+    if only_a:
+        print(f"  Nur in A (verloren in B): {len(only_a)}")
+    if only_b:
+        print(f"  Neu in B: {len(only_b)}")
+    return 0
+
+
+def _scan_once_explain() -> int:
+    """v38: dBm-Legende + Feldbeschreibung + Vergleichs-Tipps."""
+    print("=" * 78)
+    print("  dBm-LEGENDE \u2014 Signalstaerke im WLAN")
+    print("=" * 78)
+    print()
+    print("  dBm ist die Empfangsleistung relativ zu 1 Milliwatt, logarithmisch.")
+    print("  Je NAEHER an 0, desto STAERKER das Signal. -30 ist besser als -70.")
+    print("  3 dB Unterschied = Faktor 2 in Empfangsleistung.")
+    print()
+    print(f"  {'dBm':>7}   {'Qualitaet':<14}  {'Erwartung im Alltag':<40}")
+    print("  " + "-" * 64)
+    bereiche = [
+        ("> -30", "extrem",       "direkt am Sender (<50 cm)"),
+        ("-30..-40", "sehr stark",  "gleicher Raum (2-3 m)"),
+        ("-40..-50", "stark",       "Nebenzimmer, 1 Wand"),
+        ("-50..-60", "mittel",      "2 Waende dazwischen"),
+        ("-60..-70", "schwach",     "Grenzbereich, oft instabil"),
+        ("-70..-80", "sehr schwach","kaum nutzbar, viel Packet Loss"),
+        ("-80..-90", "kaum",        "Zufallstreffer, im Rauschen"),
+        ("< -90",    "Rauschen",    "unter Empfindlichkeitsgrenze"),
+    ]
+    for spanne, quali, text in bereiche:
+        print(f"  {spanne:>7}   {quali:<14}  {text:<40}")
+    print()
+    print("=" * 78)
+    print("  FELDER IM JSON-ENVELOPE (--scan-dump-full)")
+    print("=" * 78)
+    print()
+    felder = [
+        ("schema_version", "Format-Version (aktuell 1)"),
+        ("signal",         "letzter Einzelwert (Roh)"),
+        ("signal_median",  "Median aller Beacons (robust, empfohlen)"),
+        ("signal_mean",    "Mittelwert (empfindlich gegen Ausreisser)"),
+        ("signal_min/max", "Extremwerte (Fading-Umfang)"),
+        ("signal_range",   "max - min"),
+        ("signal_stdev",   "Standardabweichung (Rauschmass)"),
+        ("signal_trend",   "improving | declining | stable | unknown"),
+        ("n_sightings",    "Anzahl verarbeiteter Frames"),
+        ("sighting_rate_hz","Beacons pro Sekunde"),
+        ("confidence",     "0-100 (hoeher = mehr und stabilere Daten)"),
+        ("band",           "2.4 | 5 | 6 GHz"),
+        ("channel",        "Kanalnummer (0 wenn nicht extrahierbar)"),
+        ("frequency_mhz",  "Frequenz in MHz"),
+        ("hidden",         "True = kein SSID im Beacon enthalten"),
+        ("ap_family_id",   "Gruppe mehrerer BSSIDs (ein physischer AP)"),
+        ("decoded_ies",    "Rohdaten der Informationselemente"),
+    ]
+    for name, beschr in felder:
+        print(f"  {name:<18}  {beschr}")
+    print()
+    print("=" * 78)
+    print("  TIPPS ZUM ANTENNENVERGLEICH")
+    print("=" * 78)
+    print()
+    print("  1. Standort und Umgebung zwischen Messungen nicht veraendern.")
+    print("  2. BSSIDs mit n_sightings < 20 ignorieren (zu wenig Datenbasis).")
+    print("  3. BSSIDs mit signal_stdev > 5 dB skeptisch betrachten")
+    print("     (instabil, Multipath oder Bewegung).")
+    print("  4. Delta von +/- 2 dB ist im Rauschen; erst ab +/- 3 dB echter Effekt.")
+    print("  5. Anzahl verlorener/gewonnener BSSIDs ist oft aussagekraeftiger")
+    print("     als einzelne dB-Werte.")
+    print("  6. Fuer Antennenvergleich: immer 2 Kontrollmessungen mit gleicher")
+    print("     Antenne zuerst. Wenn die stabil sind (< 1 dB Drift), erst dann")
+    print("     die Testantenne anschrauben.")
+    print()
+    return 0
+
+
+def _scan_once_oui_normalized(bssid: str) -> str:
+    """OUI mit ausmaskiertem LAA-Bit (Bit 1 des ersten Bytes).
+
+    Beispiel: '04:a2:22:...' und '06:a2:22:...' sind dieselbe OUI-Familie
+    (Bit 1 = locally administered). Herstellergruppierung nutzt diese
+    normalisierte OUI, um Virtual-APs desselben Routers zu erkennen.
+    """
+    if not bssid:
+        return ""
+    try:
+        parts = bssid.replace("-", ":").split(":")
+        if len(parts) < 3:
+            return bssid.lower()
+        first = int(parts[0], 16) & 0xFD
+        return f"{first:02x}:{parts[1].lower()}:{parts[2].lower()}"
+    except (ValueError, AttributeError, IndexError):
+        return bssid.lower()
+
+
+def _scan_once_fill_channel_from_ies(net: dict) -> None:
+    """Fallback: Kanal aus HT/VHT-Operation-IE ableiten, wenn er fehlt.
+
+    Bei 5-GHz-only-APs fehlt oft das DS-Parameter-IE (ID 3). Dann steckt
+    der Kanal im HT-Operation-IE (ID 61, primary_channel) oder im
+    VHT-Operation-IE (ID 192, center_freq_seg0).
+    """
+    if not isinstance(net, dict):
+        return
+    if net.get("channel"):
+        return
+    ies = net.get("decoded_ies") or {}
+    if not isinstance(ies, dict):
+        return
+
+    def _get(ie_id):
+        v = ies.get(ie_id)
+        if v is None:
+            v = ies.get(str(ie_id))
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, dict):
+                    return item
+            return None
+        return v if isinstance(v, dict) else None
+
+    def _apply(ch):
+        try:
+            ch_int = int(ch)
+        except (TypeError, ValueError):
+            return False
+        if ch_int <= 0:
+            return False
+        net["channel"] = ch_int
+        net["band"] = _scan_once_band_of(ch_int)
+        net["frequency_mhz"] = _scan_once_freq_mhz(ch_int)
+        return True
+
+    ht = _get(61)
+    if isinstance(ht, dict):
+        if _apply(ht.get("primary_channel")):
+            return
+    vht = _get(192)
+    if isinstance(vht, dict):
+        if _apply(vht.get("center_freq_seg0")):
+            return
+
+
+def _scan_once_apply_probe_ssids(nets: list, probe_ssids: dict) -> int:
+    """Deckt hidden BSSIDs auf, indem sie mit Probe-Response-SSIDs korreliert werden.
+
+    probe_ssids: {bssid_lower: set_of_ssids} aus passiv mitgehoerten
+    Probe Responses.
+
+    Rueckgabe: Anzahl aufgedeckter BSSIDs.
+    """
+    if not isinstance(nets, list) or not isinstance(probe_ssids, dict):
+        return 0
+    revealed = 0
+    for n in nets:
+        if not isinstance(n, dict):
+            continue
+        if n.get("ssid"):
+            continue
+        bssid_key = str(n.get("bssid") or "").lower()
+        candidates = probe_ssids.get(bssid_key)
+        if not candidates:
+            continue
+        valid = sorted(
+            s for s in candidates
+            if s and isinstance(s, str) and s.strip() and s != "<hidden>"
+        )
+        if not valid:
+            continue
+        n["ssid"] = valid[0]
+        n["hidden"] = False
+        n["ssid_source"] = "probe_response"
+        n["ssid_candidates"] = valid
+        revealed += 1
+    return revealed
+
+
+def _scan_once_quality_report(channels_req: list, channels_obs: list,
+                              hop_stats: dict | None,
+                              dwell: float) -> dict:
+    """v38: Bericht zur Kanal-Abdeckung und Scan-Qualitaet."""
+    req = list(channels_req or [])
+    observed = sorted({int(c) for c in (channels_obs or []) if int(c or 0) > 0})
+    visits = {}
+    cycles = 0
+    if isinstance(hop_stats, dict):
+        visits = {
+            int(k): int(v)
+            for k, v in (hop_stats.get("visits") or {}).items()
+        }
+        cycles = int(hop_stats.get("cycles", 0) or 0)
+    visited = sorted(visits.keys())
+    never_visited = sorted(set(req) - set(visited))
+    empty = sorted(set(visited) - set(observed))
+    return {
+        "channels_requested": req,
+        "channels_visited": visited,
+        "channels_never_visited": never_visited,
+        "channels_observed": observed,
+        "channels_empty": empty,
+        "visit_counts": visits,
+        "hop_cycles_completed": cycles,
+        "dwell_seconds": float(dwell),
+    }
+
+
+def _scan_once_band_of(channel) -> str:
+    """Ordnet Kanal einem Band zu: '2.4' | '5' | '6' | '?'."""
+    try:
+        c = int(channel)
+    except (TypeError, ValueError):
+        return "?"
+    if 1 <= c <= 14:
+        return "2.4"
+    if 32 <= c <= 177:
+        return "5"
+    if c > 177:
+        return "6"
+    return "?"
+
+
+def _scan_once_freq_mhz(channel) -> int:
+    """Kanal zu Frequenz in MHz (Naeherung nach IEEE 802.11)."""
+    try:
+        c = int(channel)
+    except (TypeError, ValueError):
+        return 0
+    if 1 <= c <= 13:
+        return 2407 + c * 5
+    if c == 14:
+        return 2484
+    if 32 <= c <= 177:
+        return 5000 + c * 5
+    if c > 177:
+        return 5950 + c * 5
+    return 0
+
+
+def _scan_once_derive_stats(net: dict, scan_start: float,
+                            scan_end: float) -> None:
+    """Rechnet Signal-Statistik, Trend, Confidence in-place aus."""
+    import statistics as _st
+    samples = net.get("signal_samples") or []
+    if not samples:
+        return
+    net["n_sightings"] = len(samples)
+    net["signal_median"] = int(_st.median(samples))
+    net["signal_mean"] = round(_st.fmean(samples), 2)
+    net["signal_min"] = int(min(samples))
+    net["signal_max"] = int(max(samples))
+    net["signal_range"] = net["signal_max"] - net["signal_min"]
+    try:
+        net["signal_stdev"] = round(_st.pstdev(samples), 2)
+    except _st.StatisticsError:
+        net["signal_stdev"] = 0.0
+
+    duration = max(0.001, float(scan_end) - float(scan_start))
+    net["sighting_rate_hz"] = round(net["n_sightings"] / duration, 2)
+
+    if len(samples) >= 4:
+        half = len(samples) // 2
+        first_mean = sum(samples[:half]) / half
+        second_mean = sum(samples[half:]) / (len(samples) - half)
+        diff = second_mean - first_mean
+        if diff > 2.0:
+            net["signal_trend"] = "improving"
+        elif diff < -2.0:
+            net["signal_trend"] = "declining"
+        else:
+            net["signal_trend"] = "stable"
+    else:
+        net["signal_trend"] = "unknown"
+
+    n_score = min(50, int(net["n_sightings"] // 2))
+    s_score = max(0, 50 - int(net["signal_stdev"] * 10))
+    net["confidence"] = min(100, n_score + s_score)
+
+
+def _scan_once_assign_families(nets: list) -> None:
+    """Gruppiert BSSIDs zu physischen AP-Familien (OUI + MAC-Distanz + Kanal)."""
+    def _mac_distance(a: str, b: str) -> int:
+        """Distanz der letzten 3 Oktette (NIC-spezifisch).
+
+        Die ersten 3 Oktette sind OUI und werden separat verglichen.
+        """
+        def _last3(bssid: str) -> int:
+            try:
+                parts = bssid.replace("-", ":").split(":")
+                if len(parts) != 6:
+                    return -1
+                return int("".join(parts[3:6]), 16)
+            except (ValueError, AttributeError, IndexError):
+                return -1
+
+        la, lb = _last3(a), _last3(b)
+        if la < 0 or lb < 0:
+            return 999
+        return abs(la - lb)
+
+    indexed = list(enumerate(nets))
+    for _i, net in indexed:
+        net.setdefault("ap_family_id", net.get("bssid", ""))
+    changed = True
+    iterations = 0
+    while changed and iterations < 10:
+        changed = False
+        iterations += 1
+        for i, ni in indexed:
+            for j, nj in indexed:
+                if i == j:
+                    continue
+                fi = ni.get("ap_family_id")
+                fj = nj.get("ap_family_id")
+                if fi == fj:
+                    continue
+                if ni.get("channel") != nj.get("channel"):
+                    continue
+                b_i = ni.get("bssid", "")
+                b_j = nj.get("bssid", "")
+                oui_i = _scan_once_oui_normalized(b_i)
+                oui_j = _scan_once_oui_normalized(b_j)
+                if oui_i != oui_j:
+                    continue
+                if _mac_distance(b_i, b_j) > 16:
+                    continue
+                target = min(fi or b_i, fj or b_j)
+                ni["ap_family_id"] = target
+                nj["ap_family_id"] = target
+                changed = True
+
+
+def _scan_once_band_summary(nets: list) -> dict:
+    """Erzeugt band_summary: pro Band Kennzahlen + physikalische APs."""
+    import statistics as _st
+    bands = {}
+    for b in ("2.4", "5", "6"):
+        members = [n for n in nets if n.get("band") == b]
+        if not members:
+            bands[b] = None
+            continue
+        signals = [int(n.get("signal_median") or n.get("signal") or -100)
+                   for n in members]
+        sightings = [int(n.get("n_sightings", 0)) for n in members]
+        families = {n.get("ap_family_id") for n in members}
+        bands[b] = {
+            "n_bssids": len(members),
+            "n_physical_aps": len(families),
+            "signal_median": int(_st.median(signals)),
+            "signal_mean": round(_st.fmean(signals), 2),
+            "signal_min": int(min(signals)),
+            "signal_max": int(max(signals)),
+            "median_sightings": int(_st.median(sightings)) if sightings else 0,
+        }
+    return bands
+
+
+def _scan_once_channel_summary(nets: list) -> dict:
+    """Erzeugt channel_summary: pro Kanal n_bssids + Median-Signal."""
+    import statistics as _st
+    by_ch = {}
+    for n in nets:
+        try:
+            ch = int(n.get("channel") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ch <= 0:
+            continue
+        sig = int(n.get("signal_median") or n.get("signal") or -100)
+        by_ch.setdefault(ch, []).append(sig)
+    return {
+        str(ch): {
+            "n_bssids": len(v),
+            "median_signal": int(_st.median(v)),
+        }
+        for ch, v in sorted(by_ch.items())
+    }
+
+
+def _scan_once_family_summary(nets: list) -> list:
+    """Erzeugt family_summary: eine Zeile pro physischem AP."""
+    by_fam = {}
+    for n in nets:
+        fam = n.get("ap_family_id") or n.get("bssid")
+        by_fam.setdefault(fam, []).append(n)
+    out = []
+    for fam, members in sorted(by_fam.items()):
+        signals = [int(m.get("signal_median") or m.get("signal") or -100)
+                   for m in members]
+        ssids = [m.get("ssid") for m in members if m.get("ssid")]
+        first = members[0]
+        out.append({
+            "family_id": fam,
+            "n_members": len(members),
+            "members": sorted(m.get("bssid") for m in members),
+            "band": first.get("band"),
+            "channel": first.get("channel"),
+            "ssid_primary": ssids[0] if ssids else "",
+            "best_signal_median": int(max(signals)),
+        })
+    return out
+
+
+def _scan_once_envelope(nets: list, iface: str, channels_req: list,
+                        started: float, ended: float, dwell: float,
+                        total_beacons: int, channels_obs: list,
+                        hop_stats: dict | None = None) -> dict:
+    """Baut das vollstaendige Envelope-Dict (Schema v1)."""
+    _revealed_count = sum(
+        1 for n in nets
+        if n.get("ssid_source") == "probe_response"
+    )
+    for _n in nets:
+        if isinstance(_n, dict) and not _n.get("vendor"):
+            _n["vendor"] = _scan_oui_vendor_lookup(
+                _n.get("bssid", "")
+            )
+    summary = {
+        "n_bssids_total": len(nets),
+        "n_revealed_hidden": _revealed_count,
+        "n_physical_aps_estimated": len({n.get("ap_family_id") for n in nets}),
+        "n_2ghz": sum(1 for n in nets if n.get("band") == "2.4"),
+        "n_5ghz": sum(1 for n in nets if n.get("band") == "5"),
+        "n_6ghz": sum(1 for n in nets if n.get("band") == "6"),
+        "n_open": sum(1 for n in nets
+                      if str(n.get("encryption", "")).upper() in ("OPEN", "")),
+        "n_wep": sum(1 for n in nets
+                     if str(n.get("encryption", "")).upper() == "WEP"),
+        "n_wpa2": sum(1 for n in nets
+                      if str(n.get("encryption", "")).upper() == "WPA2"),
+        "n_wpa3": sum(1 for n in nets
+                      if str(n.get("encryption", "")).upper() == "WPA3"),
+        "n_wpa3_transition": sum(
+            1 for n in nets
+            if str(n.get("encryption", "")).upper() == "WPA3-TRANSITION"),
+        "n_enterprise": sum(
+            1 for n in nets
+            if "ENTERPRISE" in str(n.get("encryption", "")).upper()),
+        "n_hidden_ssid": sum(1 for n in nets if not n.get("ssid")),
+    }
+    return {
+        "schema_version": 1,
+        "scan": {
+            "iface": iface,
+            "started_ts": round(float(started), 3),
+            "ended_ts": round(float(ended), 3),
+            "duration_s": round(float(ended) - float(started), 3),
+            "channels_requested": list(channels_req),
+            "channels_observed": sorted(channels_obs),
+            "dwell_s": float(dwell),
+            "total_beacons_seen": int(total_beacons),
+        },
+        "summary": summary,
+        "band_summary": _scan_once_band_summary(nets),
+        "channel_summary": _scan_once_channel_summary(nets),
+        "family_summary": _scan_once_family_summary(nets),
+        "scan_quality": _scan_once_quality_report(
+            channels_req, channels_obs, hop_stats, dwell
+        ),
+        "networks": nets,
+    }
+
+
+def _scan_once_parse_channels(spec) -> list:
+    """Parst '1,6,11' oder '1 6 11' zu [1, 6, 11]. Leere/ungueltige -> []."""
+    if not spec:
+        return []
+    out = []
+    for tok in str(spec).replace(",", " ").split():
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            out.append(int(tok))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _scan_once_hopper(iface: str, channels: list, dwell: float,
+                      stop_event: threading.Event,
+                      hop_stats: dict | None = None) -> None:
+    """Hintergrund-Thread: wechselt Kanal per iw, bis stop_event gesetzt.
+
+    hop_stats (optional): dict mit "visits" (channel -> n) und "cycles" (int).
+    Wird am Ende jedes vollstaendigen Durchlaufs hochgezaehlt.
+    """
+    if not channels:
+        return
+    idx = 0
+    total = len(channels)
+    while not stop_event.is_set():
+        ch = channels[idx % total]
+        if hop_stats is not None:
+            try:
+                hop_stats["visits"][ch] = (
+                    hop_stats["visits"].get(ch, 0) + 1
+                )
+                if idx > 0 and idx % total == 0:
+                    hop_stats["cycles"] = (
+                        hop_stats.get("cycles", 0) + 1
+                    )
+            except (TypeError, AttributeError):
+                pass
+        try:
+            subprocess.run(
+                ["iw", "dev", iface, "set", "channel", str(ch)],
+                check=False,
+                timeout=1,
+                capture_output=True,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+        idx += 1
+        stop_event.wait(max(0.1, float(dwell)))
+
+
+def _scan_once_cli(iface: str = "", seconds: int = 30,
+                   dump_ies: bool = False,
+                   channels=None, dwell: float = 0.5,
+                   dump_signals: bool = False,
+                   dump_full: bool = False,
+                   out_file: str = "",
+                   scan_wlan_deep: bool = False) -> int:
+    """v38: --scan-once [--scan-iface X] [--scan-seconds N] [--scan-dump-ies].
+
+    Headless WLAN-Scan:
+      - AsyncSniffer auf iface (Default: Auto-Detect)
+      - PacketProcessor.process() je Paket
+      - decoded_ies via collect_from_packet (DATA-2c-Pfad)
+      - Ausgabe: Tabelle oder JSON (--scan-dump-ies)
+
+    Kein Qt, keine ScanEngine, kein Monitor-Mode-Setup.
+    Der User muss iface ggf. vorher selbst in Monitor-Modus setzen.
+    """
+    if not SCAPY_VERFÜGBAR:
+        _say("Scapy nicht verfuegbar - --scan-once nicht moeglich.",
+              file=sys.stderr)
+        return 1
+
+    iface = (iface or "").strip()
+    if not iface:
+        iface = _scan_once_pick_iface()
+    if not iface:
+        _say("Kein WLAN-Interface gefunden. Bitte --scan-iface angeben.",
+              file=sys.stderr)
+        return 1
+
+    try:
+        seconds = max(0, int(seconds))
+    except (TypeError, ValueError):
+        seconds = 30
+
+    # dedupe=False: jeder Beacon zaehlt, sonst keine Signal-Statistik
+    processor = PacketProcessor(dedupe=False)
+    seen: dict = {}
+    hidden_ssids: dict = {}  # bssid_lower -> set(ssid)
+    lock = threading.Lock()
+    started_ts = time.time()
+
+    def _collect(pkt) -> None:
+        # Direkt-Sniff fuer Probe-Response-SSIDs (hidden-Aufdeckung)
+        try:
+            if pkt is not None and pkt.haslayer(Dot11ProbeResp):
+                _b = getattr(pkt, "addr2", None)
+                if _b:
+                    _b_key = str(_b).lower()
+                    _ie_layer = pkt.getlayer(Dot11Elt)
+                    _ies_list = []
+                    _seen_layers = set()
+                    while (_ie_layer is not None
+                           and id(_ie_layer) not in _seen_layers):
+                        _seen_layers.add(id(_ie_layer))
+                        _ies_list.append(_ie_layer)
+                        try:
+                            _ie_layer = _ie_layer.payload
+                        except AttributeError:
+                            break
+                    for _ie in _ies_list:
+                        try:
+                            if getattr(_ie, "ID", None) == 0:
+                                _raw = getattr(_ie, "info", b"")
+                                if not isinstance(_raw, bytes):
+                                    try:
+                                        _raw = bytes(_raw)
+                                    except (TypeError, ValueError):
+                                        continue
+                                _ssid = _raw.decode(
+                                    "utf-8", errors="ignore"
+                                ).strip()
+                                if _ssid:
+                                    with lock:
+                                        hidden_ssids.setdefault(
+                                            _b_key, set()
+                                        ).add(_ssid)
+                                break
+                        except (AttributeError, TypeError):
+                            continue
+        except (AttributeError, TypeError):
+            pass
+
+        try:
+            result = processor.process(pkt)
+        except (AttributeError, TypeError, ValueError, IndexError):
+            return
+        if not result:
+            return
+        bssid = result.get("bssid")
+        if not bssid:
+            return
+        bssid_key = str(bssid).lower()
+        _raw_sig = result.get("signal")
+        try:
+            _sig_int = int(_raw_sig) if _raw_sig is not None else None
+        except (TypeError, ValueError):
+            _sig_int = None
+        with lock:
+            existing = seen.get(bssid_key)
+            if existing is not None:
+                if _raw_sig is not None:
+                    existing["signal"] = _raw_sig
+                if _sig_int is not None:
+                    existing.setdefault("signal_samples", []).append(_sig_int)
+                existing["last_seen_ts"] = time.time()
+                new_ies = result.get("decoded_ies") or {}
+                if new_ies:
+                    existing["decoded_ies"] = new_ies
+                return
+            _now = time.time()
+            seen[bssid_key] = {
+                "ssid": result.get("ssid", ""),
+                "bssid": bssid,
+                "channel": result.get("channel", 0),
+                "signal": result.get("signal", -100),
+                "encryption": result.get("encryption", "UNKNOWN"),
+                "decoded_ies": result.get("decoded_ies") or {},
+                "signal_samples": [_sig_int] if _sig_int is not None else [],
+                "first_seen_ts": _now,
+                "last_seen_ts": _now,
+            }
+
+    _ch_list = list(channels) if channels else []
+    if _ch_list:
+        _say(
+            f"[scan-once] Interface={iface} Dauer={seconds}s "
+            f"Kanäle={_ch_list} dwell={dwell}s",
+            file=sys.stderr,
+        )
+    else:
+        _say(
+            f"[scan-once] Interface={iface} Dauer={seconds}s "
+            f"(kein Kanal-Hopping)",
+            file=sys.stderr,
+        )
+
+    # Deep-Mode: Dwell auf 1.0s, mindestens 3 Rotationszyklen
+    if scan_wlan_deep:
+        dwell = max(1.0, float(dwell))
+        if _ch_list:
+            min_seconds = int(3 * len(_ch_list) * dwell) + 1
+            if seconds < min_seconds:
+                _say(
+                    f"[scan-once] Deep-Mode: Dauer {seconds}s -> "
+                    f"{min_seconds}s (fuer 3 Zyklen \u00fcber "
+                    f"{len(_ch_list)} Kan\u00e4le)",
+                    file=sys.stderr,
+                )
+                seconds = min_seconds
+
+    stop_hopping = threading.Event()
+    hopper_thread = None
+    hop_stats = {"visits": {}, "cycles": 0}
+    if _ch_list:
+        hopper_thread = threading.Thread(
+            target=_scan_once_hopper,
+            args=(iface, _ch_list, dwell, stop_hopping, hop_stats),
+            daemon=True,
+            name="scan_once_hopper",
+        )
+        hopper_thread.start()
+
+    sniffer = None
+    try:
+        sniffer = scapy.AsyncSniffer(
+            iface=iface,
+            prn=_collect,
+            store=False,
+        )
+        sniffer.start()
+    except (OSError, RuntimeError, AttributeError, ValueError) as exc:
+        print(f"Sniffer-Start fehlgeschlagen: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        print("[scan-once] Abbruch durch Benutzer.", file=sys.stderr)
+    finally:
+        stop_hopping.set()
+        if hopper_thread is not None:
+            hopper_thread.join(timeout=2)
+        try:
+            if sniffer is not None:
+                sniffer.stop()
+        except (OSError, RuntimeError, AttributeError):
+            pass
+
+    nets = list(seen.values())
+    _revealed = _scan_once_apply_probe_ssids(nets, hidden_ssids)
+    if _ch_list:
+        _visited = set(hop_stats.get("visits", {}).keys())
+        _requested = set(_ch_list)
+        _never = sorted(_requested - _visited)
+        if _never:
+            _say(
+                f"[scan-once] WARNUNG: Kanal/Kan\u00e4le "
+                f"{_never} nie besucht (nicht abgedeckt)",
+                file=sys.stderr,
+            )
+        _with_frames = {int(n.get("channel") or 0) for n in nets}
+        _empty = sorted(_visited - _with_frames - {0})
+        if _empty:
+            _say(
+                f"[scan-once] Hinweis: Kanal/Kan\u00e4le "
+                f"{_empty} besucht, aber keine Frames empfangen",
+                file=sys.stderr,
+            )
+    if _revealed:
+        _say(
+            f"[scan-once] {_revealed} hidden SSID(s) durch "
+            f"Probe-Response aufgedeckt.",
+            file=sys.stderr,
+        )
+    _scan_started = float(started_ts)
+    _scan_ended = time.time()
+    for _n in nets:
+        _scan_once_fill_channel_from_ies(_n)
+        _n["band"] = _scan_once_band_of(_n.get("channel"))
+        _n["frequency_mhz"] = _scan_once_freq_mhz(_n.get("channel"))
+        _n["hidden"] = not bool(_n.get("ssid"))
+        _scan_once_derive_stats(_n, _scan_started, _scan_ended)
+    _scan_once_assign_families(nets)
+    _channels_obs = [int(n.get("channel") or 0) for n in nets
+                     if int(n.get("channel") or 0) > 0]
+    _total_beacons = sum(int(n.get("n_sightings", 0)) for n in nets)
+
+    if not dump_signals:
+        for _n in nets:
+            _n.pop("signal_samples", None)
+
+    if dump_full or out_file:
+        try:
+            _env = _scan_once_envelope(
+                nets, iface, list(_ch_list), _scan_started, _scan_ended,
+                dwell, _total_beacons, _channels_obs,
+                hop_stats=hop_stats,
+            )
+        except (TypeError, ValueError) as exc:
+            _say(f"Envelope-Aufbau fehlgeschlagen: {exc}",
+                  file=sys.stderr)
+            return 1
+        if out_file:
+            try:
+                with open(out_file, "w", encoding="utf-8") as _fh:
+                    json.dump(_env, _fh, indent=2, default=str,
+                              ensure_ascii=False)
+                try:
+                    os.chmod(out_file, 0o644)
+                except OSError:
+                    pass
+                _say(f"[scan-out] Envelope geschrieben: {out_file}",
+                      file=sys.stderr)
+            except (OSError, TypeError, ValueError) as exc:
+                print(f"scan-out Fehler: {exc}", file=sys.stderr)
+                return 1
+            return 0
+        try:
+            print(json.dumps(_env, indent=2, default=str,
+                             ensure_ascii=False))
+        except (TypeError, ValueError) as exc:
+            _say(f"Envelope-JSON fehlgeschlagen: {exc}",
+                  file=sys.stderr)
+            return 1
+        return 0
+
+    if dump_ies:
+        try:
+            if out_file:
+                with open(out_file, "w", encoding="utf-8") as _fh:
+                    json.dump(nets, _fh, indent=2, default=str,
+                              ensure_ascii=False)
+                try:
+                    os.chmod(out_file, 0o644)
+                except OSError:
+                    pass
+                _say(f"[scan-out] {len(nets)} Netzwerke: {out_file}",
+                      file=sys.stderr)
+            else:
+                print(json.dumps(nets, indent=2, default=str,
+                                 ensure_ascii=False))
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"JSON-Serialisierung fehlgeschlagen: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
+    if not nets:
+        _say("Keine Netzwerke empfangen.")
+        return 0
+
+    _say("=" * 92)
+    _say(f"  SCAN-ERGEBNIS ({len(nets)} Netzwerke, {seconds}s auf {iface})")
+    _say("=" * 92)
+    def _tbl_key(x):
+        v = x.get("signal_median")
+        if v is None:
+            v = x.get("signal") or -100
+        return -int(v)
+
+    hdr = (f"{'SSID':<24} {'BSSID':<18} {'Band':>4} {'Ch':>3} "
+           f"{'dBm':>4} {'Q':<3} {'n':>4} {'Conf':>4} "
+           f"{'Trend':<10} {'#IEs':>4}")
+    _say(hdr)
+    _say("-" * 92)
+    for n in sorted(nets, key=_tbl_key):
+        _ssid_raw = n.get("ssid")
+        _is_hidden = not _ssid_raw
+        ssid = "<hidden>" if _is_hidden else str(_ssid_raw)[:23]
+        _dBm = n.get("signal_median")
+        if _dBm is None:
+            _dBm = n.get("signal")
+        try:
+            _dBm_int = int(_dBm) if _dBm is not None else -100
+        except (TypeError, ValueError):
+            _dBm_int = -100
+        _q = _scan_quality_bar(_dBm_int)
+        _n = int(n.get("n_sightings") or 0)
+        _conf = n.get("confidence")
+        _conf_s = str(_conf) if _conf is not None else "\u2014"
+        _trend = str(n.get("signal_trend") or "\u2014")[:10]
+        _band = str(n.get("band") or "?")
+        ie_count = len(n.get("decoded_ies") or {})
+        _say(
+            f"{ssid:<24} {n.get('bssid', '?')!s:<18} "
+            f"{_band:>4} {int(n.get('channel') or 0):>3} "
+            f"{_dBm_int:>4} {_q:<3} {_n:>4} {_conf_s:>4} "
+            f"{_trend:<10} {ie_count:>4}"
+        )
+    _say("=" * 100)
+    total_ies = sum(len(n.get("decoded_ies") or {}) for n in nets)
+    _say(f"Summe IE-Typen: {total_ies} | --scan-dump-ies fuer Rohdaten")
+    _say("Tipp: --scan-explain zeigt dBm-Legende + Feldbeschreibung.")
+    return 0
+
+
+def _hw_dump_cli(output_path: str = "") -> int:
+    """v37-R17: --hw-dump [pfad] - Hardware-Diagnose sammeln.
+
+    Sammelt in EINER Textdatei:
+      - Umgebungsinfo (Host, Kernel, Distro, User)
+      - USB-Tree + WLAN-Module + DKMS-Status
+      - iw dev + iw phy + rfkill
+      - dmesg (WLAN-Filter)
+      - HardwareScanner-Report (JSON)
+      - HardwareVerifier-Report
+      - HardwareAdvisor-Audit
+
+    Standard-Pfad: ~/.wlan_ultimate/hw_dump_YYYYMMDD_HHMMSS.txt (0600)
+    """
+    import platform
+    from datetime import datetime as _dt
+
+    parts = []
+    sep = "=" * 72
+    dash = "-" * 72
+
+    def _section(title):
+        parts.append("")
+        parts.append(dash)
+        parts.append(f"  {title}")
+        parts.append(dash)
+
+    def _kv(key, value):
+        parts.append(f"  {key:<16} {value}")
+
+    def _run_cmd(cmd, timeout=5):
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+            return (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.SubprocessError) as e:
+            return f"[Fehler: {e}]"
+
+    # Header
+    parts.append(sep)
+    parts.append("  WLAN Ultimate Security Suite - HARDWARE-DUMP")
+    parts.append(sep)
+    _kv("Erzeugt:", _dt.now().isoformat(timespec="seconds"))
+
+    # Umgebung
+    _section("UMGEBUNG")
+    _kv("Hostname:", platform.node())
+    _kv("User:", os.environ.get("USER", "?"))
+    _kv("Python:", platform.python_version())
+    _kv("Kernel:", platform.release())
+    _kv("OS:", platform.platform())
+    _kv("Distro:", _run_cmd(["cat", "/etc/os-release"]).split("\n")[0:5])
+    _kv("EUID:", str(os.geteuid() if hasattr(os, "geteuid") else -1))
+
+    # lsb_release (falls vorhanden)
+    try:
+        rc, out, _ = HardwareVerifier._run(
+            ["lsb_release", "-a"], timeout=3
+        )
+        if rc == 0 and out:
+            _section("LSB_RELEASE")
+            for line in out.splitlines():
+                parts.append(f"  {line}")
+    except Exception:
+        pass
+
+    # USB
+    _section("USB-GERAETE (lsusb)")
+    for line in _run_cmd(["lsusb"]).splitlines():
+        parts.append(f"  {line}")
+
+    parts.append("")
+    parts.append("USB-TREE (lsusb -t):")
+    for line in _run_cmd(["lsusb", "-t"]).splitlines():
+        parts.append(f"  {line}")
+
+    # WLAN-Module
+    _section("GELADENE WLAN-MODULE")
+    for line in _run_cmd(["lsmod"]).splitlines():
+        if any(
+            kw in line.lower()
+            for kw in ("rtl", "mt76", "mt79", "ath9k", "ath10k",
+                       "ath11k", "ath12k", "rt2800", "rt73",
+                       "iwlwifi", "brcmfmac", "cfg80211",
+                       "mac80211", "88xxau", "8187")
+        ):
+            parts.append(f"  {line}")
+
+    # DKMS
+    _section("DKMS-STATUS")
+    dkms_out = _run_cmd(["dkms", "status"])
+    if "Fehler" not in dkms_out and dkms_out.strip():
+        for line in dkms_out.splitlines():
+            parts.append(f"  {line}")
+    else:
+        parts.append("  (dkms nicht verfuegbar oder keine Module)")
+
+    # iw dev
+    _section("IW DEV")
+    for line in _run_cmd(["iw", "dev"]).splitlines():
+        parts.append(f"  {line}")
+
+    # iw reg
+    _section("IW REG (Regulatory)")
+    for line in _run_cmd(["iw", "reg", "get"]).splitlines()[:15]:
+        parts.append(f"  {line}")
+
+    # iw phy pro phy
+    _section("IW PHY (Faehigkeiten pro phy)")
+    try:
+        ifaces = HardwareScanner()._get_wlan_iface_names()
+    except Exception:
+        ifaces = []
+    phy_seen = set()
+    for iface in ifaces:
+        phy = HardwareVerifier._get_phy(iface)
+        if not phy or phy in phy_seen:
+            continue
+        phy_seen.add(phy)
+        parts.append("")
+        parts.append(f"  --- {phy} (fuer iface {iface}) ---")
+        out = _run_cmd(["iw", "phy", phy, "info"], timeout=8)
+        # Nur relevante Zeilen
+        want = False
+        for line in out.splitlines():
+            ls = line.strip()
+            if (
+                "Supported interface modes" in ls
+                or (ls.startswith("*") and want)
+                or "Band" in ls
+                or "valid interface" in ls.lower()
+                or "radar detection" in ls.lower()
+                or "software interface modes" in ls.lower()
+            ):
+                parts.append(f"  {line}")
+                want = True
+            elif ls.startswith("*") and want:
+                parts.append(f"  {line}")
+            elif not ls:
+                want = False
+
+    # rfkill
+    _section("RFKILL")
+    for line in _run_cmd(["rfkill", "list"]).splitlines():
+        parts.append(f"  {line}")
+
+    # dmesg
+    _section("DMESG (WLAN/USB-Filter, letzte 100 Zeilen)")
+    dmesg_out = _run_cmd(
+        ["bash", "-c",
+         "dmesg 2>/dev/null | grep -iE 'wlan|wifi|firmware|usb|"
+         "80211|rtl|mt76|ath' | tail -100"],
+        timeout=5,
+    )
+    if dmesg_out.strip():
+        for line in dmesg_out.splitlines():
+            parts.append(f"  {line}")
+    else:
+        parts.append("  (leer oder dmesg ohne root nicht lesbar)")
+
+    # HardwareScanner-JSON
+    _section("HARDWARE-SCANNER (JSON)")
+    try:
+        scanner = HardwareScanner()
+        report = scanner.full_report()
+        json_out = scanner.report_to_json(report, indent=2)
+        for line in json_out.splitlines():
+            parts.append(f"  {line}")
+    except Exception as e:
+        parts.append(f"  [Fehler: {str(e)[:200]}]")
+
+    # HardwareVerifier
+    _section("HARDWARE-VERIFIKATION")
+    try:
+        verifier = HardwareVerifier()
+        pairs = []
+        for a in report.get("wlan_adapters", []):
+            usb_id = a.get("usb_id", "")
+            claimed = WiFiAdapterCatalog.lookup(usb_id)
+            if not claimed:
+                claimed = {
+                    "model": a.get("catalog_model", a.get("iface", "?")),
+                    "monitor": a.get("supports_monitor", False),
+                    "injection": a.get("supports_injection", False),
+                    "ap_mode": a.get("supports_ap", False),
+                    "active_monitor": a.get(
+                        "supports_active_monitor", False
+                    ),
+                    "vif": a.get("supports_vif", False),
+                    "driver": a.get("driver", ""),
+                }
+            pairs.append((a.get("iface", ""), claimed))
+        vrep = verifier.verify_all(pairs)
+        for line in verifier.format_report(vrep).splitlines():
+            parts.append(f"  {line}")
+    except Exception as e:
+        parts.append(f"  [Fehler: {str(e)[:200]}]")
+
+    # HardwareAdvisor
+    _section("HARDWARE-ADVISOR")
+    try:
+        audit = HardwareAdvisor.audit()
+        for line in HardwareAdvisor.format_audit(audit).splitlines():
+            parts.append(f"  {line}")
+    except Exception as e:
+        parts.append(f"  [Fehler: {str(e)[:200]}]")
+
+    parts.append("")
+    parts.append(sep)
+    parts.append("  ENDE HARDWARE-DUMP")
+    parts.append(sep)
+
+    content = "\n".join(parts)
+
+    # Ziel-Pfad
+    if not output_path:
+        try:
+            base = Path.home() / ".wlan_ultimate"
+            base.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            base = Path.home()
+        fname = "hw_dump_" + _dt.now().strftime("%Y%m%d_%H%M%S") + ".txt"
+        target = base / fname
+    else:
+        target = Path(output_path)
+
+    try:
+        target.write_text(content, encoding="utf-8")
+        try:
+            os.chmod(target, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        print(f"Fehler beim Schreiben: {e}")
+        return 1
+
+    size_kb = target.stat().st_size / 1024
+    print(f"Hardware-Dump erstellt: {target}")
+    print(f"Groesse: {size_kb:.1f} KiB")
+    print("")
+    print("Diesen Report koennen Sie an Bug-Reports anhaengen.")
+    return 0
+
+
+def _hw_bt_cli() -> int:
+    """v37-R16: --hw-bt - Bluetooth-Dongle-Katalog + Live-Status."""
+    print("=" * 72)
+    print("  BLUETOOTH-STATUS + KATALOG")
+    print("=" * 72)
+    print("")
+    # Live-Status
+    scanner = HardwareScanner()
+    bt = scanner.scan_bluetooth()
+    print("-- Aktueller Status --")
+    print(f"  Verfuegbar:   {'JA' if bt['available'] else 'NEIN'}")
+    print(
+        f"  Kernel-Modul: "
+        f"{'geladen' if bt['kernel_support'] else 'fehlt'}"
+    )
+    print(
+        f"  bluez:        "
+        f"{'installiert' if bt['bluez_installed'] else 'fehlt'}"
+    )
+    print(
+        f"  hcitool:      "
+        f"{'installiert' if bt['hcitool_installed'] else 'fehlt'}"
+    )
+    if bt["adapters"]:
+        print(f"  Adapter:      {', '.join(bt['adapters'])}")
+    if bt["note"]:
+        print(f"  Notiz:        {bt['note']}")
+    print("")
+    # Katalog
+    print(BluetoothCatalog.render_full_report())
+    return 0
+
+
+
+
 
 
 def _hw_compare_cli(usb_ids_csv: str) -> int:
@@ -82710,6 +91367,486 @@ def _run_startup_deep_sync() -> dict:
         return _deep_sync_registries()
     except (NameError, AttributeError, RuntimeError):
         return {}
+
+
+
+
+@dataclass
+class AntennaInfo:
+    """Eine WLAN-Antenne mit ihren technischen Daten.
+
+    Anschluss-Konventionen:
+      "RP-SMA Male"  -> direkt an Alfa-Adapter (RP-SMA Female) schraubbar
+      "RP-SMA Female" -> braucht RP-SMA-Male-Kabel/Adapter
+      "N-Male"       -> braucht N-Female-Kupplung oder N-Adapter
+      "N-Female"     -> braucht N-Male-Kabel/Adapter
+    """
+    model: str
+    vendor: str = "Alfa"
+    gain_2g_dbi: float = 0.0
+    gain_5g_dbi: float = 0.0
+    gain_6g_dbi: float = 0.0
+    antenna_type: str = "omni"  # "omni" | "panel" | "dipole"
+    connector: str = "RP-SMA Male"
+    indoor: bool = True
+    outdoor: bool = False
+    length_mm: int = 0
+    weight_g: int = 0
+    price_eur: float = 0.0
+    notes: str = ""
+    recommended_for: list = field(default_factory=list)
+
+    def is_dual_band(self) -> bool:
+        return self.gain_2g_dbi > 0 and self.gain_5g_dbi > 0
+
+    def is_tri_band(self) -> bool:
+        return (
+            self.gain_2g_dbi > 0
+            and self.gain_5g_dbi > 0
+            and self.gain_6g_dbi > 0
+        )
+
+    def needs_antenna_adapter(self) -> bool:
+        """True, wenn der Anschluss NICHT direkt an Alfa-Adapter passt."""
+        return self.connector != "RP-SMA Male"
+
+    def total_gain(self) -> float:
+        return self.gain_2g_dbi + self.gain_5g_dbi
+
+
+class AntennaCatalog:
+    """Katalog empfohlener WLAN-Antennen (Stand 2026, Getic-Preise).
+
+    Nur empirisch belegte oder offiziell spezifizierte Daten.
+    Keine spekulativen Gain-Werte. Anschluss-Typen werden NICHT geraten.
+    """
+
+    ANTENNAS = {
+        # ── Serienantennen (in Adaptern enthalten) ────────────────
+        "ALFA-STOCK-5DBI": AntennaInfo(
+            model="Alfa Stock 5dBi Dipole",
+            gain_2g_dbi=5.0, gain_5g_dbi=5.0,
+            antenna_type="dipole", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=0.0,
+            notes="Mitgeliefert bei ACH, ACHM, ACM. Kein separater Kauf.",
+            recommended_for=["ach", "achm", "acm"],
+        ),
+        # ── Indoor, Dual-Band ─────────────────────────────────────
+        "ARS-25-57A": AntennaInfo(
+            model="Alfa ARS-25-57A Zimmerantenne 5/7 dBi",
+            gain_2g_dbi=5.0, gain_5g_dbi=7.0,
+            antenna_type="omni", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=12.15,
+            notes="Beste Allround-Indoor-Wahl. Direkt am Adapter.",
+            recommended_for=["ach", "achm", "acm"],
+        ),
+        "APA-M25": AntennaInfo(
+            model="Alfa APA-M25 Panel Indoor 8/10 dBi",
+            gain_2g_dbi=8.0, gain_5g_dbi=10.0,
+            antenna_type="panel", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=16.27,
+            notes="Richtantenne 66deg horizontal. Nur mit Ausrichtung.",
+            recommended_for=[],
+        ),
+        "APA-M25-6E": AntennaInfo(
+            model="Alfa APA-M25-6E Panel Indoor 8/10/9 dBi",
+            gain_2g_dbi=8.0, gain_5g_dbi=10.0, gain_6g_dbi=9.0,
+            antenna_type="panel", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=15.58,
+            notes="Tri-Band-Richtantenne. 6 GHz fuer WiFi 6E.",
+            recommended_for=[],
+        ),
+        "APA-M04": AntennaInfo(
+            model="Alfa APA-M04 Panel Indoor 7 dBi",
+            gain_2g_dbi=7.0, gain_5g_dbi=0.0,
+            antenna_type="panel", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=9.00,
+            notes="Nur 2.4 GHz. Richtantenne.",
+            recommended_for=[],
+        ),
+        "ARS-N19": AntennaInfo(
+            model="Alfa ARS-N19 Indoor 9 dBi",
+            gain_2g_dbi=9.0, gain_5g_dbi=0.0,
+            antenna_type="omni", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=6.60,
+            notes="Nur 2.4 GHz. Hoher Gewinn, aber kein 5 GHz.",
+            recommended_for=[],
+        ),
+        "ARS-N19M": AntennaInfo(
+            model="Alfa ARS-N19M 2.4GHz Dipol 9dBi Magnetfuss",
+            gain_2g_dbi=9.0, gain_5g_dbi=0.0,
+            antenna_type="omni", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=13.09,
+            notes="Nur 2.4 GHz. Magnetfuss fuer flexible Position.",
+            recommended_for=[],
+        ),
+        "ARS-NT5B7": AntennaInfo(
+            model="Alfa ARS-NT5B7 WiFi 6E Dipol 4 dBi",
+            gain_2g_dbi=4.0, gain_5g_dbi=4.0, gain_6g_dbi=4.0,
+            antenna_type="dipole", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=4.14,
+            notes="Tri-Band, aber nur 4 dBi. Schwacher Gewinn.",
+            recommended_for=[],
+        ),
+        "ARS-WIFI6E-M2": AntennaInfo(
+            model="Alfa ARS-WiFi6E-M2 Omni-Zimmerantenne",
+            gain_2g_dbi=0.0, gain_5g_dbi=0.0, gain_6g_dbi=0.0,
+            antenna_type="omni", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=23.70,
+            notes="Genaue Gain-Werte nicht spezifiziert. WiFi 6E.",
+            recommended_for=[],
+        ),
+        # ── Indoor, WLAN + Bluetooth ──────────────────────────────
+        "AXM": AntennaInfo(
+            model="Alfa AWUS036AXM (Adapter, kein Antennenkauf)",
+            gain_2g_dbi=0.0, gain_5g_dbi=0.0, gain_6g_dbi=0.0,
+            antenna_type="dipole", connector="RP-SMA Male",
+            indoor=True, outdoor=False,
+            price_eur=26.89,
+            notes="WiFi 6E + BT 5.2 Kombi. MT7921AUN. "
+                  "Monitor-Mode im mt7921u-Treiber ab Kernel 6.18 broken. "
+                  "Kein reiner BT-Adapter.",
+            recommended_for=[],
+        ),
+        # ── Outdoor, Dual-Band ────────────────────────────────────
+        "AOA-2458-79AM": AntennaInfo(
+            model="Alfa AOA-2458-79AM Omni Outdoor 7/9 dBi (N-Male)",
+            gain_2g_dbi=7.0, gain_5g_dbi=9.0,
+            antenna_type="omni", connector="N-Male",
+            indoor=False, outdoor=True,
+            length_mm=322, weight_g=155,
+            price_eur=19.68,
+            notes="Aussenantenne. Braucht N-Adapter + "
+                  "Koaxialkabel. Nur freistehend betreiben.",
+            recommended_for=[],
+        ),
+        "AOA-2458-79AF": AntennaInfo(
+            model="Alfa AOA-2458-79AF Omni Outdoor 7/9 dBi (N-Female)",
+            gain_2g_dbi=7.0, gain_5g_dbi=9.0,
+            antenna_type="omni", connector="N-Female",
+            indoor=False, outdoor=True,
+            length_mm=317, weight_g=200,
+            price_eur=19.68,
+            notes="Aussenantenne. Braucht N-Adapter + "
+                  "Koaxialkabel. Nur freistehend betreiben.",
+            recommended_for=[],
+        ),
+        "AOA-2458-46ACM": AntennaInfo(
+            model="Alfa AOA-2458-46ACM 4/6 dBi N-Male",
+            gain_2g_dbi=4.0, gain_5g_dbi=6.0,
+            antenna_type="omni", connector="N-Male",
+            indoor=False, outdoor=True,
+            price_eur=11.75,
+            notes="Guenstigste Aussenantenne. Niedrigerer Gain.",
+            recommended_for=[],
+        ),
+        "APA-L2458-08A": AntennaInfo(
+            model="Alfa APA-L2458-08A Panel Outdoor 8 dBi N-Female",
+            gain_2g_dbi=8.0, gain_5g_dbi=8.0,
+            antenna_type="panel", connector="N-Female",
+            indoor=False, outdoor=True,
+            price_eur=27.41,
+            notes="Aussen-Richtantenne. Benoetigt N-Male-Adapter.",
+            recommended_for=[],
+        ),
+        "AOA-5815": AntennaInfo(
+            model="Alfa AOA-5815 5GHz Outdoor 15 dBi N-Female",
+            gain_2g_dbi=0.0, gain_5g_dbi=15.0,
+            antenna_type="omni", connector="N-Female",
+            indoor=False, outdoor=True,
+            price_eur=60.59,
+            notes="Nur 5 GHz. Sehr hoher Gain. Richtantenne.",
+            recommended_for=[],
+        ),
+        # ── Koaxialkabel-Zubehoer ─────────────────────────────────
+        "CABLE-N-RPSMA-3M": AntennaInfo(
+            model="N-Stecker auf RP-SMA-Stecker Koaxialkabel 3m",
+            gain_2g_dbi=0.0, gain_5g_dbi=0.0,
+            antenna_type="cable", connector="N-Male / RP-SMA Male",
+            indoor=True, outdoor=True,
+            price_eur=5.66,
+            notes="Verbindet AOA-Antennen mit RP-SMA-Adaptern. "
+                  "Daempfung ~0.3 dB/m auf 2.4 GHz, ~0.6 dB/m auf 5 GHz.",
+            recommended_for=[],
+        ),
+    }
+
+    @classmethod
+    def lookup(cls, model: str) -> AntennaInfo | None:
+        if not model:
+            return None
+        return cls.ANTENNAS.get(model)
+
+    @classmethod
+    def all_models(cls) -> list:
+        return sorted(cls.ANTENNAS.keys())
+
+    @classmethod
+    def find_indoor(cls) -> list:
+        return [a for a in cls.ANTENNAS.values()
+                if a.indoor and a.antenna_type != "cable"]
+
+    @classmethod
+    def find_outdoor(cls) -> list:
+        return [a for a in cls.ANTENNAS.values() if a.outdoor]
+
+    @classmethod
+    def find_dual_band(cls) -> list:
+        return [a for a in cls.ANTENNAS.values() if a.is_dual_band()]
+
+    @classmethod
+    def find_direct_mount(cls) -> list:
+        """Antennen, die direkt an Alfa-Adapter geschraubt werden koennen."""
+        return [
+            a for a in cls.ANTENNAS.values()
+            if a.connector == "RP-SMA Male"
+            and a.antenna_type != "cable"
+            and a.price_eur > 0  # Stock-Antennen ausschliessen
+        ]
+
+    @classmethod
+    def find_by_max_price(cls, price_eur: float) -> list:
+        return [
+            a for a in cls.ANTENNAS.values()
+            if 0 < a.price_eur <= price_eur and a.antenna_type != "cable"
+        ]
+
+    @classmethod
+    def recommended_for_achm(cls) -> list:
+        """Bestes Upgrade fuer den ACHM (1 Antennenbuchse, Indoor)."""
+        return sorted(
+            [a for a in cls.ANTENNAS.values()
+             if "achm" in a.recommended_for],
+            key=lambda a: -a.total_gain(),
+        )
+
+    @classmethod
+    def recommended_for_achc(cls) -> list:
+        """Empfehlung fuer ACH-C (2 Antennenbuchsen, MIMO braucht 2x identisch)."""
+        return sorted(
+            [a for a in cls.ANTENNAS.values()
+             if "ach" in a.recommended_for],
+            key=lambda a: -a.total_gain(),
+        )
+
+    @classmethod
+    def summary(cls) -> dict:
+        all_a = list(cls.ANTENNAS.values())
+        return {
+            "total": len(all_a),
+            "indoor": sum(1 for a in all_a if a.indoor),
+            "outdoor": sum(1 for a in all_a if a.outdoor),
+            "dual_band": sum(1 for a in all_a if a.is_dual_band()),
+            "tri_band": sum(1 for a in all_a if a.is_tri_band()),
+            "direct_mount": len(cls.find_direct_mount()),
+        }
+
+    @classmethod
+    def render_full_report(cls) -> str:
+        lines = ["=" * 72, "ANTENNA CATALOG", "=" * 72]
+        s = cls.summary()
+        lines.append(
+            "Gesamt: " + str(s["total"])
+            + "  |  Indoor: " + str(s["indoor"])
+            + "  |  Outdoor: " + str(s["outdoor"])
+            + "  |  Dual-Band: " + str(s["dual_band"])
+            + "  |  Tri-Band: " + str(s["tri_band"])
+        )
+        lines.append("")
+        for key in cls.all_models():
+            a = cls.ANTENNAS[key]
+            gain = []
+            if a.gain_2g_dbi:
+                gain.append(str(a.gain_2g_dbi) + " dBi @2.4")
+            if a.gain_5g_dbi:
+                gain.append(str(a.gain_5g_dbi) + " dBi @5")
+            if a.gain_6g_dbi:
+                gain.append(str(a.gain_6g_dbi) + " dBi @6")
+            gain_s = ", ".join(gain) if gain else "(kein Gain)"
+            price = (str(a.price_eur) + " EUR") if a.price_eur > 0 else "Stock"
+            lines.append(
+                "  " + key.ljust(20) + " | "
+                + gain_s.ljust(30) + " | "
+                + a.connector.ljust(15) + " | "
+                + price
+            )
+            if a.notes:
+                lines.append("      " + a.notes)
+        lines.append("=" * 72)
+        return "\n".join(lines)
+
+
+
+@dataclass
+class AntennaCompatibilityReport:
+    """Ergebnis einer Kompatibilitaetspruefung Adapter <-> Antenne."""
+    adapter_usb_id: str
+    antenna_model: str
+    fits: bool = False
+    needs_adapter: bool = False
+    needs_cable: bool = False
+    warnings: list = field(default_factory=list)
+    notes: list = field(default_factory=list)
+
+
+class AntennaCompatibility:
+    """Prueft, ob eine Antenne an einen Adapter passt.
+
+    Adapter-Anschluesse (Alfa-Standard): RP-SMA Female.
+    - RP-SMA Male -> direkt anschraubbar
+    - N-Male / N-Female -> Adapter auf RP-SMA noetig
+    - Aussenantennen brauchen zusaetzlich ein Koaxialkabel,
+      damit der Adapter nicht mechanisch belastet wird.
+    """
+
+    # Adapter-Anschluesse laut Alfa-Specs
+    ADAPTER_CONNECTORS = {
+        "0bda:8812": "RP-SMA Female",   # ACH-C
+        "0bda:881a": "RP-SMA Female",   # ACH
+        "0e8d:7610": "RP-SMA Female",   # ACHM
+        "0e8d:7612": "RP-SMA Female",   # ACM
+        "0bda:8187": "RP-SMA Female",   # AWUS036H
+    }
+
+    # Dampfungs-Konstanten fuer 3-m-Standardkoaxialkabel (RG-58-Klasse)
+    # in dB pro Meter. Konservative Mittelwerte.
+    CABLE_ATTENUATION_DB_PER_M = {
+        2.4: 0.30,
+        5.0: 0.60,
+        6.0: 0.75,
+    }
+
+    @classmethod
+    def adapter_connector(cls, usb_id: str) -> str:
+        if not usb_id:
+            return "unbekannt"
+        return cls.ADAPTER_CONNECTORS.get(usb_id.lower(), "unbekannt")
+
+    @classmethod
+    def check(cls, adapter_usb_id: str,
+              antenna_model: str) -> AntennaCompatibilityReport:
+        report = AntennaCompatibilityReport(
+            adapter_usb_id=adapter_usb_id or "",
+            antenna_model=antenna_model or "",
+        )
+        ant = AntennaCatalog.lookup(antenna_model)
+        if ant is None:
+            report.warnings.append(
+                "Antennen-Modell '" + str(antenna_model)
+                + "' nicht im Katalog."
+            )
+            return report
+
+        adapter_conn = cls.adapter_connector(adapter_usb_id)
+        if adapter_conn == "unbekannt":
+            report.warnings.append(
+                "Adapter-USB-ID '" + str(adapter_usb_id)
+                + "' nicht im Kompatibilitaets-Katalog."
+            )
+            return report
+
+        # Direkt oder Adapter noetig?
+        if ant.connector == "RP-SMA Male" and adapter_conn == "RP-SMA Female":
+            report.fits = True
+        elif ant.connector.startswith("N-"):
+            report.needs_adapter = True
+            report.fits = True
+            report.notes.append(
+                "N-Adapter auf RP-SMA Male noetig (nicht im Katalog)."
+            )
+        elif ant.connector == "RP-SMA Female":
+            report.needs_adapter = True
+            report.fits = True
+            report.notes.append(
+                "RP-SMA-Male-auf-RP-SMA-Male-Kabel noetig."
+            )
+        else:
+            report.warnings.append(
+                "Anschluss-Kombination nicht unterstuetzt: "
+                + ant.connector + " <-> " + adapter_conn
+            )
+
+        # Aussenantennen: Kabel + Warnung
+        if ant.outdoor:
+            report.needs_cable = True
+            report.notes.append(
+                "Aussenantenne: Koaxialkabel empfohlen, "
+                "sonst mechanische Belastung am RP-SMA-Port."
+            )
+            if ant.weight_g >= 100:
+                report.warnings.append(
+                    "Antennengewicht " + str(ant.weight_g)
+                    + " g: bei Direktmontage Bruchgefahr am Port."
+                )
+
+        # Kabel als eigenes Modell?
+        if ant.antenna_type == "cable":
+            report.warnings.append(
+                "Dies ist ein Kabel, keine Antenne."
+            )
+            report.fits = False
+
+        return report
+
+    @classmethod
+    def effective_gain(cls, gain_dbi: float, freq_ghz: float,
+                       cable_length_m: float = 0.0) -> float:
+        """Restgewinn nach Kabeldaempfung in dB.
+
+        freq_ghz: 2.4, 5.0, 6.0 (andere Werte werden auf 2.4 gerundet).
+        cable_length_m: 0 = Direktmontage, sonst Kabellaenge.
+        """
+        if cable_length_m <= 0:
+            return float(gain_dbi)
+        # Naechsten Frequenz-Key finden
+        keys = sorted(cls.CABLE_ATTENUATION_DB_PER_M.keys())
+        best = keys[0]
+        for k in keys:
+            if abs(freq_ghz - k) < abs(freq_ghz - best):
+                best = k
+        attn_per_m = cls.CABLE_ATTENUATION_DB_PER_M[best]
+        return float(gain_dbi) - attn_per_m * cable_length_m
+
+    @classmethod
+    def total_effective_gain(cls, antenna_model: str,
+                             freq_ghz: float,
+                             cable_length_m: float = 0.0) -> float:
+        ant = AntennaCatalog.lookup(antenna_model)
+        if ant is None:
+            return 0.0
+        if freq_ghz < 3.0:
+            base = ant.gain_2g_dbi
+        elif freq_ghz < 5.5:
+            base = ant.gain_5g_dbi
+        else:
+            base = ant.gain_6g_dbi
+        return cls.effective_gain(base, freq_ghz, cable_length_m)
+
+    @classmethod
+    def render_report(cls, report: AntennaCompatibilityReport) -> str:
+        lines = [
+            "Antennen-Kompatibilitaet",
+            "  Adapter : " + report.adapter_usb_id,
+            "  Antenne : " + report.antenna_model,
+            "  Passt   : " + ("JA" if report.fits else "NEIN"),
+            "  Adapter : " + ("ja" if report.needs_adapter else "nein"),
+            "  Kabel   : " + ("ja" if report.needs_cable else "nein"),
+        ]
+        for n in report.notes:
+            lines.append("  - " + n)
+        for w in report.warnings:
+            lines.append("  ! " + w)
+        return "\n".join(lines)
+
 
 
 class WorkflowBlockType(Enum):
@@ -83624,7 +92761,7 @@ if __name__ == "__main__":
         )
         os.environ["QT_QPA_PLATFORM"] = "xcb"
 
-    if os.geteuid() != 0:
+    if os.geteuid() != 0 and not _QUIET_CLI:
         print(
             "⚠️ Sie sind nicht als root angemeldet. Einige Funktionen (Monitor-Modus, Packet Injection) werden nicht verfügbar sein."
         )
