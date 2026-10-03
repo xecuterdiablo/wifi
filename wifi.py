@@ -70,7 +70,6 @@ import zipfile
 from collections import defaultdict, deque
 from collections.abc import Callable
 
-# v10.6: Alias fuer Workflow-Composer (kurzschreibweise)
 _defaultdict = defaultdict
 
 from contextlib import contextmanager
@@ -81,6 +80,10 @@ from enum import Enum, IntEnum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+import os as _os
+import re as _re  # noqa: F401
+import sys as _sys  # noqa: F401
 
 
 def _prewarm_libxml2() -> None:
@@ -101,14 +104,14 @@ def _prewarm_libxml2() -> None:
 _prewarm_libxml2()
 
 
-def _ensure_secure_config_dirs() -> list:
+def _ensure_secure_config_dirs() -> list[str]:
     """P7.7: AppKonstanten.*_DIR mit Mode 0o700 anlegen bzw. korrigieren.
 
     Best-effort, silent. Nur Verzeichnisse, die dem aktuellen User
     gehoeren werden angepasst (root-owned Leichen bleiben unberuehrt).
     Rueckgabe: Liste von Problem-Strings (leer wenn alles OK).
     """
-    problems = []
+    problems: list[str] = []
     names = (
         "KONFIG_DIR", "LOG_DIR", "REPORT_DIR", "CAPTURE_DIR",
         "EXPORT_DIR", "TEMP_DIR", "BACKUP_DIR", "CACHE_DIR",
@@ -148,13 +151,9 @@ def _ensure_secure_config_dirs() -> list:
     return problems
 
 
-
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="sqlite3")
 
 
-# ────────────────────────────────────────────────────────────────
-# 3.5 DiagnosticHook (v10.9) — stille Exceptions sichtbar machen
-# ────────────────────────────────────────────────────────────────
 class DiagnosticHook:
     """Zentraler Exception-Hook fuer Main-Thread + alle Threads.
 
@@ -164,11 +163,11 @@ class DiagnosticHook:
       - Idempotent: install() kann beliebig oft gerufen werden.
     """
 
-    _installed = False
-    _logger = None
+    _installed: bool = False
+    _logger: logging.Logger | None = None
 
     @classmethod
-    def install(cls, logger=None) -> None:
+    def install(cls, logger: logging.Logger | None = None) -> None:
         if logger is not None:
             cls._logger = logger
         if cls._logger is None:
@@ -183,9 +182,17 @@ class DiagnosticHook:
             pass
 
     @classmethod
-    def _format(cls, exc_type, exc_value, exc_tb, thread_name="main"):
+    def _format(
+        cls,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        exc_tb: Any,
+        thread_name: str = "main",
+    ) -> str:
         try:
-            body = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+            body = "".join(
+                traceback.format_exception(exc_type, exc_value, exc_tb)
+            )
         except (AttributeError, TypeError):
             body = repr(exc_value)
         name = exc_type.__name__ if exc_type else "?"
@@ -195,7 +202,12 @@ class DiagnosticHook:
         )
 
     @classmethod
-    def _main_hook(cls, exc_type, exc_value, exc_tb):
+    def _main_hook(
+        cls,
+        exc_type: type[BaseException],
+        exc_value: BaseException,
+        exc_tb: Any,
+    ) -> None:
         if cls._logger is not None:
             try:
                 cls._logger.error(
@@ -207,7 +219,7 @@ class DiagnosticHook:
             sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     @classmethod
-    def _thread_hook(cls, args):
+    def _thread_hook(cls, args: threading.ExceptHookArgs) -> None:
         name = getattr(getattr(args, "thread", None), "name", "?")
         if cls._logger is not None:
             try:
@@ -220,9 +232,9 @@ class DiagnosticHook:
                 pass
 
 
-def _thread_wrap(fn, label: str = ""):
+def _thread_wrap(fn: Callable[..., Any], label: str = "") -> Callable[..., Any]:
     """Klammert eine Thread-Zielfunktion in Try/Except mit Logging."""
-    def _runner(*a, **kw):
+    def _runner(*a: Any, **kw: Any) -> Any:
         try:
             return fn(*a, **kw)
         except BaseException as exc:
@@ -242,15 +254,25 @@ class DiagContext:
 
     Beispiel: with DiagContext("evil-twin.preflight", self.logger): ...
     """
-    def __init__(self, label: str, logger=None, reraise: bool = True):
+    def __init__(
+        self,
+        label: str,
+        logger: logging.Logger | None = None,
+        reraise: bool = True,
+    ) -> None:
         self.label = label
         self.logger = logger or logging.getLogger("wlan_ultimate.Diagnostics")
         self.reraise = reraise
 
-    def __enter__(self):
+    def __enter__(self) -> DiagContext:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> bool:
         if exc_type is None:
             return False
         try:
@@ -264,117 +286,179 @@ class DiagContext:
 
 
 class DiagnosticReport:
-    """P3: Aggregiert [DIAG-EXC]/[DIAG-THREAD]/[DIAG-CTX] aus dem Log."""
+    """Aggregiert [DIAG-EXC]/[DIAG-THREAD]/[DIAG-CTX] aus dem Log.
 
+    Parst Log-Zeilen des Formats:
+        2024-01-15 14:32:01,123 [ERROR] logger.name:42 – [DIAG-CTX] label: msg
+    und extrahiert strukturierte Eintraege fuer Auswertung/Report.
+    """
+
+    # ── Regexe (einmal kompiliert, modulweit geteilt) ──────────────
+    # Hinweis: "\u2013" ist der en-dash (–) zwischen logger:line und payload.
     LINE_RE = re.compile(
         r"^(?P<Y>\d{4})-(?P<Mo>\d{2})-(?P<D>\d{2}) "
         r"(?P<H>\d{2}):(?P<Mi>\d{2}):(?P<S>\d{2}),(?P<ms>\d{3})"
         r"\s+\[(?P<level>[A-Z]+)\]\s+"
         r"(?P<logger>[^:\s]+):(?P<line>\d+)\s+"
-        + chr(0x2013) +
-        r"\s+(?P<payload>\[DIAG-[A-Z]+\].*)$"
-    )
-    CTX_RE = re.compile(r"^\[DIAG-CTX\]\s+(?P<label>[^:]+):\s+(?P<msg>.*)$")
-    THREAD_RE = re.compile(r"^\[DIAG-THREAD\]\s+(?P<label>[^:]+):\s+(?P<msg>.*)$")
-    EXC_RE = re.compile(
-        r"^\[DIAG-EXC\]\s+thread=(?P<thread>\S+)\s+"
-        r"type=(?P<type>\S+)\s+msg=(?P<msg>.*)$"
+        r"\u2013\s+"
+        r"(?P<payload>\[DIAG-[A-Z]+\].*)$"
     )
 
-    def __init__(self, log_path=None):
+    # Dispatch: welcher DIAG-Typ wird mit welchem Regex verarbeitet.
+    # Reihenfolge ist wichtig -- erster Treffer gewinnt.
+    _PAYLOAD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+        (
+            "CTX",
+            re.compile(r"^\[DIAG-CTX\]\s+(?P<label>[^:]+):\s+(?P<msg>.*)$"),
+        ),
+        (
+            "THREAD",
+            re.compile(
+                r"^\[DIAG-THREAD\]\s+(?P<label>[^:]+):\s+(?P<msg>.*)$"
+            ),
+        ),
+        (
+            "EXC",
+            re.compile(
+                r"^\[DIAG-EXC\]\s+thread=(?P<thread>\S+)\s+"
+                r"type=(?P<type>\S+)\s+msg=(?P<msg>.*)$"
+            ),
+        ),
+    )
+
+    def __init__(self, log_path: str | Path | None = None) -> None:
         if log_path is None:
             log_path = (
                 Path.home() / ".wlan_ultimate" / "logs" / "wlan_ultimate.log"
             )
-        self.log_path = Path(log_path)
-        self.entries = []
+        self.log_path: Path = Path(log_path)
+        self.entries: list[dict[str, Any]] = []
 
-    def scan(self, since_hours=None):
+    # ── Parsing ────────────────────────────────────────────────────
+
+    def scan(self, since_hours: float | None = None) -> list[dict[str, Any]]:
+        """Liest das Log und fuellt self.entries.
+
+        since_hours: nur Eintraege der letzten N Stunden (None = alle).
+        """
         self.entries = []
         if not self.log_path.exists():
             return self.entries
-        cutoff = None
+
+        cutoff: float | None = None
         if since_hours is not None:
             cutoff = time.time() - float(since_hours) * 3600.0
+
         try:
             text = self.log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return self.entries
+
         for raw in text.splitlines():
-            m = self.LINE_RE.match(raw)
-            if not m:
-                continue
-            try:
-                ts = time.mktime((
-                    int(m.group("Y")), int(m.group("Mo")), int(m.group("D")),
-                    int(m.group("H")), int(m.group("Mi")), int(m.group("S")),
-                    0, 0, -1,
-                )) + int(m.group("ms")) / 1000.0
-            except (ValueError, OverflowError):
-                continue
-            if cutoff is not None and ts < cutoff:
-                continue
-            entry = {
-                "ts": ts,
-                "level": m.group("level"),
-                "logger": m.group("logger"),
-                "src_line": int(m.group("line")),
-            }
-            payload = m.group("payload")
-            cm = self.CTX_RE.match(payload)
-            if cm:
-                entry.update(kind="CTX", label=cm.group("label").strip(),
-                             msg=cm.group("msg").strip())
+            entry = self._parse_line(raw, cutoff)
+            if entry is not None:
                 self.entries.append(entry)
-                continue
-            tm = self.THREAD_RE.match(payload)
-            if tm:
-                entry.update(kind="THREAD", label=tm.group("label").strip(),
-                             msg=tm.group("msg").strip())
-                self.entries.append(entry)
-                continue
-            em = self.EXC_RE.match(payload)
-            if em:
-                entry.update(kind="EXC", thread=em.group("thread"),
-                             type=em.group("type"), msg=em.group("msg").strip())
-                self.entries.append(entry)
+
         return self.entries
 
-    def top_exceptions(self, n=10):
-        counts = {}
-        for e in self.entries:
-            key = (e.get("kind", "?"),
-                   e.get("label") or e.get("type") or "?")
+    @classmethod
+    def _parse_line(
+        cls, raw: str, cutoff: float | None
+    ) -> dict[str, Any] | None:
+        """Parst eine Log-Zeile. None wenn kein DIAG-Eintrag."""
+        m = cls.LINE_RE.match(raw)
+        if not m:
+            return None
+
+        try:
+            ts = datetime(
+                int(m["Y"]), int(m["Mo"]), int(m["D"]),
+                int(m["H"]), int(m["Mi"]), int(m["S"]),
+                int(m["ms"]) * 1000,
+                tzinfo=cls._LOCAL_TZ,
+            ).timestamp()
+        except (ValueError, OverflowError):
+            return None
+
+        if cutoff is not None and ts < cutoff:
+            return None
+
+        entry: dict[str, Any] = {
+            "ts": ts,
+            "level": m["level"],
+            "logger": m["logger"],
+            "src_line": int(m["line"]),
+        }
+
+        payload = m["payload"]
+        for kind, pattern in cls._PAYLOAD_PATTERNS:
+            pm = pattern.match(payload)
+            if pm is None:
+                continue
+            groups = pm.groupdict()
+            entry["kind"] = kind
+            for key, value in groups.items():
+                entry[key] = value.strip()
+            return entry
+
+        # Unbekannter DIAG-Typ -- nicht verwerfen, sondern markieren.
+        entry["kind"] = "UNKNOWN"
+        entry["msg"] = payload
+        return entry
+
+    # ── Auswertung ─────────────────────────────────────────────────
+
+    def top_exceptions(
+        self, n: int = 10
+    ) -> list[tuple[tuple[str, str], int]]:
+        """Haeufigste Eintraege als [((kind, label), count), ...]."""
+        counts: dict[tuple[str, str], int] = {}
+        for entry in self.entries:
+            key = (
+                entry.get("kind", "?"),
+                entry.get("label") or entry.get("type") or "?",
+            )
             counts[key] = counts.get(key, 0) + 1
         return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
 
-    def trend_per_day(self):
-        by_day = {}
-        for e in self.entries:
-            day = time.strftime("%Y-%m-%d", time.localtime(e["ts"]))
+    def trend_per_day(self) -> dict[str, int]:
+        """Eintraege pro Tag als {YYYY-MM-DD: count}, chronologisch."""
+        by_day: dict[str, int] = {}
+        for entry in self.entries:
+            day = time.strftime(
+                "%Y-%m-%d", time.localtime(entry["ts"])
+            )
             by_day[day] = by_day.get(day, 0) + 1
         return dict(sorted(by_day.items()))
 
-    def render_text(self, n=10):
-        lines = [
+    # ── Ausgabe ────────────────────────────────────────────────────
+
+    def render_text(self, n: int = 10) -> str:
+        """Menschenlesbarer Report (fuer Konsole/Tab)."""
+        lines: list[str] = [
             "=== DiagnosticReport ===",
-            "Log: " + str(self.log_path),
-            "Eintraege: " + str(len(self.entries)),
+            f"Log: {self.log_path}",
+            f"Eintraege: {len(self.entries)}",
             "",
             "Top-Exceptions:",
         ]
+
         top = self.top_exceptions(n)
         if not top:
             lines.append("  (keine)")
-        for (kind, label), count in top:
-            lines.append(f"  {count:5d}  [{kind}] {label}")
+        else:
+            for (kind, label), count in top:
+                lines.append(f"  {count:5d}  [{kind}] {label}")
+
         lines.append("")
         lines.append("Trend pro Tag:")
         trend = self.trend_per_day()
         if not trend:
             lines.append("  (keine)")
-        for day, count in trend.items():
-            lines.append(f"  {day}  {count}")
+        else:
+            for day, count in trend.items():
+                lines.append(f"  {day}  {count}")
+
         return "\n".join(lines)
 
 @dataclass
@@ -395,21 +479,18 @@ class AdapterInfo:
     can_monitor: bool = False
     can_managed: bool = False
     can_ibss: bool = False
-    source: str = "iw"  # P6.6: "iw" | "iwconfig"
-
-    # P9.3: Kernel-gemeldete Interface-Kombinationen
-    # (aus "valid interface combinations" in `iw phy <phy> info`)
+    source: str = "iw"
     supports_multi_vif: bool = False
     max_total_interfaces: int = 1
     max_simultaneous_channels: int = 1
-    interface_combinations: list = field(default_factory=list)
-
-    # P9.3b: Active Monitor Mode (Kernel-gemeldet)
+    interface_combinations: list[dict[str, Any]] = field(default_factory=list)
     supports_active_monitor: bool = False
 
     def fingerprint(self) -> str:
         """P6.2: Stabile Identitaet = Treibername (NICHT iface).
-        Gleiche Modelle kollidieren — dann MAC als Tie-Breaker."""
+
+        Gleiche Modelle kollidieren — dann MAC als Tie-Breaker.
+        """
         return self.driver or self.iface
 
     def fingerprint_full(self) -> str:
@@ -419,7 +500,8 @@ class AdapterInfo:
         return self.iface
 
     def caps_str(self) -> str:
-        caps = []
+        """Faehigkeiten als 'AP, monitor, managed'-String."""
+        caps: list[str] = []
         if self.can_ap:
             caps.append("AP")
         if self.can_monitor:
@@ -428,7 +510,7 @@ class AdapterInfo:
             caps.append("managed")
         if self.can_ibss:
             caps.append("IBSS")
-        return ",".join(caps) or "-"
+        return ", ".join(caps) or "-"
 
     def describe(self) -> str:
         tp = f"{self.txpower_dbm:.0f}dBm" if self.txpower_dbm else "?dBm"
@@ -451,13 +533,25 @@ class AdapterCapabilities:
         r"^\s*\*\s+(?P<mode>IBSS|managed|AP|monitor|P2P-\S+)\s*$"
     )
 
+    # Modus-Mapping fuer iwconfig-Fallback:
+    #   iwconfig-Mode -> (iftype, can_managed, can_monitor, can_ap)
+    _IWCONFIG_MODES: dict[str, tuple[str, bool, bool, bool]] = {
+        "MANAGED": ("managed", True, False, False),
+        "AUTO": ("managed", True, False, False),
+        "MONITOR": ("monitor", False, True, False),
+        "MASTER": ("AP", False, False, True),
+        "AD-HOC": ("IBSS", False, False, False),
+    }
+
+    # ── Interface-Erkennung ────────────────────────────────────────
+
     @classmethod
-    def _wireless_ifaces(cls) -> list:
+    def _wireless_ifaces(cls) -> list[str]:
         """P6.6: Findet WLAN-Interfaces ohne iw ueber sysfs.
 
         /sys/class/net/<iface>/wireless/ existiert nur fuer WLAN.
         """
-        out = []
+        out: list[str] = []
         base = Path("/sys/class/net")
         try:
             if not base.is_dir():
@@ -473,82 +567,91 @@ class AdapterCapabilities:
         return out
 
     @classmethod
-    def _freq_to_channel(cls, ghz: float):
-        """P6.6: MHz -> Kanal (2.4/5 GHz), oder None."""
+    def _freq_to_channel(cls, ghz: float) -> int | None:
+        """P6.6/P10: MHz -> Kanal fuer 2.4/5/6 GHz, sonst None.
+
+        2.4 GHz: 2412-2484 (Kanal 1-14, Kanal 14 = 2484)
+        5 GHz  : 5180-5900 (Kanal 36-177, nur 20-MHz-Raster)
+        6 GHz  : 5955-7115 (Kanal 1-233, Wi-Fi 6E)
+        """
         try:
             mhz = round(float(ghz) * 1000)
         except (TypeError, ValueError):
             return None
+
+        # 2.4 GHz
         if 2412 <= mhz <= 2484:
             return 14 if mhz == 2484 else (mhz - 2407) // 5
-        # P8-Fix: 5-GHz-Kanaele beginnen bei 5180 MHz (Kanal 36).
-        # Der 5000-5179-Bereich liefert (mhz-5000)//5 == 0..35 --
-        # Kanal 0 existiert nicht, daher erst ab 5180.
+
+        # 5 GHz (Kanal 36 beginnt bei 5180 MHz)
         if 5180 <= mhz <= 5900:
             return (mhz - 5000) // 5
+
+        # 6 GHz (Wi-Fi 6E, Kanal 1 beginnt bei 5955 MHz)
+        if 5955 <= mhz <= 7115:
+            return (mhz - 5950) // 5
+
         return None
 
+    # ── Fallback via iwconfig ─────────────────────────────────────
+
     @classmethod
-    def _detect_via_iwconfig(cls, ifaces) -> list:
+    def _detect_via_iwconfig(cls, ifaces: list[str]) -> list[AdapterInfo]:
         """P6.6: Fallback-Erkennung via iwconfig (wireless-tools).
 
         Faehigkeiten sind konservativ: nur der aktuelle Mode zaehlt als
         bekannt. Bei Monitor/AP im Ist-Mode wird das entsprechende
         can_*-Flag gesetzt, sonst nur can_managed.
         """
-        mode_map = {
-            "MANAGED": ("managed", True, False, False),
-            "AUTO": ("managed", True, False, False),
-            "MONITOR": ("monitor", False, True, False),
-            "MASTER": ("AP", False, False, True),
-            "AD-HOC": ("IBSS", False, False, False),
-        }
-        adapters = []
+        adapters: list[AdapterInfo] = []
         for iface in ifaces:
-            out = cls._run(
-                ["iwconfig", iface], f"iwconfig[{iface}]"
-            )
+            out = cls._run(["iwconfig", iface], f"iwconfig[{iface}]")
             if not out.strip():
                 continue
+
             info = AdapterInfo(iface=iface, source="iwconfig")
             info.driver = cls._driver_for(iface)
+
             for line in out.splitlines():
                 m_mode = re.search(r"Mode:(\S+)", line)
                 if m_mode:
                     cur = m_mode.group(1).upper()
-                    if cur in mode_map:
-                        t, mg, mo, ap = mode_map[cur]
+                    if cur in cls._IWCONFIG_MODES:
+                        t, mg, mo, ap = cls._IWCONFIG_MODES[cur]
                         info.iftype = t
                         info.can_managed = mg
                         info.can_monitor = mo
                         info.can_ap = ap
                     else:
                         info.iftype = cur.lower()
-                m_mac = re.search(
-                    r"Access Point:\s*([0-9A-Fa-f:]{17})", line
-                )
+
+                m_mac = re.search(r"Access Point:\s*([0-9A-Fa-f:]{17})", line)
                 if m_mac:
                     info.mac = m_mac.group(1).upper()
-                m_tp = re.search(
-                    r"Tx-Power[=:]\s*(-?\d+)\s*dBm", line
-                )
+
+                m_tp = re.search(r"Tx-Power[=:]\s*(-?\d+)\s*dBm", line)
                 if m_tp:
                     try:
                         info.txpower_dbm = float(m_tp.group(1))
                     except ValueError:
                         pass
+
                 m_freq = re.search(r"Frequency:([\d.]+)\s*GHz", line)
                 if m_freq:
                     ch = cls._freq_to_channel(m_freq.group(1))
                     if ch is not None:
                         info.channel = ch
+
             adapters.append(info)
         return adapters
 
+    # ── Hilfsfunktionen ───────────────────────────────────────────
+
     @classmethod
-    def _run(cls, cmd, tag):
+    def _run(cls, cmd: list[str], tag: str) -> str:
+        """Fuehrt einen Befehl aus und liefert stdout (oder '')."""
         try:
-            rc, out, _ = CommandRunner.run(
+            _rc, out, _err = CommandRunner.run(
                 cmd,
                 subsystem="driver",
                 tag=tag,
@@ -561,6 +664,7 @@ class AdapterCapabilities:
 
     @classmethod
     def _driver_for(cls, iface: str) -> str:
+        """Liest den Treibernamen aus /sys/class/net/<iface>/device/driver."""
         try:
             link = f"/sys/class/net/{iface}/device/driver"
             if os.path.islink(link):
@@ -570,17 +674,20 @@ class AdapterCapabilities:
         return ""
 
     @classmethod
-    def _modes_for_phy(cls, phy: str) -> set:
+    def _modes_for_phy(cls, phy: str) -> set[str]:
+        """Parst `iw phy <phy> info` und liefert unterstuetzte Modi."""
         out = cls._run(["iw", "phy", phy, "info"], f"caps[{phy}]")
-        modes = set()
+        modes: set[str] = set()
         for line in out.splitlines():
             m = cls._MODE_RE.match(line)
             if m:
                 modes.add(m.group("mode").upper())
         return modes
 
+    # ── Interface-Combinations (P9.3) ─────────────────────────────
+
     @staticmethod
-    def _parse_interface_combinations(phy_text: str) -> dict:
+    def _parse_interface_combinations(phy_text: str) -> dict[str, Any]:
         """P9.3: Parst "interface combinations" aus `iw phy <phy> info`.
 
         Liefert immer ein dict mit stabilen Keys:
@@ -590,7 +697,7 @@ class AdapterCapabilities:
           max_channels            : int (max. gleichzeitige Kanaele)
           max_interfaces_by_type  : dict[str, int]
         """
-        result = {
+        result: dict[str, Any] = {
             "supported": False,
             "combinations": [],
             "max_total": 1,
@@ -604,7 +711,7 @@ class AdapterCapabilities:
             return result
 
         lines = phy_text.splitlines()
-        header_idx = None
+        header_idx: int | None = None
         for idx, ln in enumerate(lines):
             if "valid interface combinations:" in ln:
                 header_idx = idx
@@ -614,8 +721,8 @@ class AdapterCapabilities:
 
         result["supported"] = True
 
-        entries = []
-        cur = None
+        entries: list[list[str]] = []
+        cur: list[str] | None = None
         for ln in lines[header_idx + 1:]:
             stripped = ln.strip()
             if not stripped:
@@ -637,31 +744,38 @@ class AdapterCapabilities:
         if cur:
             entries.append(cur)
 
-        import re as _re
         total_max = 1
         channels_max = 1
         type_map: dict[str, int] = {}
-        parsed = []
+        parsed: list[dict[str, Any]] = []
+
         for parts in entries:
             text = " ".join(parts)
-            combo = {
+            combo: dict[str, Any] = {
                 "raw": text,
                 "interfaces": {},
                 "total": 1,
                 "channels": 1,
             }
-            for m in _re.finditer(r"#\{\s*([^}]+?)\s*\}\s*<=\s*(\d+)", text):
-                types = [t.strip() for t in m.group(1).split(",") if t.strip()]
+            for m in re.finditer(
+                r"#\{\s*([^}]+?)\s*\}\s*<=\s*(\d+)", text
+            ):
+                types = [
+                    t.strip() for t in m.group(1).split(",") if t.strip()
+                ]
                 n = int(m.group(2))
                 for t in types:
                     combo["interfaces"][t] = n
                     type_map[t] = max(type_map.get(t, 0), n)
-            m_total = _re.search(r"total\s*<=\s*(\d+)", text)
+
+            m_total = re.search(r"total\s*<=\s*(\d+)", text)
             if m_total:
                 combo["total"] = int(m_total.group(1))
-            m_ch = _re.search(r"#channels\s*<=\s*(\d+)", text)
+
+            m_ch = re.search(r"#channels\s*<=\s*(\d+)", text)
             if m_ch:
                 combo["channels"] = int(m_ch.group(1))
+
             total_max = max(total_max, combo["total"])
             channels_max = max(channels_max, combo["channels"])
             parsed.append(combo)
@@ -672,23 +786,28 @@ class AdapterCapabilities:
         result["max_interfaces_by_type"] = type_map
         return result
 
+    # ── Hauptdetektion ────────────────────────────────────────────
+
     @classmethod
-    def detect(cls) -> list:
+    def detect(cls) -> list[AdapterInfo]:
+        """Erkennt WLAN-Adapter via iw, Fallback auf iwconfig/sysfs."""
         out = cls._run(["iw", "dev"], "iw-dev")
         if not out.strip():
-            # P6.6: iw fehlt/leer -> iwconfig-Fallback
             ifaces = cls._wireless_ifaces()
             if ifaces:
                 return cls._detect_via_iwconfig(ifaces)
             return []
-        adapters = []
+
+        adapters: list[AdapterInfo] = []
         current_phy = ""
-        current = None
+        current: AdapterInfo | None = None
+
         for line in out.splitlines():
             m_phy = cls._PHY_RE.match(line)
             if m_phy:
                 current_phy = "phy" + m_phy.group("n")
                 continue
+
             m_dev = cls._DEV_RE.match(line)
             if m_dev:
                 if current is not None:
@@ -697,11 +816,14 @@ class AdapterCapabilities:
                     iface=m_dev.group("iface"), phy=current_phy
                 )
                 continue
+
             if current is None:
                 continue
+
             m_attr = cls._ATTR_RE.match(line)
             if not m_attr:
                 continue
+
             key, val = m_attr.group("key"), m_attr.group("val")
             if key == "addr":
                 current.mac = val
@@ -717,10 +839,12 @@ class AdapterCapabilities:
                     current.channel = int(val.split()[0])
                 except (ValueError, IndexError):
                     pass
+
         if current is not None:
             adapters.append(current)
 
-        mode_cache = {}
+        # Modi pro PHY einmal abfragen (Cache), dann auf Adapter anwenden.
+        mode_cache: dict[str, set[str]] = {}
         for a in adapters:
             if a.phy not in mode_cache:
                 mode_cache[a.phy] = cls._modes_for_phy(a.phy)
@@ -730,10 +854,16 @@ class AdapterCapabilities:
             a.can_managed = "MANAGED" in modes
             a.can_ibss = "IBSS" in modes
             a.driver = cls._driver_for(a.iface)
+
         return adapters
 
+    # ── Rollen-Zuweisung ──────────────────────────────────────────
+
     @classmethod
-    def suggest_roles(cls, adapters=None) -> tuple:
+    def suggest_roles(
+        cls, adapters: list[AdapterInfo] | None = None
+    ) -> tuple[str | None, str | None]:
+        """Schlaegt (iface_ap, iface_deauth) vor, basierend auf Faehigkeiten."""
         if adapters is None:
             adapters = cls.detect()
         ap = next((a for a in adapters if a.can_ap), None)
@@ -748,9 +878,13 @@ class AdapterCapabilities:
         return (ap.iface if ap else None, deauth.iface if deauth else None)
 
     @classmethod
-    def resolve(cls, fp: str, adapters=None) -> str | None:
+    def resolve(
+        cls, fp: str, adapters: list[AdapterInfo] | None = None
+    ) -> str | None:
         """P6.2: Sucht aktuellen iface-Namen zum Fingerprint (Treiber).
-        Akzeptiert '<driver>' und legacy '<driver>@<iface>'."""
+
+        Akzeptiert '<driver>' und legacy '<driver>@<iface>'.
+        """
         if not fp:
             return None
         driver = fp.split("@", 1)[0]
@@ -761,7 +895,10 @@ class AdapterCapabilities:
         return None
 
     @classmethod
-    def render_report(cls, adapters=None) -> str:
+    def render_report(
+        cls, adapters: list[AdapterInfo] | None = None
+    ) -> str:
+        """Menschenlesbarer Report mit Rollen-Vorschlag."""
         if adapters is None:
             adapters = cls.detect()
         if not adapters:
@@ -773,52 +910,66 @@ class AdapterCapabilities:
         lines.append(f"Vorschlag iface_deauth:  {deauth or '—'}")
         return "\n".join(lines)
 
-import os as _os
-import sys as _sys
 
-if _os.geteuid() == 0 and _os.environ.get("SUDO_USER"):
-    _sudo_user = _os.environ["SUDO_USER"]
+# ──────────────────────────────────────────────────────────────────────
+# sudo-User-Site-Packages einbinden (nur wenn als root via sudo gestartet)
+# ──────────────────────────────────────────────────────────────────────
+
+if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+    _sudo_user = os.environ["SUDO_USER"]
     _user_home = f"/home/{_sudo_user}"
-    if _os.path.isdir(_user_home):
-        _local_lib = _os.path.join(_user_home, ".local", "lib")
-        if _os.path.isdir(_local_lib):
+    if os.path.isdir(_user_home):
+        _local_lib = os.path.join(_user_home, ".local", "lib")
+        if os.path.isdir(_local_lib):
             try:
-                for _py_ver in sorted(_os.listdir(_local_lib)):
+                for _py_ver in sorted(os.listdir(_local_lib)):
                     if _py_ver.startswith("python"):
-                        _sp = _os.path.join(_local_lib, _py_ver, "site-packages")
-                        if _os.path.isdir(_sp) and _sp not in _sys.path:
-                            _sys.path.insert(0, _sp)
+                        _sp = os.path.join(
+                            _local_lib, _py_ver, "site-packages"
+                        )
+                        if os.path.isdir(_sp) and _sp not in sys.path:
+                            sys.path.insert(0, _sp)
             except OSError:
                 pass
-        _local_bin = _os.path.join(_user_home, ".local", "bin")
-        if _os.path.isdir(_local_bin) and _local_bin not in _os.environ.get("PATH", ""):
-            _os.environ["PATH"] = _local_bin + ":" + _os.environ.get("PATH", "")
 
-# 7e-5a/5b: --quiet erkennen, aber pytest-eigene Flags ignorieren.
-# Hintergrund: `pytest tests/ -q` setzt "-q" in sys.argv[1]. Ohne
-# Guard wuerden Tests mit CLI-Ausgabe-Pruefung alle Status-Prints
-# unterdrueckt sehen (5 rote Tests in 7e-5b).
+        _local_bin = os.path.join(_user_home, ".local", "bin")
+        if (
+            os.path.isdir(_local_bin)
+            and _local_bin not in os.environ.get("PATH", "")
+        ):
+            os.environ["PATH"] = (
+                _local_bin + ":" + os.environ.get("PATH", "")
+            )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Quiet-Modus (--quiet / -q) und Startup-Banner
+# ──────────────────────────────────────────────────────────────────────
+
 _QUIET_CLI = (
-    "pytest" not in _sys.modules
-    and any(a in ("-q", "--quiet") for a in _sys.argv)
+    "pytest" not in sys.modules
+    and any(a in ("-q", "--quiet") for a in sys.argv)
 )
 
 if _QUIET_CLI:
-    # 7e-5d: Logging global stumm (DebugManager loggt beim Init
-    # eine INFO-Zeile, BEVOR main() Log-Level setzt).
     logging.disable(logging.INFO)
 
 
-def _banner(*args, **kwargs):
+def _banner(*args: Any, **kwargs: Any) -> None:
     """Startup-Banner: nur wenn nicht --quiet/-q (7e-5a)."""
     if not _QUIET_CLI:
         print(*args, **kwargs)
 
-_say = _banner  # 7e-5b: quiet-aware CLI-Status-Print (stumm bei --quiet)
+
+_say = _banner
 
 _banner("\n" + "=" * 60)
 _banner("Lade Module...")
 _banner("=" * 60)
+
+# ──────────────────────────────────────────────────────────────────────
+# Optionale Abhaengigkeiten (granular)
+# ──────────────────────────────────────────────────────────────────────
 
 SCAPY_VERFÜGBAR = False
 NUMPY_VERFÜGBAR = False
@@ -833,7 +984,6 @@ PYNMEA2_AVAILABLE = False
 WEB_AVAILABLE = False
 REQUESTS_AVAILABLE = False
 
-# ─── Scapy ────────────────────────────────────────────────────────────
 _SCAPY_BASE_OK = False
 _SCAPY_DOT11_OK = False
 _SCAPY_DOT11FCS_OK = False
@@ -873,10 +1023,10 @@ try:
     _SCAPY_DOT11FCS_OK = True
     _banner("✓ Scapy Dot11FCS-Support geladen")
 except ImportError:
-    Dot11FCS = None
-    Dot11FCSBeacon = None
-    Dot11FCSProbeReq = None
-    Dot11FCSProbeResp = None
+    Dot11FCS = None  # type: ignore[assignment]
+    Dot11FCSBeacon = None  # type: ignore[assignment]
+    Dot11FCSProbeReq = None  # type: ignore[assignment]
+    Dot11FCSProbeResp = None  # type: ignore[assignment]
     _SCAPY_DOT11FCS_OK = False
 
 try:
@@ -885,7 +1035,7 @@ try:
     _SCAPY_EAPOL_OK = True
 except ImportError:
     try:
-        from scapy.layers.dot11 import EAPOL
+        from scapy.layers.dot11 import EAPOL  # type: ignore[no-redef]
 
         _SCAPY_EAPOL_OK = True
     except ImportError as e:
@@ -907,7 +1057,7 @@ if SCAPY_VERFÜGBAR:
 else:
     _banner("⚠️  Scapy nur teilweise verfügbar.")
 
-# ─── NumPy ────────────────────────────────────────────────────────────
+
 try:
     import numpy as np
 
@@ -916,7 +1066,6 @@ try:
 except ImportError:
     _banner("⚠️  NumPy not available")
 
-# ─── Matplotlib ───────────────────────────────────────────────────────
 try:
     import matplotlib
 
@@ -931,7 +1080,6 @@ try:
 except ImportError:
     _banner("⚠️  Matplotlib not available")
 
-# ─── Netifaces ────────────────────────────────────────────────────────
 try:
     import netifaces
 
@@ -940,7 +1088,6 @@ try:
 except ImportError:
     _banner("⚠️  netifaces not available")
 
-# ─── PySerial ─────────────────────────────────────────────────────────
 try:
     import serial
     import serial.tools.list_ports
@@ -950,7 +1097,6 @@ try:
 except ImportError:
     _banner("⚠️  pyserial not available")
 
-# ─── SimpleKML ────────────────────────────────────────────────────────
 try:
     import simplekml
 
@@ -959,7 +1105,6 @@ try:
 except ImportError:
     _banner("⚠️  simplekml not available")
 
-# ─── GPXPy ────────────────────────────────────────────────────────────
 try:
     import gpxpy
     import gpxpy.gpx
@@ -969,7 +1114,6 @@ try:
 except ImportError:
     _banner("⚠️  gpxpy not available")
 
-# ─── Folium ───────────────────────────────────────────────────────────
 try:
     import folium
 
@@ -978,7 +1122,6 @@ try:
 except ImportError:
     _banner("⚠️  folium not available")
 
-# ─── PyYAML ───────────────────────────────────────────────────────────
 try:
     import yaml
 
@@ -987,7 +1130,6 @@ try:
 except ImportError:
     _banner("⚠️  yaml not available (using JSON for config)")
 
-# ─── pynmea2 ──────────────────────────────────────────────────────────
 try:
     import pynmea2
 
@@ -996,7 +1138,6 @@ try:
 except ImportError:
     _banner("⚠️  pynmea2 not available")
 
-# ─── requests ─────────────────────────────────────────────────────────
 try:
     import requests
 
@@ -1005,13 +1146,14 @@ except ImportError:
     REQUESTS_AVAILABLE = False
     requests = None  # type: ignore[assignment]
 
-# ─── Aliase ───────────────────────────────────────────────────────────
 SCAPY_AVAILABLE = SCAPY_VERFÜGBAR
 MATPLOTLIB_AVAILABLE = MATPLOTLIB_VERFÜGBAR
 
-# ══════════════════════════════════════════════════════════════════════
-# 5. Qt-Imports
-# ══════════════════════════════════════════════════════════════════════
+
+# ──────────────────────────────────────────────────────────────────────
+# Qt-Imports (PyQt6) -- Imports werden an Widgets weitergereicht
+# ──────────────────────────────────────────────────────────────────────
+
 _banner("\n" + "=" * 60)
 _banner("Module geladen. Starte GUI-Imports...")
 _banner("=" * 60)
@@ -1173,7 +1315,6 @@ except ImportError as e:
     _banner("Install with: pip install PyQt6 PyQt6-WebEngine")
     sys.exit(1)
 
-# v37-R20: QButtonGroup nachgezogen (fehlte im Hauptimport)
 try:
     from PyQt6.QtWidgets import QButtonGroup
 except ImportError:
@@ -17731,29 +17872,58 @@ class PlatformUtils:
         if not PlatformUtils.is_root():
             PlatformUtils._logger.error("Monitor-Modus erfordert Root-Rechte.")
             return False
+        # v37-R33: State-Recovery - Interface darf nicht DOWN bleiben
+        _iface_was_down = False
         try:
-            # Interface down
-            subprocess.run(["ip", "link", "set", iface, "down"], check=True, timeout=5)
-            # Typ auf monitor setzen
             subprocess.run(
-                ["iw", "dev", iface, "set", "type", "monitor"], check=True, timeout=5
+                ["ip", "link", "set", iface, "down"],
+                check=True, timeout=5,
             )
-            # Optionale Alfa-Optimierungen
-            if alfa_optimize:
+            _iface_was_down = True
+
+            # Innerer Block: bei Fehler Interface wieder up
+            try:
+                subprocess.run(
+                    ["iw", "dev", iface, "set", "type", "monitor"],
+                    check=True, timeout=5,
+                )
+                if alfa_optimize:
+                    try:
+                        subprocess.run(
+                            ["iwconfig", iface, "power", "off"],
+                            check=False, timeout=3,
+                        )
+                        subprocess.run(
+                            ["iw", "dev", iface, "set", "txpower",
+                             "fixed", "3000"],
+                            check=False, timeout=3,
+                        )
+                    except (subprocess.SubprocessError, OSError):
+                        pass
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired, OSError) as _inner:
+                # Recovery: Interface wieder up (Typ bleibt wie vorher)
                 try:
                     subprocess.run(
-                        ["iwconfig", iface, "power", "off"], check=False, timeout=3
+                        ["ip", "link", "set", iface, "up"],
+                        check=False, timeout=5,
                     )
-                    subprocess.run(
-                        ["iw", "dev", iface, "set", "txpower", "fixed", "3000"],
-                        check=False,
-                        timeout=3,
+                    PlatformUtils._logger.warning(
+                        f"Monitor-Mode fehlgeschlagen, {iface} wieder "
+                        f"hergestellt: {_inner}"
                     )
                 except (subprocess.SubprocessError, OSError):
                     pass
-            # Interface up
-            subprocess.run(["ip", "link", "set", iface, "up"], check=True, timeout=5)
-            PlatformUtils._logger.info(f"Monitor-Modus für {iface} aktiviert.")
+                return False
+
+            subprocess.run(
+                ["ip", "link", "set", iface, "up"],
+                check=True, timeout=5,
+            )
+            _iface_was_down = False
+            PlatformUtils._logger.info(
+                f"Monitor-Modus für {iface} aktiviert."
+            )
             return True
         except subprocess.CalledProcessError as e:
             PlatformUtils._logger.error(
@@ -17776,13 +17946,37 @@ class PlatformUtils:
             return False
         if not PlatformUtils.is_root():
             return False
+        # v37-R33: State-Recovery
         try:
-            subprocess.run(["ip", "link", "set", iface, "down"], check=True, timeout=5)
             subprocess.run(
-                ["iw", "dev", iface, "set", "type", "managed"], check=True, timeout=5
+                ["ip", "link", "set", iface, "down"],
+                check=True, timeout=5,
             )
-            subprocess.run(["ip", "link", "set", iface, "up"], check=True, timeout=5)
-            PlatformUtils._logger.info(f"Managed-Modus für {iface} wiederhergestellt.")
+            try:
+                subprocess.run(
+                    ["iw", "dev", iface, "set", "type", "managed"],
+                    check=True, timeout=5,
+                )
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired, OSError) as _inner:
+                try:
+                    subprocess.run(
+                        ["ip", "link", "set", iface, "up"],
+                        check=False, timeout=5,
+                    )
+                except (subprocess.SubprocessError, OSError):
+                    pass
+                PlatformUtils._logger.error(
+                    f"Managed-Mode fehlgeschlagen: {_inner}"
+                )
+                return False
+            subprocess.run(
+                ["ip", "link", "set", iface, "up"],
+                check=True, timeout=5,
+            )
+            PlatformUtils._logger.info(
+                f"Managed-Modus für {iface} wiederhergestellt."
+            )
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
             PlatformUtils._logger.error(
@@ -17842,12 +18036,34 @@ class PlatformUtils:
             return False
         if not PlatformUtils.is_root():
             return False
+        # v37-R33: State-Recovery
         try:
-            subprocess.run(["ip", "link", "set", iface, "down"], check=True, timeout=5)
             subprocess.run(
-                ["ip", "link", "set", iface, "address", new_mac], check=True, timeout=5
+                ["ip", "link", "set", iface, "down"],
+                check=True, timeout=5,
             )
-            subprocess.run(["ip", "link", "set", iface, "up"], check=True, timeout=5)
+            try:
+                subprocess.run(
+                    ["ip", "link", "set", iface, "address", new_mac],
+                    check=True, timeout=5,
+                )
+            except (subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired, OSError) as _inner:
+                try:
+                    subprocess.run(
+                        ["ip", "link", "set", iface, "up"],
+                        check=False, timeout=5,
+                    )
+                except (subprocess.SubprocessError, OSError):
+                    pass
+                PlatformUtils._logger.error(
+                    f"MAC-Change fehlgeschlagen: {_inner}"
+                )
+                return False
+            subprocess.run(
+                ["ip", "link", "set", iface, "up"],
+                check=True, timeout=5,
+            )
             return True
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
             PlatformUtils._logger.error(f"Fehler beim Ändern der MAC-Adresse: {e}")
@@ -18912,6 +19128,11 @@ class SecurityProfile:
             "wps_version": self.wps_version,
             "wps_locked": self.wps_locked,
             "wps_config_methods": list(self.wps_config_methods),
+            "wps_device_name": self.wps_device_name,
+            "wps_manufacturer": self.wps_manufacturer,
+            "wps_model_name": self.wps_model_name,
+            "wps_model_number": self.wps_model_number,
+            "wps_serial": self.wps_serial,
             "privacy_bit": self.privacy_bit,
             "has_rsn": self.has_rsn,
             "has_rsnxe": self.has_rsnxe,
@@ -19093,51 +19314,6 @@ class CryptoParser:
 
         profile.protocol = cls._classify(profile)
 
-        # v10.7-DIAG: in Datei schreiben (auch ohne Log-Level)
-        try:
-            _bssid = ""
-            try:
-                d = pkt.getlayer(Dot11)
-                if d is not None:
-                    _bssid = (
-                        getattr(d, "addr3", "") or getattr(d, "addr2", "") or ""
-                    ).lower()
-            except (AttributeError, TypeError):
-                pass
-            with open("/tmp/wlan_crypto_debug.log", "a", encoding="utf-8") as _fh:
-                import time as _t
-
-                _fh.write(
-                    _t.strftime("%H:%M:%S")
-                    + " "
-                    + "bssid="
-                    + _bssid
-                    + " "
-                    + "rsn="
-                    + str(profile.has_rsn)
-                    + " "
-                    + "wpa1="
-                    + str(profile.has_wpa1)
-                    + " "
-                    + "priv="
-                    + str(profile.privacy_bit)
-                    + " "
-                    + "akm="
-                    + ",".join(profile.akm[:3])
-                    + " "
-                    + "pw="
-                    + ",".join(profile.pairwise[:2])
-                    + " "
-                    + "proto="
-                    + profile.protocol
-                    + " "
-                    + "rsn_len="
-                    + str(len(profile.raw_rsn))
-                    + " "
-                    + "\n"
-                )
-        except (OSError, AttributeError, TypeError, ValueError):
-            pass
 
         return profile
 
@@ -30717,7 +30893,6 @@ class FilterTab(QWidget):
 
     def _apply_preset(self, name: str):
         preset = FilterBuilder.PRESETS.get(name, {})
-        # Formular zurücksetzen
         self.krypto_combo.setCurrentIndex(0)
         self.min_sig.setValue(-100)
         self.max_sig.setValue(-20)
@@ -39947,7 +40122,6 @@ class SidebarNavigator(QWidget):
         it = QTreeWidgetItemIterator(self.tree)
         while it.value():
             item = it.value()
-            # Root-Items: sichtbar wenn mind. 1 Kind passt
             if item.parent() is None:
                 visible_child = False
                 for i in range(item.childCount()):
@@ -40014,7 +40188,6 @@ class TabSearchDialog(QDialog):
         for name in self.tab_names:
             if not text or text in name.lower():
                 self.list_widget.addItem(name)
-        # Erste auswählen
         if self.list_widget.count() > 0:
             self.list_widget.setCurrentRow(0)
 
@@ -40033,9 +40206,6 @@ class TabSearchDialog(QDialog):
             super().keyPressEvent(event)
 
 
-# ----------------------------------------------------------------
-# D. DebugOverlay — Live-Log
-# ----------------------------------------------------------------
 class _OverlayLogHandler(logging.Handler):
     """Logging-Handler der in ein Overlay schreibt."""
 
@@ -40104,9 +40274,7 @@ class DebugOverlay(QWidget):
                 "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S"
             )
         )
-        # Global an Root-Logger hängen
         logging.getLogger().addHandler(self._handler)
-        # Callback für Live-Update
         self._handler.on_log(self._on_log)
         self._build_ui()
 
@@ -40114,7 +40282,6 @@ class DebugOverlay(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # Kopf
         hrow = QHBoxLayout()
         lbl = QLabel("🐛 Debug-Log (F12 zum Schließen)")
         lbl.setStyleSheet(
@@ -40132,7 +40299,6 @@ class DebugOverlay(QWidget):
         hrow.addWidget(b_clear)
         layout.addLayout(hrow)
 
-        # Log-Text
         self.text = QPlainTextEdit()
         self.text.setReadOnly(True)
         self.text.setStyleSheet(
@@ -40146,7 +40312,6 @@ class DebugOverlay(QWidget):
         self.text.setMaximumBlockCount(1000)
         layout.addWidget(self.text, 1)
 
-        # Statistik
         srow = QHBoxLayout()
         self.lbl_stats = QLabel("0 Zeilen")
         self.lbl_stats.setStyleSheet(
@@ -40155,12 +40320,9 @@ class DebugOverlay(QWidget):
         srow.addWidget(self.lbl_stats)
         srow.addStretch()
         layout.addLayout(srow)
-
-        # Größe
         self.resize(1000, 400)
 
     def _on_log(self, msg, level):
-        # Nur im GUI-Thread
         try:
             from PyQt6.QtCore import QThread
 
@@ -40173,7 +40335,6 @@ class DebugOverlay(QWidget):
 
     def _append(self, msg, level):
         try:
-            # Farbe nach Level
             color = {
                 "DEBUG": "#7f8c8d",
                 "INFO": "#bdc3c7",
@@ -40183,7 +40344,6 @@ class DebugOverlay(QWidget):
             }.get(level, "#d4d4d4")
             html = f"<span style='color:{color};'>" f"{msg.replace('<', '&lt;')}</span>"
             self.text.appendHtml(html)
-            # Scroll ans Ende
             sb = self.text.verticalScrollBar()
             sb.setValue(sb.maximum())
             self.lbl_stats.setText(f"{self.text.blockCount()} Zeilen")
@@ -40202,7 +40362,6 @@ class DebugOverlay(QWidget):
             self.raise_()
 
     def showEvent(self, event):
-        # Zentrieren im Parent
         try:
             if self.parent():
                 pg = self.parent().geometry()
@@ -40214,9 +40373,6 @@ class DebugOverlay(QWidget):
         super().showEvent(event)
 
 
-# ----------------------------------------------------------------
-# E. MultiWindowSupport — Tab in eigenes Fenster
-# ----------------------------------------------------------------
 class FloatingTabWindow(QMainWindow):
     """Zeigt einen Tab-Inhalt in eigenem Fenster."""
 
@@ -40235,14 +40391,10 @@ class FloatingTabWindow(QMainWindow):
     def _build_ui(self):
         try:
             tw = self.gui_ref.tab_widget
-            # Widget aus Tab holen
             w = tw.widget(self.tab_index)
             if w is None:
                 return
-            # aus Layout lösen — wir nehmen einfach eine Kopie als
-            # centralWidget (vorsichtig: nicht destroy!)
             self._central = w
-            # Neues Parent zuweisen
             w.setParent(self)
             self.setCentralWidget(w)
         except (AttributeError, RuntimeError) as e:
@@ -40253,9 +40405,6 @@ class FloatingTabWindow(QMainWindow):
         event.accept()
 
 
-# ----------------------------------------------------------------
-# G. LogAnalyzer-Fix — Zeitstempel-Parser
-# ----------------------------------------------------------------
 class ScanEngine:
     """
     Hochperformante, robuste Scan-Engine für WLAN-Netzwerke.
@@ -40269,9 +40418,6 @@ class ScanEngine:
       • Robuste Fallbacks & korrekte pps-Berechnung
     """
 
-    # ================================================================
-    # Signals
-    # ================================================================
     class _Signals(QObject):
         network_found = pyqtSignal(dict)
         network_updated = pyqtSignal(dict)
@@ -40281,9 +40427,6 @@ class ScanEngine:
         packet_captured = pyqtSignal(object)
         statistics_update = pyqtSignal(dict)
 
-    # ================================================================
-    # Konstruktor
-    # ================================================================
     def __init__(
         self,
         config,
@@ -40293,7 +40436,6 @@ class ScanEngine:
         discovery_engine=None,
         timing_profile=None,
     ):
-        # ---- externe Referenzen --------------------------------
         self.config = config
         self.iface_mgr = interface_manager
         self.event_bus = event_bus
@@ -40301,25 +40443,17 @@ class ScanEngine:
 
         self.logger = logging.getLogger("wlan_ultimate.ScanEngine")
         self.logger.propagate = True
-
-        # ---- Status / Sync ------------------------------------
         self.running = False
         self.paused = False
         self._stop_event = threading.Event()
         self._pause_event = threading.Event()
         self._lock = threading.RLock()
-
-        # ---- Threads / Sniffer --------------------------------
         self._sniffers: dict[str, Any] = {}
         self._channel_threads: dict[str, threading.Thread] = {}
         self._watchdog_thread: threading.Thread | None = None
         self._stats_thread: threading.Thread | None = None
-
-        # ---- Paketverarbeitung --------------------------------
         self._packet_processor = PacketProcessor()
         self._seen_networks: dict[str, dict[str, Any]] = {}
-
-        # v5.2 – garantierte Initialisierung
         self._channel_traffic: dict[int, int] = defaultdict(int)
         self._channel_usage: dict[int, int] = defaultdict(int)
         self._signal_history: dict[str, list] = defaultdict(list)
@@ -40327,15 +40461,9 @@ class ScanEngine:
         self._first_seen: dict[str, float] = {}
         self._last_seen: dict[str, float] = {}
         self._channel_dwell_override: dict[int, float] = {}
-
-        # v9.0 – aktueller Kanal & Timing
         self._current_channel: int = 0
         self._current_channel_by_iface: dict[str, int] = {}
-
-        # TimingProfile (Single Source of Truth für Dwell)
         self._timing_profile = timing_profile
-
-        # ---- Zähler (thread-safe via _lock) -------------------
         self._packet_count: int = 0
         self._raw_packet_count: int = 0
         self._processed_packet_count: int = 0
@@ -40344,15 +40472,11 @@ class ScanEngine:
         self._networks_per_second: float = 0.0
         self._packet_type_stats: dict[str, int] = defaultdict(int)
         self._filter_counters: dict[str, int] = defaultdict(int)
-
-        # ---- Filter -------------------------------------------
         self._band_filter: str | None = None
         self._include_dfs: bool = True
         self._ssid_whitelist: set[str] = set()
         self._bssid_blacklist: set[str] = set()
         self._min_signal_dbm: int = -100
-
-        # ---- Timing -------------------------------------------
         self._max_duration: float = 0.0
         self._pending_max_duration: float = 0.0
         self._start_time: float = 0.0
@@ -40362,16 +40486,11 @@ class ScanEngine:
         self._watchdog_interval: float = 5.0
         self._stats_interval: float = 1.0
         self._diagnostic_interval: float = 5.0
-
-        # ---- Diagnose -----------------------------------------
         self.debug_sniffer: bool = False
         self._silence_warning_threshold: float = 30.0
-
-        # ---- Auto-Optimierung ---------------------------------
         self._auto_optimize: bool = True
         self._optimization_results: dict[str, dict[str, Any]] = {}
 
-        # ---- Optionale Sub-Engines (fail-safe) ----------------
         self._discovery_engine = discovery_engine
         if self._discovery_engine is None:
             try:
@@ -40399,12 +40518,8 @@ class ScanEngine:
             self._pattern_detector = None
             self._client_tracker = None
 
-        # ---- Signals ------------------------------------------
         self._signals = self._Signals()
 
-    # ================================================================
-    # Properties
-    # ================================================================
     @property
     def signals(self):
         return self._signals
@@ -40423,9 +40538,6 @@ class ScanEngine:
             return 0.0
         return time.time() - self._start_time
 
-    # ================================================================
-    # Konfigurations-Setter
-    # ================================================================
     def set_band_filter(self, band: str | None) -> None:
         if band not in (None, "2.4", "5", "6"):
             raise ValueError(f"Ungültiger Band-Filter: {band}")
@@ -40474,7 +40586,6 @@ class ScanEngine:
             _dbg("läuft bereits → False")
             return False
 
-        # Scapy-FCS
         try:
             if SCAPY_VERFÜGBAR:
                 from scapy.config import conf as _scapy_conf
@@ -40625,13 +40736,11 @@ class ScanEngine:
         self._watchdog_thread = None
         self._stats_thread = None
 
-        # ---- Auto-Restore IMMER versuchen --------------------
         try:
             self._restore_interface_defaults()
         except (RuntimeError, OSError) as exc:
             _dbg(f"Restore-Fehler: {exc}")
 
-        # ---- Ergebnis emittieren -----------------------------
         with self._lock:
             networks = [copy.deepcopy(n) for n in self._seen_networks.values()]
 
@@ -40709,7 +40818,6 @@ class ScanEngine:
                     return False
                 _dbg(f"Kanäle: {len(channels)}")
 
-                # Hopper-Thread
                 hopper = threading.Thread(
                     target=_thread_wrap(self._channel_hopper, "anon-37317"),
                     args=(iface_name, channels),
@@ -40724,7 +40832,6 @@ class ScanEngine:
                     _dbg("Scapy nicht verfügbar")
                     return False
 
-                # Sicherer Startkanal (6)
                 if 6 in channels:
                     try:
                         CommandRunner.run(
@@ -40745,7 +40852,6 @@ class ScanEngine:
                     except (AttributeError, TypeError, ValueError) as exc:
                         self.logger.debug(f"Callback-Fehler ({_iface}): {exc}")
 
-                # ---- Sniffer versuchen (nur ein Pfad, sauber) -----
                 sniffer = None
                 last_exc: Exception | None = None
                 _dbg("Erstelle AsyncSniffer")
@@ -40781,7 +40887,6 @@ class ScanEngine:
                 )
                 _dbg(f"OK – {len(channels)} Kanäle")
 
-                # ---- Paketfluss-Verifikation ---------------------
                 try:
                     if not self._verify_packet_flow(iface_name, timeout=3.0):
                         self.logger.warning(
@@ -40877,14 +40982,18 @@ class ScanEngine:
         except (OSError, RuntimeError, AttributeError):
             pass
 
-    # ================================================================
-    # Kanalwechsler
-    # ================================================================
     def _channel_hopper(self, iface_name: str, channels: list[int]) -> None:
+        """P10.1: Kanal-Hopping mit Settling-Zeit und Fehler-Logging.
+
+        Wechselt nur, wenn sich der Kanal aendert. Nutzt CommandRunner
+        (statt subprocess) und liest die Settling-Zeit aus TimingProfile.
+        Fehler werden geloggt statt still verschluckt.
+        """
         dwell_time = self._get_dwell_time()
+        settle_time = self._get_channel_settle()
         self.logger.info(
             f"[{iface_name}] Kanal-Hopper startet ({len(channels)} Kanäle, "
-            f"dwell={dwell_time:.2f}s)"
+            f"dwell={dwell_time:.2f}s, settle={settle_time:.3f}s)"
         )
         idx = 0
         total = len(channels)
@@ -40896,28 +41005,40 @@ class ScanEngine:
 
             channel = channels[idx % total]
 
-            # aktuellen Kanal pflegen (thread-safe)
+            with self._lock:
+                last_channel = self._current_channel_by_iface.get(iface_name)
+
+            # P10.1: Nur wechseln wenn Kanal sich aendert
+            if channel != last_channel:
+                rc, _out, err = CommandRunner.run(
+                    ["iw", "dev", iface_name, "set", "channel",
+                     str(channel)],
+                    subsystem="scan",
+                    tag=f"hopper[{iface_name}]",
+                    soft_fail=True,
+                    timeout=1,
+                )
+                if rc != 0:
+                    self.logger.debug(
+                        f"[{iface_name}] Kanal {channel} fehlgeschlagen: "
+                        f"{err.strip() or 'rc=' + str(rc)}"
+                    )
+                elif settle_time > 0:
+                    # Settling: Karte braucht Zeit fuer Kanalwechsel
+                    self._stop_event.wait(settle_time)
+
             with self._lock:
                 self._current_channel = channel
                 self._current_channel_by_iface[iface_name] = channel
 
-            try:
-                subprocess.run(
-                    ["iw", "dev", iface_name, "set", "channel", str(channel)],
-                    check=False,
-                    timeout=1,
-                    capture_output=True,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-                pass
-
-            # Fortschritt
+            position = (idx % total) + 1
             if self._max_duration > 0:
                 overall = min(
-                    100, int((self.elapsed_seconds / self._max_duration) * 100)
+                    100,
+                    int((self.elapsed_seconds / self._max_duration) * 100),
                 )
             else:
-                overall = int(((idx % total) + 1) / total * 100)
+                overall = int(position / total * 100)
 
             self._safe_emit(
                 self._signals.scan_progress,
@@ -40925,7 +41046,10 @@ class ScanEngine:
                 f"{iface_name}: Kanal {channel} ({self.elapsed_seconds:.0f}s)",
             )
 
-            if self._max_duration > 0 and self.elapsed_seconds >= self._max_duration:
+            if (
+                self._max_duration > 0
+                and self.elapsed_seconds >= self._max_duration
+            ):
                 self.logger.info("Max. Scan-Dauer erreicht – stoppe.")
                 threading.Thread(
                     target=_thread_wrap(self.stop, "AutoStop"),
@@ -40950,6 +41074,21 @@ class ScanEngine:
             return max(0.05, min(5.0, dwell))
         except (TypeError, ValueError):
             return 0.15
+
+    def _get_channel_settle(self) -> float:
+        """P10.1: Settling-Zeit nach Kanalwechsel (TimingProfile-SSOT).
+
+        Nach `iw set channel` braucht die WLAN-Karte 10-50 ms, um
+        wirklich auf den Zielkanal zu wechseln. Ohne diese Pause
+        werden die ersten Pakete dem alten Kanal zugeordnet.
+        """
+        tp = self._timing_profile
+        if tp is not None:
+            try:
+                return max(0.0, min(0.5, float(tp.channel_settle)))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return 0.02  # 20 ms konservativer Default
 
     def _get_channels_for_interface(self, iface_name: str) -> list[int]:
         default_channels = getattr(self.config, "channels", None) or [
@@ -41016,9 +41155,6 @@ class ScanEngine:
 
         return filtered
 
-    # ================================================================
-    # Paketfluss-Verifikation
-    # ================================================================
     def _verify_packet_flow(self, iface_name, timeout: float = 3.0) -> bool:
         """Prüft, ob Pakete eintreffen (korrekte pps-Berechnung)."""
         try:
@@ -41046,15 +41182,11 @@ class ScanEngine:
             self.logger.error(f"_verify_packet_flow: {e}")
             return False
 
-    # ================================================================
-    # Paketverarbeitung
-    # ================================================================
     def _process_packet(self, iface_name: str, pkt: Any) -> None:
         with self._lock:
             self._raw_packet_count += 1
         self._last_packet_time = time.time()
 
-        # Rohpaket-Log (nur die ersten 30)
         if self._raw_packet_count <= 30:
             try:
                 _sum = pkt.summary()
@@ -41070,7 +41202,6 @@ class ScanEngine:
             except (AttributeError, TypeError) as e:
                 self.logger.debug(f"raw_log: {e}")
 
-        # Diagnose
         if self.debug_sniffer:
             self._diagnose_packet_type(pkt)
 
@@ -41084,20 +41215,11 @@ class ScanEngine:
                     f"Typen: {dict(self._packet_type_stats)}"
                 )
 
-        # ---- Verarbeiten ---------------------------------------
-        # v10.7: crypto-debug-PACKET — jeder Aufruf wird geloggt
-        try:
-            import time as _t_crypto
-
-            with open("/tmp/wlan_crypto_dump.log", "a", encoding="utf-8") as _fh:
-                _fh.write(
-                    _t_crypto.strftime("%H:%M:%S")
-                    + " pkt_received iface="
-                    + str(iface_name)
-                    + "\n"
-                )
-        except (OSError, AttributeError):
-            pass
+        # P10.2: Roh-Paket-Trace nur bei aktivem Debugging
+        if self.debug_sniffer:
+            self.logger.debug(
+                f"[RAW] iface={iface_name} pkt={self._raw_packet_count}"
+            )
 
         try:
             result = self._packet_processor.process(pkt)
@@ -41110,7 +41232,6 @@ class ScanEngine:
             self._packet_type_stats["processor_fatal"] += 1
             return
 
-        # ---- v3.5-Fallback ------------------------------------
         if not result:
             try:
                 result = self._v35_extract_fallback(pkt)
@@ -41141,7 +41262,6 @@ class ScanEngine:
 
         self._safe_emit(self._signals.packet_captured, pkt)
 
-        # ---- Routing ------------------------------------------
         if pkt_type in ("beacon", "probe_response"):
             self._ensure_signal(result, pkt)
             self._handle_network_result(result)
@@ -41237,7 +41357,6 @@ class ScanEngine:
             except Exception:
                 pass
 
-        # v37-R13d: CentralStore-Persistenz
         try:
             _st = get_store() if "get_store" in globals() else None
         except Exception:
@@ -41259,9 +41378,6 @@ class ScanEngine:
         elif self.debug_sniffer:
             self.logger.debug(f"[PROBE-REQ] {client_mac} sucht {probe_ssid or '-'}")
 
-    # ================================================================
-    # IE-Parser (vereinheitlicht)
-    # ================================================================
     _CIPHER_MAP = {
         0x000FAC00: "USE-GROUP",
         0x000FAC01: "WEP-40",
@@ -41376,8 +41492,6 @@ class ScanEngine:
             "vendor_ies": [],
             "capability": 0,
             "max_rate": 0.0,
-            # P9.1: alle IEs, die der neue Dispatcher versteht.
-            # Key = IE-ID (int), Value = dict aus IEEE80211IEParser.
             "decoded_ies": {},
         }
         if not SCAPY_VERFÜGBAR:
@@ -41399,38 +41513,38 @@ class ScanEngine:
                     except (TypeError, ValueError):
                         raw = b""
 
-                if ie_id == 0 and raw:  # SSID
+                if ie_id == 0 and raw:  
                     info["ssid"] = raw.decode("utf-8", errors="ignore")
-                elif ie_id == 1 and raw:  # Supported Rates
+                elif ie_id == 1 and raw: 
                     rates = [(b & 0x7F) * 0.5 for b in raw]
                     info["rates"] = rates
                     if rates:
                         info["max_rate"] = max(rates)
-                elif ie_id == 3 and raw:  # DS Parameter (Kanal)
+                elif ie_id == 3 and raw:  
                     info["channel_ie"] = raw[0]
-                elif ie_id == 5 and len(raw) >= 2:  # TIM
+                elif ie_id == 5 and len(raw) >= 2: 
                     info["dtim"] = raw[1]
-                elif ie_id == 7 and len(raw) >= 2:  # Country
+                elif ie_id == 7 and len(raw) >= 2: 
                     info["country"] = raw[:2].decode("ascii", errors="ignore")
-                elif ie_id == 45 and len(raw) >= 2:  # HT Capabilities
+                elif ie_id == 45 and len(raw) >= 2: 
                     info["ht_cap"] = {
                         "cap_info": int.from_bytes(raw[0:2], "little"),
                         "ampdu": raw[2] if len(raw) > 2 else 0,
                         "mcs_set": list(raw[3:19]) if len(raw) >= 19 else [],
                     }
-                elif ie_id == 48 and len(raw) >= 2:  # RSN
+                elif ie_id == 48 and len(raw) >= 2:  
                     info["rsn"] = self._v41_parse_rsn(raw)
-                elif ie_id == 50 and raw:  # Extended Rates
+                elif ie_id == 50 and raw:  
                     info["ext_rates"] = [(b & 0x7F) * 0.5 for b in raw]
                     if info["ext_rates"]:
                         info["max_rate"] = max(info["max_rate"], max(info["ext_rates"]))
-                elif ie_id == 191 and len(raw) >= 12:  # VHT Cap
+                elif ie_id == 191 and len(raw) >= 12:  
                     info["vht_cap"] = {
                         "cap_info": int.from_bytes(raw[0:4], "little"),
                         "rx_mcs": int.from_bytes(raw[4:6], "little"),
                         "tx_mcs": int.from_bytes(raw[6:8], "little"),
                     }
-                elif ie_id == 221 and len(raw) >= 4:  # Vendor Specific
+                elif ie_id == 221 and len(raw) >= 4:  
                     oui = raw[:3]
                     oui_type = raw[3] if len(raw) > 3 else 0
                     info["vendor_ies"].append(
@@ -41444,19 +41558,14 @@ class ScanEngine:
                         info["wpa1"] = {"len": len(raw)}
                     elif oui == b"\x00\x50\xf2" and oui_type == 4:
                         info["wps"] = self._v41_parse_wps(raw)
-                elif ie_id == 255 and raw:  # Extended Capabilities
+                elif ie_id == 255 and raw: 
                     info["extended_cap"] = list(raw)
 
-                # P9.1: Dispatcher fuer neue IE-Typen.
-                # Doppel-Pfad-Bewusstsein: die oben geparsten Felder
-                # (ssid/rates/rsn/...) bleiben der Primaerpfad fuer
-                # bestehende Konsumenten. decoded_ies ist zusaetzlich.
                 if ie_id is not None:
                     decoded = IEEE80211IEParser.parse_ie(
                         int(ie_id), raw
                     )
                     if decoded is not None:
-                        # Mehrfach vorkommende IDs: Liste anlegen
                         if ie_id in info["decoded_ies"]:
                             slot = info["decoded_ies"][ie_id]
                             if isinstance(slot, list):
@@ -41470,7 +41579,6 @@ class ScanEngine:
             except (AttributeError, TypeError, ValueError):
                 break
 
-        # Capabilities
         try:
             for attr in ("cap", "capabilities"):
                 v = getattr(pkt, attr, None)
@@ -41487,15 +41595,18 @@ class ScanEngine:
         result = {
             "version": "",
             "locked": False,
+            "wps_state": "",
             "config_methods": [],
             "device_name": "",
             "manufacturer": "",
             "model": "",
+            "model_number": "",
             "device_type": "",
             "serial": "",
+            "rf_bands": "",
         }
         try:
-            idx = 4  # 00:50:f2:04 + WPS-Tag
+            idx = 4 
             while idx + 4 <= len(data):
                 at = int.from_bytes(data[idx : idx + 2], "big")
                 al = int.from_bytes(data[idx + 2 : idx + 4], "big")
@@ -41503,10 +41614,16 @@ class ScanEngine:
                     break
                 ad = data[idx + 4 : idx + 4 + al]
 
-                if at == 0x1044 and al >= 1:
-                    result["version"] = f"1.{ad[0]}"
+                if at == 0x104A and al >= 1:
+                    result["version"] = f"1.{ad[0] & 0x0F}"
+                elif at == 0x1044 and al >= 1:
+                    result["wps_state"] = (
+                        "configured" if ad[0] == 0x02 else "unconfigured"
+                    )
                 elif at == 0x1057 and al >= 1:
                     result["locked"] = bool(ad[0])
+                elif at == 0x103C and al >= 1:
+                    result["rf_bands"] = f"0x{ad[0]:02x}"
                 elif at == 0x1008 and al >= 2:
                     cm = int.from_bytes(ad[0:2], "big")
                     m = []
@@ -41532,8 +41649,14 @@ class ScanEngine:
                     result["manufacturer"] = ad.decode("utf-8", errors="ignore")
                 elif at == 0x1023:
                     result["model"] = ad.decode("utf-8", errors="ignore")
-                elif at == 0x1054:
+                elif at == 0x1024:
+                    result["model_number"] = ad.decode(
+                        "utf-8", errors="ignore"
+                    )
+                elif at == 0x1042:
                     result["serial"] = ad.decode("utf-8", errors="ignore")
+                elif at == 0x1054 and al >= 8:
+                    result["device_type"] = ad[:8].hex()
                 idx += 4 + al
         except (IndexError, ValueError, AttributeError):
             pass
@@ -41557,7 +41680,6 @@ class ScanEngine:
             "owe": False,
             "enterprise": False,
         }
-        # Privacy-Bit
         try:
             caps = 0
             for attr in ("cap", "capabilities"):
@@ -41620,35 +41742,13 @@ class ScanEngine:
 
         result["encryption"] = self._v84_detect_encryption(result)
 
-        # v10.7-DIAG-V84: echten Pfad sichtbar machen
-        try:
-            with open("/tmp/wlan_crypto_debug.log", "a", encoding="utf-8") as _fh:
-                import time as _t
-
-                _fh.write(
-                    _t.strftime("%H:%M:%S")
-                    + " [V84] "
-                    + "enc="
-                    + str(result.get("encryption", "?"))
-                    + " "
-                    + "rsn="
-                    + str(result.get("has_rsn"))
-                    + " "
-                    + "wpa1="
-                    + str(result.get("has_wpa1"))
-                    + " "
-                    + "priv="
-                    + str(result.get("privacy_bit"))
-                    + " "
-                    + "akm="
-                    + ",".join(result.get("akm", [])[:2])
-                    + " "
-                    + "cipher="
-                    + ",".join(result.get("cipher", [])[:2])
-                    + "\n"
-                )
-        except (OSError, AttributeError, TypeError, ValueError):
-            pass
+        # P10.2: Krypto-Debug nur bei aktivem Debugging
+        if self.debug_sniffer:
+            self.logger.debug(
+                f"[V84] enc={result.get('encryption', '?')} "
+                f"rsn={result.get('has_rsn')} "
+                f"akm={','.join(result.get('akm', [])[:2])}"
+            )
 
         return result
 
@@ -41703,20 +41803,25 @@ class ScanEngine:
             pass
 
     def _v84_parse_wps_detail(self, info: bytes, result: dict) -> None:
+        """v37-R34: delegiert an _v41_parse_wps (DRY).
+
+        Vorher: eigener Mini-Parser mit 0x1044-Bug (WPS-State statt
+        Version). Jetzt: eine Quelle fuer alle WPS-Attribute.
+        """
         try:
-            idx = 4
-            while idx + 4 <= len(info):
-                at = int.from_bytes(info[idx : idx + 2], "big")
-                al = int.from_bytes(info[idx + 2 : idx + 4], "big")
-                if idx + 4 + al > len(info):
-                    break
-                ad = info[idx + 4 : idx + 4 + al]
-                if at == 0x1044 and al >= 1:
-                    result["wps_version"] = f"1.{ad[0]}"
-                elif at == 0x1057 and al >= 1:
-                    result["wps_locked"] = bool(ad[0])
-                idx += 4 + al
-        except (IndexError, ValueError, TypeError):
+            parsed = self._v41_parse_wps(info)
+            result["wps_version"] = parsed.get("version") or ""
+            result["wps_locked"] = bool(parsed.get("locked"))
+            result["wps_state"] = parsed.get("wps_state") or ""
+            result["wps_config_methods"] = parsed.get("config_methods") or []
+            result["wps_device_name"] = parsed.get("device_name") or ""
+            result["wps_manufacturer"] = parsed.get("manufacturer") or ""
+            result["wps_model"] = parsed.get("model") or ""
+            result["wps_model_number"] = parsed.get("model_number") or ""
+            result["wps_serial"] = parsed.get("serial") or ""
+            result["wps_device_type"] = parsed.get("device_type") or ""
+            result["wps_rf_bands"] = parsed.get("rf_bands") or ""
+        except (AttributeError, TypeError, ValueError):
             pass
 
     def _v84_detect_encryption(self, r: dict) -> str:
@@ -41747,9 +41852,6 @@ class ScanEngine:
                 return "OPEN"
         return "UNKNOWN"
 
-    # ================================================================
-    # v3.5-Fallback-Extraktion
-    # ================================================================
     def _v35_extract_fallback(self, pkt) -> dict[str, Any] | None:
         try:
             summary = pkt.summary()
@@ -41774,13 +41876,11 @@ class ScanEngine:
         if not bssid:
             return None
 
-        # Sicherheitsanalyse
         try:
             sec = self._v84_parse_security_from_ie(pkt)
         except (AttributeError, TypeError):
             sec = {}
 
-        # Vollständige IE-Analyse
         try:
             ie_info = self._v41_parse_ie_full(pkt)
         except (AttributeError, TypeError):
@@ -41788,7 +41888,6 @@ class ScanEngine:
 
         ssid = ie_info.get("ssid") or "<hidden>"
 
-        # Signal
         signal = -100
         if SCAPY_VERFÜGBAR:
             try:
@@ -41829,12 +41928,10 @@ class ScanEngine:
             except (AttributeError, TypeError, ValueError):
                 pass
 
-        # Kanal
         channel = ie_info.get("channel_ie") or 0
         if not channel:
             channel = self._current_channel or 0
 
-        # Verschlüsselung: IE-basiert hat Vorrang
         encryption = sec.get("encryption", "UNKNOWN")
         rsn = ie_info.get("rsn")
         wpa1 = ie_info.get("wpa1")
@@ -41871,6 +41968,15 @@ class ScanEngine:
             "wps": bool(sec.get("has_wps") or ie_info.get("wps")),
             "wps_locked": sec.get("wps_locked", False),
             "wps_version": sec.get("wps_version", ""),
+            "wps_state": sec.get("wps_state", ""),
+            "wps_config_methods": list(sec.get("wps_config_methods") or []),
+            "wps_device_name": sec.get("wps_device_name", ""),
+            "wps_manufacturer": sec.get("wps_manufacturer", ""),
+            "wps_model": sec.get("wps_model", ""),
+            "wps_model_number": sec.get("wps_model_number", ""),
+            "wps_serial": sec.get("wps_serial", ""),
+            "wps_device_type": sec.get("wps_device_type", ""),
+            "wps_rf_bands": sec.get("wps_rf_bands", ""),
             "sae": sec.get("sae", False),
             "owe": sec.get("owe", False),
             "enterprise": sec.get("enterprise", False),
@@ -41892,9 +41998,6 @@ class ScanEngine:
             "_v84_enhanced": True,
         }
 
-    # ================================================================
-    # Sichtungen & Konfidenz
-    # ================================================================
     def _v41_record_sighting(self, bssid: str, signal: int) -> None:
         now = time.time()
         with self._lock:
@@ -41979,9 +42082,6 @@ class ScanEngine:
         result["age_seconds"] = int(now - first_seen)
         return result
 
-    # ================================================================
-    # Adapter-Health
-    # ================================================================
     def _v57_audit_tx_power(
         self, iface_name: str, target_dbm: int = 30
     ) -> dict[str, Any]:
@@ -42064,7 +42164,6 @@ class ScanEngine:
                 h["issues"].append(f"{name}: {detail}")
                 h["ok"] = False
 
-        # 1. Monitor
         try:
             _, out, _ = CommandRunner.run(
                 ["iw", "dev", iface_name, "info"],
@@ -42083,7 +42182,6 @@ class ScanEngine:
         except Exception as e:
             _add_check("Monitor-Modus", False, str(e))
 
-        # 2. Kanal
         try:
             _, out, _ = CommandRunner.run(
                 ["iw", "dev", iface_name, "info"],
@@ -42103,7 +42201,6 @@ class ScanEngine:
         except Exception as e:
             _add_check("Kanal gesetzt", False, str(e))
 
-        # 3. TX-Power
         try:
             _, out, _ = CommandRunner.run(
                 ["iw", "dev", iface_name, "get", "txpower"],
@@ -42123,7 +42220,6 @@ class ScanEngine:
         except Exception as e:
             _add_check("TX-Power", False, str(e))
 
-        # 4. UP
         try:
             _, out, _ = CommandRunner.run(
                 ["ip", "link", "show", iface_name],
@@ -42142,7 +42238,6 @@ class ScanEngine:
         except Exception as e:
             _add_check("Interface UP", False, str(e))
 
-        # 5. Paketrate
         try:
             elapsed = max(1.0, time.time() - self._start_time)
             raw = self._raw_packet_count
@@ -42156,7 +42251,6 @@ class ScanEngine:
         except Exception as e:
             _add_check("Paketrate", False, str(e))
 
-        # 6. RX/TX-Errors
         try:
             base = Path("/sys/class/net") / iface_name / "statistics"
             if base.exists():
@@ -42171,7 +42265,6 @@ class ScanEngine:
         except Exception:
             pass
 
-        # 7. Signal
         try:
             nets = list(self._seen_networks.values())
             if nets:
@@ -42288,9 +42381,6 @@ class ScanEngine:
             report["total"] += 1
         return report
 
-    # ================================================================
-    # Netzwerk-Handler
-    # ================================================================
     def _handle_network_result(self, result: dict[str, Any]) -> None:
         raw_bssid = result.get("bssid", "")
         bssid = self._normalize_mac(raw_bssid) if raw_bssid else ""
@@ -42307,7 +42397,6 @@ class ScanEngine:
             self._filter_counters["bssid_blacklisted"] += 1
             return
 
-        # SSID
         raw_ssid = result.get("ssid", "")
         if raw_ssid is None:
             ssid = ""
@@ -42320,7 +42409,6 @@ class ScanEngine:
             self._filter_counters["ssid_not_whitelisted"] += 1
             return
 
-        # Signal
         signal = result.get("signal")
         if signal is None or signal == 0:
             signal = -100
@@ -42331,9 +42419,7 @@ class ScanEngine:
 
         _is_v35 = bool(result.get("_v35_source"))
 
-        # v10.7: Fragmente ohne RSSI verwerfen (keine "OPEN"-Geister)
         if signal == -100 and not result.get("_v35_source"):
-            # Nur verwerfen wenn wir schon einen echten Wert hatten
             existing_sig = None
             with self._lock:
                 ex = self._seen_networks.get(bssid)
@@ -42354,7 +42440,6 @@ class ScanEngine:
                 )
             return
 
-        # CentralStore
         try:
             _store = get_store()
         except (NameError, AttributeError):
@@ -42381,7 +42466,6 @@ class ScanEngine:
             except Exception:
                 pass
 
-        # Kanal
         channel = result.get("channel", 0)
         try:
             channel = int(channel) if channel else 0
@@ -42393,7 +42477,6 @@ class ScanEngine:
                 self._channel_usage[channel] += 1
                 self._channel_traffic[channel] += 1
 
-        # Watchlist
         try:
             cb = getattr(self, "_watchlist_check_cb", None)
             if cb:
@@ -42406,9 +42489,7 @@ class ScanEngine:
         except (AttributeError, TypeError):
             pass
 
-        # Timeline
         is_new = bssid not in self._seen_networks
-        # v10.6: Fragmente ohne RSSI verwerfen (waren "OPEN"-Geister)
         if signal == -100 and not self._seen_networks.get(bssid):
             self._filter_counters["no_rssi_fragment"] = (
                 self._filter_counters.get("no_rssi_fragment", 0) + 1
@@ -42426,7 +42507,6 @@ class ScanEngine:
             except Exception:
                 pass
 
-        # Kismet + ChannelStats
         try:
             if self._kismet_logger is not None:
                 self._kismet_logger.log_network(
@@ -42441,41 +42521,21 @@ class ScanEngine:
         except Exception:
             pass
 
-        # DiscoveryEngine
         try:
             if self._discovery_engine is not None:
                 self._discovery_engine.process_wlan_beacon(result)
         except Exception:
             pass
 
-        # v10.7-DIAG-HANDLE: was kommt aus dem PacketProcessor an?
-        try:
-            with open("/tmp/wlan_crypto_debug.log", "a", encoding="utf-8") as _fh:
-                import time as _t
+        # P10.2: Handle-Debug nur bei aktivem Debugging
+        if self.debug_sniffer:
+            self.logger.debug(
+                f"[HANDLE] bssid={bssid} "
+                f"enc={result.get('encryption', '?')} "
+                f"sig={result.get('signal', '?')} "
+                f"v35={result.get('_v35_source', False)}"
+            )
 
-                _fh.write(
-                    _t.strftime("%H:%M:%S")
-                    + " [HANDLE] "
-                    + "bssid="
-                    + str(bssid)
-                    + " "
-                    + "enc="
-                    + str(result.get("encryption", "?"))
-                    + " "
-                    + "sig="
-                    + str(result.get("signal", "?"))
-                    + " "
-                    + "v35="
-                    + str(result.get("_v35_source", False))
-                    + " "
-                    + "v84="
-                    + str(result.get("_v84_enhanced", False))
-                    + "\n"
-                )
-        except (OSError, AttributeError, TypeError, ValueError):
-            pass
-
-        # ---- Merging ------------------------------------------
         now = time.time()
         with self._lock:
             if bssid not in self._seen_networks:
@@ -42490,6 +42550,17 @@ class ScanEngine:
                     "wps": bool(result.get("wps", False)),
                     "wps_locked": bool(result.get("wps_locked", False)),
                     "wps_version": result.get("wps_version", ""),
+                    "wps_state": result.get("wps_state", ""),
+                    "wps_config_methods": list(
+                        result.get("wps_config_methods") or []
+                    ),
+                    "wps_device_name": result.get("wps_device_name", ""),
+                    "wps_manufacturer": result.get("wps_manufacturer", ""),
+                    "wps_model": result.get("wps_model", ""),
+                    "wps_model_number": result.get("wps_model_number", ""),
+                    "wps_serial": result.get("wps_serial", ""),
+                    "wps_device_type": result.get("wps_device_type", ""),
+                    "wps_rf_bands": result.get("wps_rf_bands", ""),
                     "sae": bool(result.get("sae", False)),
                     "owe": bool(result.get("owe", False)),
                     "enterprise": bool(result.get("enterprise", False)),
@@ -42535,9 +42606,27 @@ class ScanEngine:
                 if _rank.get(new_enc, 0) > _rank.get(old_enc, 0):
                     existing["encryption"] = new_enc
 
-                for k in ("cipher", "akm", "wps_version"):
+                for k in (
+                    "cipher",
+                    "akm",
+                    "wps_version",
+                    "wps_state",
+                    "wps_device_name",
+                    "wps_manufacturer",
+                    "wps_model",
+                    "wps_model_number",
+                    "wps_serial",
+                    "wps_device_type",
+                    "wps_rf_bands",
+                ):
                     if result.get(k) and not existing.get(k):
                         existing[k] = result[k]
+                if result.get("wps_config_methods") and not existing.get(
+                    "wps_config_methods"
+                ):
+                    existing["wps_config_methods"] = list(
+                        result["wps_config_methods"]
+                    )
                 for flag in (
                     "wps",
                     "wps_locked",
@@ -42554,7 +42643,6 @@ class ScanEngine:
                     existing["decoded_ies"] = result["decoded_ies"]
 
 
-        # ---- Emission -----------------------------------------
         if is_new:
             self._filter_counters["accepted_new"] += 1
             if self.debug_sniffer:
@@ -42650,9 +42738,6 @@ class ScanEngine:
             return ""
         return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
 
-    # ================================================================
-    # Watchdog
-    # ================================================================
     def _watchdog_loop(self) -> None:
         while not self._stop_event.is_set():
             self._stop_event.wait(self._watchdog_interval)
@@ -42711,7 +42796,6 @@ class ScanEngine:
                 except (OSError, RuntimeError, ValueError) as exc:
                     self.logger.error(f"Sniffer-Neustart {iface_name}: {exc}")
 
-            # Stille-Warnung (Timer wird resettet, damit kein Spam)
             if self._last_packet_time > 0:
                 silence = time.time() - self._last_packet_time
                 if silence > self._silence_warning_threshold:
@@ -42720,9 +42804,6 @@ class ScanEngine:
                     )
                     self._last_packet_time = time.time()
 
-    # ================================================================
-    # Statistik
-    # ================================================================
     def _stats_loop(self) -> None:
         last_packets = 0
         last_networks = 0
@@ -42772,9 +42853,6 @@ class ScanEngine:
             }
             self._safe_emit(self._signals.statistics_update, stats)
 
-    # ================================================================
-    # Öffentliche Getter
-    # ================================================================
     def get_seen_networks(self) -> list[dict[str, Any]]:
         with self._lock:
             return [copy.deepcopy(n) for n in self._seen_networks.values()]
@@ -42809,9 +42887,6 @@ class ScanEngine:
     def get_filter_counters(self) -> dict[str, int]:
         return dict(self._filter_counters)
 
-    # ================================================================
-    # Hilfsmethoden
-    # ================================================================
     def _safe_emit(self, signal: Any, *args: Any) -> None:
         try:
             signal.emit(*args)
@@ -42826,9 +42901,6 @@ class ScanEngine:
         except (AttributeError, RuntimeError, TypeError):
             pass
 
-    # ================================================================
-    # Cleanup
-    # ================================================================
     def cleanup(self) -> None:
         self.stop()
         with self._lock:
@@ -42856,9 +42928,6 @@ class ScanEngine:
         )
 
 
-# ----------------------------------------------------------------------
-# GPSManager (seriell + simuliert, mit Callback-Liste)
-# ----------------------------------------------------------------------
 class GPSManager:
     """
     Vollständige, erweiterte Klasse für GPS-Empfang (seriell oder simuliert).
@@ -42882,13 +42951,12 @@ class GPSManager:
         self.event_bus = event_bus
         self.logger = logging.getLogger(__name__ + ".GPSManager")
 
-        # Zustand
         self.serial_port: serial.Serial | None = None
         self.latitude: float = 0.0
         self.longitude: float = 0.0
         self.altitude: float = 0.0
-        self.speed: float = 0.0  # Knoten
-        self.track: float = 0.0  # Richtung in Grad
+        self.speed: float = 0.0  
+        self.track: float = 0.0  
         self.fix_quality: int = 0
         self.satellites_used: int = 0
         self.hdop: float = 0.0
@@ -42900,18 +42968,13 @@ class GPSManager:
         self.thread: threading.Thread | None = None
         self.simulated = False
         self.callbacks: list[Callable[[float, float, float], None]] = []
-
-        # Simulator-Parameter
         self._sim_lat = 52.5200
         self._sim_lon = 13.4050
         self._sim_alt = 50.0
         self._sim_t = 0.0
-        self._sim_radius = 0.002  # km
-        self._sim_speed = 2.0  # km/h
+        self._sim_radius = 0.002 
+        self._sim_speed = 2.0 
 
-    # ------------------------------------------------------------
-    # Start / Stop
-    # ------------------------------------------------------------
     def start(self, simulated: bool = False) -> bool:
         """
         Startet den GPS-Empfang (entweder echt oder simuliert).
@@ -42930,7 +42993,6 @@ class GPSManager:
             self.logger.info("GPS Simulator gestartet")
             return True
 
-        # Echter GPS über seriellen Port
         if not PYSERIAL_AVAILABLE:
             self.logger.error(
                 "pyserial nicht installiert, kann echten GPS nicht starten"
@@ -42966,9 +43028,6 @@ class GPSManager:
                 self.logger.debug(f"Fehler beim Schließen des seriellen Ports: {e}")
         self.logger.info("GPS gestoppt")
 
-    # ------------------------------------------------------------
-    # Callback-Verwaltung
-    # ------------------------------------------------------------
     def add_callback(self, callback: Callable[[float, float, float], None]) -> None:
         """Fügt einen Callback hinzu, der bei jedem GPS-Update aufgerufen wird (lat, lon, alt)."""
         if callback not in self.callbacks:
@@ -42991,9 +43050,6 @@ class GPSManager:
             except Exception as e:
                 self.logger.error(f"Fehler in Callback: {e}")
 
-    # ------------------------------------------------------------
-    # Serielle GPS-Lese-Schleife (NMEA)
-    # ------------------------------------------------------------
     def _read_loop(self) -> None:
         """Hauptschleife für echten GPS-Empfang über serielle Schnittstelle."""
         while self.running and self.serial_port and self.serial_port.is_open:
@@ -43039,7 +43095,6 @@ class GPSManager:
             except Exception as e:
                 self.logger.debug(f"pynmea2 parse error: {e}")
         else:
-            # Fallback: Einfaches Parsen für GPGGA
             if line.startswith("$GPGGA"):
                 parts = line.split(",")
                 if len(parts) >= 10 and parts[2] and parts[4]:
@@ -43063,9 +43118,6 @@ class GPSManager:
                     except (ValueError, IndexError) as e:
                         self.logger.debug(f"Fallback parse error: {e}")
 
-    # ------------------------------------------------------------
-    # Simulator-Schleife (Kreisbewegung)
-    # ------------------------------------------------------------
     def _simulate_loop(self) -> None:
         """Simuliert GPS-Daten mit einer sich bewegenden Position (Kreis oder Linie)."""
         while self.running:
@@ -43087,9 +43139,6 @@ class GPSManager:
             self._notify_callbacks()
             time.sleep(2.0)
 
-    # ------------------------------------------------------------
-    # EventBus & Hilfsmethoden
-    # ------------------------------------------------------------
     def _emit_update(self) -> None:
         """Sendet ein GPS-Update über den EventBus, falls vorhanden."""
         if self.event_bus:
@@ -43130,9 +43179,6 @@ class GPSManager:
         with self.lock:
             return self.hdop
 
-    # ------------------------------------------------------------
-    # Dunder-Methoden
-    # ------------------------------------------------------------
     def __repr__(self) -> str:
         status = (
             "Simulator" if self.simulated else ("Echt" if self.running else "Gestoppt")
@@ -43140,9 +43186,6 @@ class GPSManager:
         return f"<GPSManager status={status} fix={self.has_fix()} lat={self.latitude:.5f} lon={self.longitude:.5f}>"
 
 
-# ----------------------------------------------------------------------
-# KaliToolManager (Prozessverwaltung)
-# ----------------------------------------------------------------------
 class KaliToolManager:
     """
     Vollständiger, erweiterter Tool-Manager für Kali Linux Penetration Testing Tools.
@@ -43162,9 +43205,6 @@ class KaliToolManager:
         self._lock = threading.RLock()
         self._output_threads: dict[str, threading.Thread] = {}
 
-    # ------------------------------------------------------------
-    # Tool-Erkennung
-    # ------------------------------------------------------------
     def check_tool(self, tool: str) -> bool:
         """
         Prüft, ob ein Tool im System verfügbar ist (cached).
@@ -43190,9 +43230,6 @@ class KaliToolManager:
         """Gibt den absoluten Pfad eines Tools zurück oder None."""
         return shutil.which(tool)
 
-    # ------------------------------------------------------------
-    # Tool-Ausführung (mit Callback und Timeout)
-    # ------------------------------------------------------------
     def run_tool(
         self,
         tool: str,
@@ -43227,7 +43264,6 @@ class KaliToolManager:
             with self._lock:
                 self.running_processes[session_id or tool] = proc
 
-            # Thread für stdout-Ausgabe
             if callback:
 
                 def reader():
@@ -43252,7 +43288,6 @@ class KaliToolManager:
                 with self._lock:
                     self._output_threads[session_id or tool] = t
 
-            # Timeout-Handler
             if timeout:
 
                 def timeout_handler():
@@ -43273,9 +43308,6 @@ class KaliToolManager:
             self.logger.error(f"Fehler beim Starten von {tool}: {e}")
             return None
 
-    # ------------------------------------------------------------
-    # Stoppen von Tools
-    # ------------------------------------------------------------
     def stop_tool(self, identifier: str, signal: int = signal.SIGTERM) -> bool:
         """
         Stoppt ein laufendes Tool (nach Session-ID oder Tool-Name).
@@ -43291,12 +43323,10 @@ class KaliToolManager:
                 self.logger.debug(f"Kein laufender Prozess fuer {identifier}")
                 return False
             try:
-                # Versuche zuerst zu terminieren
                 if sys.platform != "win32":
                     os.killpg(os.getpgid(proc.pid), signal)
                 else:
                     proc.terminate()
-                # Kurze Wartezeit
                 for _ in range(10):
                     if proc.poll() is not None:
                         break
@@ -43322,9 +43352,6 @@ class KaliToolManager:
             self.stop_tool(ident)
         self.logger.info("Alle Tools gestoppt")
 
-    # ------------------------------------------------------------
-    # Status & Information
-    # ------------------------------------------------------------
     def is_running(self, identifier: str) -> bool:
         """Prüft, ob ein Tool (nach ID) noch läuft."""
         with self._lock:
@@ -43336,9 +43363,6 @@ class KaliToolManager:
         with self._lock:
             return list(self.running_processes.keys())
 
-    # ------------------------------------------------------------
-    # Convenience-Methoden für spezifische Tools
-    # ------------------------------------------------------------
     def run_airodump(
         self,
         interface: str,
@@ -43390,16 +43414,10 @@ class KaliToolManager:
             args.extend(additional_args)
         return self.run_tool("hashcat", args, session_id=f"hashcat_{hash_type}")
 
-    # ------------------------------------------------------------
-    # Dunder-Methoden
-    # ------------------------------------------------------------
     def __repr__(self) -> str:
         return f"<KaliToolManager available={len(self.available_tools)} running={len(self.running_processes)}>"
 
 
-# ----------------------------------------------------------------------
-# AttackController (Deauth, Evil Twin, etc.)
-# ----------------------------------------------------------------------
 @dataclass
 class AttackResult:
     """
@@ -43592,16 +43610,9 @@ class AttackController:
 
     def __init__(self, controller: Any):
         self.controller = controller
-
-        # Robuste Attribut-Auflösung mit Fallbacks, weil unterschiedliche
-        # Controller-Klassen (WLANUltimateGUI, PentestingEngine) verschiedene
-        # Attributnamen verwenden.
-        # v8.3-FIX: PentestingEngine hat evtl. .tool_manager=None
-        # → weiter nach oben suchen (Parent/Backref)
         self.tool_manager = getattr(controller, "tool_manager", None) or getattr(
             controller, "kali_tool_manager", None
         )
-        # Fallback-Chain falls direkt am Controller nichts liegt
         if self.tool_manager is None:
             for attr in (
                 "_parent",
@@ -43621,13 +43632,7 @@ class AttackController:
                 if tm is not None:
                     self.tool_manager = tm
                     break
-        # Ohne ToolManager: Dummy einsetzen statt crashen.
-        # So bleibt AttackController konstruierbar und alle Aufrufe
-        # werden zu No-Ops (shutdown-crash-frei).
         if self.tool_manager is None:
-            # v8.3-FIX: Nur warnen, wenn kein Backref existiert.
-            # Wenn PentestingEngine._parent = GUI gesetzt ist, sollte
-            # tool_manager oben schon gefunden worden sein.
             self.logger_init_warning = (
                 f"AttackController: Kein ToolManager am Controller "
                 f"({type(controller).__name__}) — "
@@ -43645,7 +43650,6 @@ class AttackController:
             controller, "konfig_manager", None
         )
 
-        # Sicherheitscheck: Kritische Attribute müssen vorhanden sein
         if self.iface_mgr is None:
             raise RuntimeError(
                 "AttackController: Kein Interface-Manager gefunden. "
@@ -43655,16 +43659,12 @@ class AttackController:
         self.logger = logging.getLogger("wlan_ultimate.AttackController")
         if getattr(self, "logger_init_warning", None):
             self.logger.warning(self.logger_init_warning)
-        # v4.0: Fehlende Attribute initialisieren
         self._active_sessions: dict[str, Any] = {}
         self._attack_progress: dict[str, float] = {}
         self._attack_callbacks: dict[str, Any] = {}
         self._lock = threading.RLock()
         self._temp_dirs: list[Path] = []
 
-    # ------------------------------------------------------------
-    # MAC-Spoofing
-    # ------------------------------------------------------------
     def change_mac(
         self, iface: str, random: bool = True, new_mac: str | None = None
     ) -> bool:
@@ -43678,14 +43678,6 @@ class AttackController:
             self.logger.info(f"MAC-Änderung für {iface} gestartet")
             return True
         return False
-
-    # ------------------------------------------------------------
-    # Deauthentication (aireplay-ng + Scapy)
-    # ------------------------------------------------------------
-
-    # ══════════════════════════════════════════════════════════════
-    # v7.0: Erweiterte Angriffe
-    # ══════════════════════════════════════════════════════════════
 
     def run_beacon_flood(self, iface, ssid_prefix="FreeWiFi", count=100):
         """Beacon-Flood mit mdk4 (Fallback: Scapy)."""
@@ -43702,7 +43694,6 @@ class AttackController:
             sid = "beacon_" + str(int(time.time()))
             self._run_tool_with_session(sid, "mdk4", cmd)
             return sid
-        # Scapy-Fallback
         if not SCAPY_AVAILABLE:
             return None
         sid = "beacon_scapy_" + str(int(time.time()))
@@ -43805,7 +43796,6 @@ class AttackController:
                 timeout=5,
             )
             return rc == 0
-        # ip link Fallback
         rc, _, _ = CommandRunner.run(
             ["ip", "link", "set", iface, "down"],
             subsystem="injection",
@@ -43831,7 +43821,6 @@ class AttackController:
         """ARP-Spoofing (MITM) - laeuft bis stop."""
         if not SCAPY_AVAILABLE:
             return None
-        # v7.1: IP-Forward aktivieren (fuer echtes MITM)
         try:
             CommandRunner.run(
                 ["sysctl", "-w", "net.ipv4.ip_forward=1"],
@@ -43947,9 +43936,6 @@ class AttackController:
         except Exception as e:
             self.logger.error(f"Fehler beim Senden von Deauth-Paketen: {e}")
 
-    # ------------------------------------------------------------
-    # ARP-Spoofing (Man-in-the-Middle)
-    # ------------------------------------------------------------
     def arp_spoof(
         self, iface: str, target_ip: str, spoof_ip: str, interval: float = 2.0
     ) -> str | None:
@@ -43986,9 +43972,6 @@ class AttackController:
                 return True
         return False
 
-    # ------------------------------------------------------------
-    # DNS-Spoofing (mit dnsmasq)
-    # ------------------------------------------------------------
     def dns_spoof(self, iface: str, hosts_file: Path | None = None) -> str | None:
         if not self.tool_manager.check_tool("dnsmasq"):
             self.logger.error("dnsmasq nicht gefunden")
@@ -44011,9 +43994,6 @@ class AttackController:
         )
         return session_id
 
-    # ------------------------------------------------------------
-    # WPS-Angriffe (Reaver, Bully)
-    # ------------------------------------------------------------
     def run_reaver(
         self,
         iface: str,
@@ -44163,9 +44143,6 @@ class AttackController:
                 pass
         return None
 
-    # ------------------------------------------------------------
-    # Evil Twin (Rogue AP) mit hostapd und dnsmasq
-    # ------------------------------------------------------------
     def start_evil_twin(
         self,
         ssid: str,
@@ -44218,7 +44195,6 @@ class AttackController:
                 except (AttributeError, TypeError):
                     pass
                 return None
-            # v10.8: Qt-Signale -> Callables fuer CLI/Workflow
             for _sig, _cb in (
                 (getattr(ctrl, "log_signal", None), on_log),
                 (getattr(ctrl, "credential_signal", None), on_cred),
@@ -44458,8 +44434,6 @@ class AttackController:
         return self._stop_loop_session(session_id)
 
     def stop_all(self) -> None:
-        # tool_manager kann None sein, wenn AttackController von
-        # PentestingEngine (ohne KaliToolManager) instanziiert wurde.
         if self.tool_manager is not None:
             self.tool_manager.stop_all()
         with self._lock:
@@ -44522,21 +44496,14 @@ class AntennaTester:
         self.db = db_manager
         self.logger = logging.getLogger(__name__ + ".AntennaTester")
         self._lock = threading.RLock()
-
-        # Antennen-Datenbank
         self.antennen_datenbank: dict[str, AntennaProfile] = {}
         self._init_default_antennas()
-
-        # Historie pro BSSID
         self._history: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._max_history_per_bssid = 50
-
-        # NEU: Live-Messungen
         self._measurements: list[AntennaMeasurement] = []
         self._measurement_file = (
             Path.home() / ".wlan_ultimate" / "antenna_measurements.json"
         )
-        # Beim Start laden
         try:
             self.load_measurements()
         except (OSError, ValueError):
@@ -44638,7 +44605,6 @@ class AntennaTester:
                 horizontal_beamwidth_deg=45.0,
                 vertical_beamwidth_deg=45.0,
             ),
-            # -------- Yagi --------
             AntennaProfile(
                 name="Yagi 14 dBi",
                 dbi=14.0,
@@ -44673,7 +44639,6 @@ class AntennaTester:
                 horizontal_beamwidth_deg=10.0,
                 vertical_beamwidth_deg=12.0,
             ),
-            # -------- Parabolic --------
             AntennaProfile(
                 name="Parabolic Grid 24 dBi",
                 dbi=24.0,
@@ -44708,7 +44673,6 @@ class AntennaTester:
                 horizontal_beamwidth_deg=3.0,
                 vertical_beamwidth_deg=3.0,
             ),
-            # -------- Patch --------
             AntennaProfile(
                 name="Patch 8 dBi",
                 dbi=8.0,
@@ -44730,7 +44694,6 @@ class AntennaTester:
             self.antennen_datenbank[self._make_key(ant.name)] = ant
         self.logger.info(f"{len(self.antennen_datenbank)} Standard-Antennen geladen.")
 
-        # v8.1: Erweiterte Antennen-Profile
         additional_antennas = [
             AntennaProfile(
                 name="Alfa Omni 2 dBi (mitgeliefert)",
@@ -44993,9 +44956,6 @@ class AntennaTester:
     def _make_key(name: str) -> str:
         return name.lower().replace(" ", "_").replace("-", "_")
 
-    # ==================================================================
-    # Datenbank-Verwaltung
-    # ==================================================================
     def list_antennas(self) -> list[AntennaProfile]:
         with self._lock:
             return list(self.antennen_datenbank.values())
@@ -45067,9 +45027,6 @@ class AntennaTester:
                     continue
         return count
 
-    # ==================================================================
-    # Link-Budget
-    # ==================================================================
     def calculate_link_budget(
         self,
         antenna: AntennaProfile,
@@ -45207,9 +45164,6 @@ class AntennaTester:
             "d2_m": round(d2_m, 2),
         }
 
-    # ==================================================================
-    # Vergleich
-    # ==================================================================
     def compare_antennas(
         self,
         netzwerk: Any,
@@ -45287,9 +45241,6 @@ class AntennaTester:
             return max(results, key=lambda x: x["dbi"])
         return results[0]
 
-    # ==================================================================
-    # Richtungsscan
-    # ==================================================================
     def directional_scan(
         self,
         antenna: AntennaProfile | None = None,
@@ -45385,9 +45336,6 @@ class AntennaTester:
             "breite_grad": round(breite, 1),
         }
 
-    # ==================================================================
-    # Live-Test
-    # ==================================================================
     def live_antenna_test(
         self,
         ziel_netzwerk: Any,
@@ -45456,9 +45404,6 @@ class AntennaTester:
         alle_ergebnisse.sort(key=lambda x: x["durchschnitt_dbm"], reverse=True)
         return alle_ergebnisse
 
-    # ==================================================================
-    # Kabel / VSWR / Polarisation
-    # ==================================================================
     def kabel_verlust_berechnen(
         self, kabel_typ: str, laenge_m: float, frequency_mhz: float
     ) -> dict[str, Any]:
@@ -45529,9 +45474,6 @@ class AntennaTester:
             "hinweis": hinweis,
         }
 
-    # ==================================================================
-    # Live-Messungen (NEU)
-    # ==================================================================
     def add_measurement(self, measurement: AntennaMeasurement) -> None:
         """Speichert eine Live-Messung und persistiert sie."""
         with self._lock:
@@ -45589,9 +45531,6 @@ class AntennaTester:
         analyzer = AntennaComparisonAnalyzer(self.logger)
         return analyzer.compare_two(baseline, new)
 
-    # ==================================================================
-    # Hilfsfunktionen
-    # ==================================================================
     def _freq_to_band(self, frequency_mhz: float) -> str:
         if 2400 <= frequency_mhz <= 2500:
             return "2.4"
@@ -45637,9 +45576,6 @@ class AntennaTester:
             basis += " Kompakt für kurze Distanzen."
         return basis
 
-    # ==================================================================
-    # Historie
-    # ==================================================================
     def _add_to_history(self, bssid: str, eintrag: dict[str, Any]) -> None:
         with self._lock:
             self._history[bssid].append(eintrag)
@@ -45657,9 +45593,6 @@ class AntennaTester:
             else:
                 self._history.clear()
 
-    # ==================================================================
-    # Export
-    # ==================================================================
     def export_results_csv(self, results: list[dict[str, Any]], filepath: Path) -> bool:
         if not results:
             return False
@@ -45715,9 +45648,6 @@ class AntennaTester:
             self.logger.error(f"JSON-Export fehlgeschlagen: {exc}")
             return False
 
-    # ==================================================================
-    # Statistik / Cleanup
-    # ==================================================================
     def get_statistics(self) -> dict[str, Any]:
         with self._lock:
             antennas = list(self.antennen_datenbank.values())
@@ -45842,20 +45772,16 @@ class AIMLProcessor:
         self._channel_usage = defaultdict(int)
         self._confidence_threshold = 0.7
 
-    # ------------------------------------------------------------
-    # Netzwerkverhalten vorhersagen
-    # ------------------------------------------------------------
     def predict_network_behavior(self, netzwerk) -> dict[str, Any]:
         """
         Sagt das Verhalten eines Netzwerks basierend auf Features voraus.
         netzwerk: WLANNetzwerk-Objekt (benötigt ssid, bssid, signal_stärke, client_anzahl, etc.)
         Rückgabe: Dictionary mit Vorhersagen (Peak-Zeit, Trend, Stabilität, etc.)
         """
-        # Features extrahieren
         features = {
             "signal_variation": random.uniform(
                 0.1, 0.9
-            ),  # Simuliert – in echter Implementierung aus Historie
+            ),  
             "client_count_variation": random.uniform(0.1, 0.5),
             "time_of_day": datetime.now().hour / 24,
             "day_of_week": datetime.now().weekday() / 7,
@@ -45864,7 +45790,6 @@ class AIMLProcessor:
             "has_wps": 1.0 if netzwerk.wps_aktiv else 0.0,
         }
 
-        # Einfaches regelbasiertes Modell (für Demo – könnte durch echte ML ersetzt werden)
         predictions = {
             "peak_usage_time": f"{random.randint(17, 20)}:00-{random.randint(21, 23)}:00",
             "vulnerability_trend": (
@@ -45888,9 +45813,6 @@ class AIMLProcessor:
         }
         return predictions
 
-    # ------------------------------------------------------------
-    # Anomalieerkennung
-    # ------------------------------------------------------------
     def anomaly_detection(self, netzwerke: list) -> list[dict[str, Any]]:
         """
         Erkennt Anomalien in einer Liste von Netzwerken.
@@ -45898,7 +45820,6 @@ class AIMLProcessor:
         """
         anomalies = []
         for netzwerk in netzwerke:
-            # 1. Ungewöhnlich hohe Signalstärke (sehr naher AP)
             if netzwerk.signal_stärke > -40:
                 anomalies.append(
                     {
@@ -45912,7 +45833,6 @@ class AIMLProcessor:
                     }
                 )
 
-            # 2. Offenes Netzwerk mit vielen Clients (gefährlich)
             if netzwerk.verschlüsselung == "OPEN" and netzwerk.client_anzahl > 10:
                 anomalies.append(
                     {
@@ -45926,7 +45846,6 @@ class AIMLProcessor:
                     }
                 )
 
-            # 3. WEP-Verschlüsselung (kritisch)
             if netzwerk.verschlüsselung == "WEP":
                 anomalies.append(
                     {
@@ -45940,7 +45859,6 @@ class AIMLProcessor:
                     }
                 )
 
-            # 4. Hidden SSID mit schwachem Signal (möglicherweise absichtlich versteckt)
             if netzwerk.hidden and netzwerk.signal_stärke < -80:
                 anomalies.append(
                     {
@@ -45954,7 +45872,6 @@ class AIMLProcessor:
                     }
                 )
 
-            # 5. WPS aktiv (hohes Risiko)
             if netzwerk.wps_aktiv:
                 anomalies.append(
                     {
@@ -45970,9 +45887,6 @@ class AIMLProcessor:
 
         return anomalies
 
-    # ------------------------------------------------------------
-    # Adaptives Scanning
-    # ------------------------------------------------------------
     def adaptive_scanning(
         self, historical_data: list[dict] | None = None
     ) -> dict[str, Any]:
@@ -45982,26 +45896,21 @@ class AIMLProcessor:
         Rückgabe: Dict mit optimal_channels, scan_duration, hop_sequence, ai_recommendation.
         """
         if historical_data and len(historical_data) > 10:
-            # Kanalstatistik aus vergangenen Scans
             channels = [entry.get("kanal", 1) for entry in historical_data]
             channel_counts = {}
             for ch in channels:
                 channel_counts[ch] = channel_counts.get(ch, 0) + 1
-            # Top 6 Kanäle (meistgenutzt)
             top_channels = sorted(
                 channel_counts.items(), key=lambda x: x[1], reverse=True
             )[:6]
             optimal_channels = [ch for ch, _ in top_channels]
         else:
-            # Standardkanäle (2,4 GHz und 5 GHz typische)
             optimal_channels = [1, 6, 11, 36, 44, 149]
-
-        # Hop-Sequenz generieren (abwechselnd 2,4 und 5 GHz)
         hop_sequence = self._generate_hop_sequence(optimal_channels)
 
         return {
             "optimal_channels": optimal_channels,
-            "scan_duration": 45,  # Sekunden
+            "scan_duration": 45,  
             "hop_sequence": hop_sequence,
             "ai_recommendation": "Focus 5GHz für weniger Störungen",
             "estimated_networks": (
@@ -46025,9 +45934,6 @@ class AIMLProcessor:
                 sequence.append(bands_5[i])
         return sequence if sequence else channels
 
-    # ------------------------------------------------------------
-    # Risikobewertung (AI-gestützt)
-    # ------------------------------------------------------------
     def evaluate_risk(self, netzwerk) -> dict[str, Any]:
         """
         Berechnet ein umfassendes Risiko-Profil für ein Netzwerk.
@@ -46036,7 +45942,6 @@ class AIMLProcessor:
         score = netzwerk.get_sicherheits_score()
         risk_level = netzwerk.get_sicherheits_level()
 
-        # Zusätzliche KI-Faktoren
         ai_risk_modifier = 0
         if netzwerk.client_anzahl > 20:
             ai_risk_modifier -= 10
@@ -46064,16 +45969,12 @@ class AIMLProcessor:
             ),
         }
 
-    # ------------------------------------------------------------
-    # Training (Platzhalter für echtes ML)
-    # ------------------------------------------------------------
     def train(self, data: list[dict], labels: list | None = None) -> None:
         """
         Trainiert ein einfaches Modell (hier simuliert).
         In einer echten Implementierung könnte hier scikit-learn oder TensorFlow genutzt werden.
         """
         self.training_data.extend(data)
-        # Simuliere Trainingserfolg
         self.models["last_trained"] = datetime.now()
         self.models["sample_count"] = len(self.training_data)
 
@@ -46083,12 +45984,8 @@ class AIMLProcessor:
         """
         if "last_trained" not in self.models:
             return None
-        # Dummy: zufällige Klasse oder Regression
         return random.choice(["safe", "warning", "critical"])
 
-    # ------------------------------------------------------------
-    # Hilfsmethoden
-    # ------------------------------------------------------------
     def update_channel_usage(self, channel: int) -> None:
         """Aktualisiert die Kanalauslastungsstatistik (für adaptives Scanning)."""
         self._channel_usage[channel] += 1
@@ -46166,15 +46063,11 @@ class EnterpriseSecurityAnalyzer:
             },
         }
 
-    # ------------------------------------------------------------------
-    # 802.1X/EAP Analyse
-    # ------------------------------------------------------------------
     def analyze_8021x(self, netzwerk) -> dict[str, Any]:
         """
         Analysiert die 802.1X/EAP Konfiguration eines Enterprise-Netzwerks.
         Simuliert Erkennung von EAP-Methoden, Zertifikatsvalidierung, RADIUS-Server.
         """
-        # Simuliere EAP-Methoden-Erkennung (in realer Implementierung über Packet Inspection)
         eap_method = random.choice(self.eap_methods)
         certificate_validation = random.choice([True, False])
         tunneled_auth = random.choice(["MSCHAPv2", "GTC", "TLS", "PAP", "CHAP"])
@@ -46192,7 +46085,6 @@ class EnterpriseSecurityAnalyzer:
             "recommendations": [],
         }
 
-        # Schwachstellenanalyse
         if eap_method == "LEAP":
             analysis["vulnerabilities"].append(
                 {
@@ -46239,9 +46131,8 @@ class EnterpriseSecurityAnalyzer:
             analysis["security_score"] -= 30
 
         if eap_method == "EAP-TLS":
-            analysis["security_score"] += 10  # Beste Methode
+            analysis["security_score"] += 10 
 
-        # Empfehlungen generieren
         if analysis["security_score"] < 70:
             analysis["recommendations"].append(
                 "Implement EAP-TLS with certificate validation for best security"
@@ -46261,7 +46152,6 @@ class EnterpriseSecurityAnalyzer:
 
         analysis["security_score"] = max(0, min(100, analysis["security_score"]))
 
-        # In DB speichern (falls vorhanden)
         if self.db and hasattr(self.db, "speichere_enterprise_analyse"):
             try:
                 self.db.speichere_enterprise_analyse(
@@ -46280,9 +46170,6 @@ class EnterpriseSecurityAnalyzer:
 
         return analysis
 
-    # ------------------------------------------------------------------
-    # NAC Bypass Test
-    # ------------------------------------------------------------------
     def nac_bypass_test(self) -> dict[str, Any]:
         """
         Testet verschiedene Techniken zur Umgehung von Network Access Control (NAC).
@@ -46318,9 +46205,6 @@ class EnterpriseSecurityAnalyzer:
             "risk_of_lockout": "Low" if success_rate < 60 else "Medium",
         }
 
-    # ------------------------------------------------------------------
-    # WIDS Evasion Test
-    # ------------------------------------------------------------------
     def wireless_ids_evasion(self) -> dict[str, Any]:
         """
         Testet Methoden zur Umgehung von Wireless Intrusion Detection Systems.
@@ -46356,9 +46240,6 @@ class EnterpriseSecurityAnalyzer:
             ],
         }
 
-    # ------------------------------------------------------------------
-    # RADIUS Server Test
-    # ------------------------------------------------------------------
     def radius_server_test(self, server_ip: str = None) -> dict[str, Any]:
         """
         Testet RADIUS Server auf bekannte Schwachstellen.
@@ -46395,15 +46276,11 @@ class EnterpriseSecurityAnalyzer:
             "security_score": random.randint(30, 90),
         }
 
-    # ------------------------------------------------------------------
-    # Zertifikatsvalidierungstest
-    # ------------------------------------------------------------------
     def certificate_validation_test(self, netzwerk) -> dict[str, Any]:
         """
         Testet, ob Clients die Server-Zertifikate validieren.
         (Simuliert MITM-Angriff)
         """
-        # In realer Implementierung würde ein Rogue-AP mit selbstsigniertem Zertifikat erstellt
         return {
             "mitm_possible": random.choice([True, False]),
             "clients_vulnerable": random.randint(0, 100),
@@ -46416,9 +46293,6 @@ class EnterpriseSecurityAnalyzer:
             "risk_level": "CRITICAL" if random.random() > 0.7 else "HIGH",
         }
 
-    # ------------------------------------------------------------------
-    # EAP-Downgrade Attack Detection
-    # ------------------------------------------------------------------
     def eap_downgrade_test(self) -> dict[str, Any]:
         """
         Testet, ob ein Downgrade von EAP-TLS auf schwächere Methoden möglich ist.
@@ -46433,9 +46307,6 @@ class EnterpriseSecurityAnalyzer:
             "severity": "HIGH" if random.random() > 0.6 else "MEDIUM",
         }
 
-    # ------------------------------------------------------------------
-    # Hilfsmethoden
-    # ------------------------------------------------------------------
     def get_radius_vulnerabilities(self) -> dict[str, dict]:
         """Gibt die bekannten RADIUS-Schwachstellen zurück."""
         return self.radius_vulnerabilities.copy()
@@ -46464,43 +46335,27 @@ class AdvancedVisualization:
         self.figure_cache = {}
         self._current_figure = None
 
-    # ------------------------------------------------------------
-    # 3D Signal Map
-    # ------------------------------------------------------------
     def create_3d_signal_map(self, netzwerke: list) -> dict[str, Any]:
         """
         Erstellt eine 3D-Signalstärke-Map aus einer Liste von WLANNetzwerk-Objekten.
         Gibt ein Dictionary mit den Daten für die Visualisierung zurück (x, y, z, Farben, Größen).
         Falls Matplotlib/NumPy nicht verfügbar, wird ein Fehler-Dictionary zurückgegeben.
-
-        Verbesserungen:
-        - Vermeidet Shadowing des 'signal'-Imports (Variable umbenannt in 'sig')
-        - Prüft Verfügbarkeit von Matplotlib und NumPy korrekt
-        - Behandelt leere Netzwerkliste
-        - Verwendet konsistente Variablennamen
-        - Fügt zusätzliche Metadaten hinzu (z. B. Sicherheits-Score für Farbgebung)
-        - Optimiert für Performance (max. 100 Netzwerke)
         """
         if not MATPLOTLIB_AVAILABLE or np is None:
             return {
                 "error": "Matplotlib und NumPy werden für 3D-Visualisierung benötigt. pip install matplotlib numpy"
             }
 
-        # Begrenze auf max. 100 Netzwerke für Performance
         networks = netzwerke[:100]
         n = len(networks)
         if n == 0:
             return {"error": "Keine Netzwerke vorhanden"}
 
-        # Simuliere x,y-Koordinaten (zufällig normalverteilt um 0)
-        # In einer echten Implementierung könnten GPS-Koordinaten oder triangulierte Positionen genutzt werden
         x = np.random.randn(n) * 10
         y = np.random.randn(n) * 10
-        # Z = Signalstärke (invertiert, da stärkere Signale höher dargestellt werden sollen)
         signals = [n.signal_stärke for n in networks]
-        z = np.array([-sig for sig in signals])  # Bessere Darstellung: stärker = höher
+        z = np.array([-sig for sig in signals]) 
 
-        # Farben und Größen basierend auf Signalstärke (und optional Sicherheits-Score)
         colors = []
         sizes = []
         for sig in signals:
@@ -46514,7 +46369,6 @@ class AdvancedVisualization:
                 colors.append([0, 1, 0, 0.4])  # Grün
                 sizes.append(20)
 
-        # Zusätzliche Metadaten für erweiterte Visualisierung (z. B. Tooltips)
         ssids = [n.ssid[:15] for n in networks]
         security_scores = (
             [n.get_sicherheits_score() for n in networks]
@@ -46561,7 +46415,6 @@ class AdvancedVisualization:
         ax.set_ylabel("Y (m)")
         ax.set_zlabel("Signal Strength (-dBm)")
         ax.set_title(title)
-        # Beschriftung der Punkte (optional, reduziert)
         for i, (x, y, z, label) in enumerate(zip(xs, ys, zs, ssids)):
             if i % 5 == 0:  # Nicht alle beschriften
                 ax.text(x, y, z, label, size=8, zorder=1)
@@ -46570,9 +46423,6 @@ class AdvancedVisualization:
         self._current_figure = fig
         return canvas
 
-    # ------------------------------------------------------------
-    # Echtzeit-Spektrum Analyzer
-    # ------------------------------------------------------------
     def real_time_spectrum_analyzer(
         self, channels: list[int] | None = None
     ) -> list[dict[str, Any]]:
@@ -46583,8 +46433,7 @@ class AdvancedVisualization:
         if channels is None:
             channels = list(range(1, 14)) + list(range(36, 165, 4))
         spectrum_data = []
-        for ch in channels[:30]:  # Begrenzung für Performance
-            # Simuliere Basispegel mit Rauschen (normalverteilt)
+        for ch in channels[:30]: 
             base_level = random.uniform(-95, -65)
             spikes = []
             num_spikes = random.randint(0, 3)
@@ -46595,7 +46444,6 @@ class AdvancedVisualization:
                     {"height": base_level + spike_height, "width": spike_width}
                 )
             is_occupied = base_level > -75 or len(spikes) > 0
-            # Frequenz approximieren (für Anzeige)
             if ch < 14:
                 freq = 2400 + (ch - 1) * 5
                 bandwidth = "20 MHz"
@@ -46636,9 +46484,6 @@ class AdvancedVisualization:
         canvas = FigureCanvas(fig)
         return canvas
 
-    # ------------------------------------------------------------
-    # Netzwerk-Topologie
-    # ------------------------------------------------------------
     def network_topology_map(self, netzwerke: list, clients: list) -> dict[str, Any]:
         """
         Erstellt eine Netzwerk-Topologie als Dictionary mit Knoten und Kanten.
@@ -46646,7 +46491,6 @@ class AdvancedVisualization:
         Kanten: Verbindungen zwischen Clients und APs (simuliert)
         """
         topology = {"nodes": [], "links": [], "groups": []}
-        # APs als Knoten, gruppiert nach Verschlüsselung
         encryption_groups = defaultdict(list)
         for i, netzwerk in enumerate(netzwerke[:20]):
             group_id = f"group_{netzwerk.verschlüsselung}"
@@ -46706,9 +46550,6 @@ class AdvancedVisualization:
                 )
         return topology
 
-    # ------------------------------------------------------------
-    # Signal Heatmap (für War-Driving)
-    # ------------------------------------------------------------
     def create_heatmap(
         self, netzwerke: list, gps_points: list | None = None
     ) -> list[dict]:
@@ -46765,9 +46606,6 @@ class AdvancedVisualization:
                     )
         return heatmap_points
 
-    # ------------------------------------------------------------
-    # Hilfsmethoden für Farben
-    # ------------------------------------------------------------
     @staticmethod
     def _get_security_color(score: int) -> str:
         """Gibt Farbe basierend auf Sicherheits-Score zurück (0-100)."""
@@ -46793,9 +46631,6 @@ class AdvancedVisualization:
         }
         return colors.get(encryption, "#7f8c8d")
 
-    # ------------------------------------------------------------
-    # Export-Funktionen
-    # ------------------------------------------------------------
     def save_figure(self, filename: str, dpi: int = 150) -> bool:
         """Speichert die aktuelle Matplotlib-Figur als Datei."""
         if self._current_figure is None or not MATPLOTLIB_AVAILABLE:
@@ -46857,9 +46692,6 @@ class PowerOptimizer:
         self._current_tx_power = self.power_profiles["balanced"]["tx_power"]
         self._current_scan_interval = self.power_profiles["balanced"]["scan_interval"]
 
-    # ------------------------------------------------------------
-    # Profilverwaltung
-    # ------------------------------------------------------------
     def set_power_profile(self, profile_name: str) -> bool:
         """
         Setzt das aktuelle Leistungsprofil.
@@ -46955,9 +46787,6 @@ class PowerOptimizer:
             "duty_cycle": scan_duty_cycle,
         }
 
-    # ------------------------------------------------------------
-    # Adaptive Power Control (Link Budget)
-    # ------------------------------------------------------------
     def adaptive_power_control(
         self,
         target_distance_km: float = 1.0,
@@ -46980,18 +46809,11 @@ class PowerOptimizer:
         :param receiver_sensitivity_dbm: Empfängerempfindlichkeit (dBm)
         :return: Dictionary mit benötigter TX-Power, aktueller TX-Power, Anpassung, Link-Marge, etc.
         """
-        # Entfernung in Metern
         distance_m = target_distance_km * 1000.0
-
-        # Freiraumdämpfung (Friis)
         free_space_loss_db = (
             20 * math.log10(distance_m) + 20 * math.log10(frequency_mhz) - 147.55
         )
 
-        # EIRP (Equivalent Isotropically Radiated Power)
-        # Wir lösen nach Tx_Power auf:
-        # Empfangsleistung = Tx_Power + Antenna_Gain_Tx - Cable_Loss - FSL + Antenna_Gain_Rx
-        # Empfangsleistung muss >= Receiver_Sensitivity + SNR sein
         required_rx_power_dbm = receiver_sensitivity_dbm + required_snr_db
         required_tx_power_dbm = (
             required_rx_power_dbm
@@ -47099,9 +46921,6 @@ class PowerOptimizer:
         """
         Schätzt die maximale Reichweite in Kilometern für eine gegebene Konfiguration.
         """
-        # Link Margin = 0 => received_power = rx_sensitivity
-        # rx_power = tx_power + gain_tx - cable_loss - FSL + gain_rx
-        # FSL = tx_power + gain_tx - cable_loss + gain_rx - rx_sensitivity
         fsl_db = (
             tx_power_dbm
             + antenna_gain_tx_dbi
@@ -47111,15 +46930,10 @@ class PowerOptimizer:
         )
         if fsl_db <= 0:
             return 0.0
-        # FSL(dB) = 20*log10(d) + 20*log10(f) - 147.55
-        # d = 10^((FSL + 147.55 - 20*log10(f)) / 20)
         exponent = (fsl_db + 147.55 - 20 * math.log10(frequency_mhz)) / 20.0
         distance_m = 10**exponent
         return round(distance_m / 1000.0, 2)
 
-    # ------------------------------------------------------------
-    # Echtzeit-Anpassung (simuliert)
-    # ------------------------------------------------------------
     def auto_adjust(
         self,
         current_snr_db: float,
@@ -47145,9 +46959,6 @@ class PowerOptimizer:
             self.power_profiles["adaptive"]["tx_power"] = new_power
         return new_power, action
 
-    # ------------------------------------------------------------
-    # Hilfsmethoden
-    # ------------------------------------------------------------
     def set_tx_power(self, power_dbm: float) -> None:
         """Setzt die Sendeleistung direkt (unabhängig vom Profil)."""
         self._current_tx_power = max(0, min(30, power_dbm))
@@ -47170,13 +46981,6 @@ class PowerOptimizer:
 class TrainingMode:
     """
     Vollständige, erweiterte Klasse für Gamification und Training.
-    Bietet:
-    - Verschiedene Schwierigkeitsgrade (beginner, intermediate, advanced, expert)
-    - Szenarien-basierte Herausforderungen (Handshake, WPS, Evil Twin, Enterprise)
-    - Punktesystem mit Zeitbonus und Hinweis-Strafe
-    - Bestenliste (simuliert)
-    - Fortschrittsbericht mit Abzeichen und Leveln
-    - Speicherung der Ergebnisse in der Datenbank
     """
 
     def __init__(self, db_manager: DatenbankManager):
@@ -47246,15 +47050,11 @@ class TrainingMode:
         self.current_score = 0
         self.completed_scenarios = []
 
-    # ------------------------------------------------------------
-    # Szenario-Erstellung
-    # ------------------------------------------------------------
     def create_training_scenario(
         self, difficulty: str = "beginner", network: WLANNetzwerk | None = None
     ) -> TrainingScenario:
         """Erstellt ein neues Trainings-Szenario basierend auf Schwierigkeit und optionalem Zielnetzwerk."""
         if network is None:
-            # Demo-Netzwerk generieren
             network = WLANNetzwerk(
                 ssid=f"Training_Network_{random.randint(100, 999)}",
                 bssid=f"AA:BB:CC:{random.randint(10,99):02d}:{random.randint(10,99):02d}:{random.randint(10,99):02d}",
@@ -47269,8 +47069,6 @@ class TrainingMode:
 
         level = self.levels[difficulty]
         scenario_template = random.choice(self.scenarios)
-
-        # Import der TrainingScenario-Klasse (lokaler Import)
         scenario = TrainingScenario(
             name=scenario_template["name"],
             difficulty=difficulty,
@@ -47285,9 +47083,6 @@ class TrainingMode:
         )
         return scenario
 
-    # ------------------------------------------------------------
-    # Punkteberechnung für einen Angriff
-    # ------------------------------------------------------------
     def score_attack(
         self,
         scenario: TrainingScenario,
@@ -47380,9 +47175,6 @@ class TrainingMode:
             "scenarios_completed": len(self.completed_scenarios),
         }
 
-    # ------------------------------------------------------------
-    # Bestenliste (simuliert)
-    # ------------------------------------------------------------
     def get_leaderboard(self, limit: int = 10) -> list[dict[str, Any]]:
         """Gibt eine simulierte Bestenliste zurück (mit Platzhalter für echte Daten)."""
         leaderboard = []
@@ -47414,9 +47206,6 @@ class TrainingMode:
         )
         return leaderboard
 
-    # ------------------------------------------------------------
-    # Fortschrittsbericht
-    # ------------------------------------------------------------
     def get_progress_report(self) -> dict[str, Any]:
         """Gibt einen detaillierten Fortschrittsbericht zurück."""
         total_scenarios = sum(level["scenarios"] for level in self.levels.values())
@@ -47437,9 +47226,6 @@ class TrainingMode:
             "badges": self._get_earned_badges(),
         }
 
-    # ------------------------------------------------------------
-    # Hilfsmethoden für Level und Abzeichen
-    # ------------------------------------------------------------
     def _determine_level(self) -> str:
         """Bestimmt das aktuelle Level basierend auf dem Gesamtpunktestand."""
         if self.current_score >= 5000:
@@ -58985,12 +58771,26 @@ class AdapterWatchdog(QThread):
         self.iface_name = iface_name
         self.interval = interval
         self._stop = threading.Event()
+        # v37-R34 P13a: separates Event, damit pause/resume moeglich
+        # ist, ohne den Thread zu beenden.
+        self._suspended = threading.Event()
         self._last_state: bool = True
         self._last_mode: str = ""
         self._logger = logging.getLogger("wlan_ultimate.AdapterWatchdog")
 
     def stop(self):
         self._stop.set()
+
+    def pause(self) -> None:
+        """v37-R34 P13a: haelt Checks an (z.B. waehrend Monitor-Wechsel)."""
+        self._suspended.set()
+
+    def resume(self) -> None:
+        """v37-R34 P13a: setzt Checks fort."""
+        self._suspended.clear()
+
+    def is_paused(self) -> bool:
+        return self._suspended.is_set()
 
     def run(self):
         while not self._stop.is_set():
@@ -59001,6 +58801,10 @@ class AdapterWatchdog(QThread):
 
     def _check_once(self):
         """Prueft Interface-Zustand."""
+        # v37-R34 P13a: bei pause() nichts tun - Interface-Zugriffe
+        # wuerden sonst mit 'ip link set down' parallel laufen.
+        if self._suspended.is_set():
+            return
         try:
             exists = Path("/sys/class/net/" + self.iface_name).exists()
         except (OSError, ValueError):
@@ -59991,9 +59795,6 @@ class ToolRunner(QThread):
         return result
 
 
-# ══════════════════════════════════════════════════════════════════════
-# v37-R20: Handshake-Tab — Capture- und Crack-Threads
-# ══════════════════════════════════════════════════════════════════════
 class HandshakeCaptureThread(QThread):
     """Asynchroner Handshake-Capture in einem separaten QThread.
 
@@ -66641,35 +66442,29 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         im = self.interface_manager
         ok, msg = False, "kein Weg gefunden"
         try:
-            import subprocess as _sp
-
             try:
-                r = _sp.run(
-                    [
-                        "iw",
-                        "dev",
-                        iface_name,
-                        "set",
-                        "txpower",
-                        "fixed",
-                        str(int(value) * 100),
-                    ],
-                    capture_output=True,
+                rc, _out, err = CommandRunner.run(
+                    ["iw", "dev", iface_name, "set", "txpower",
+                     "fixed", str(int(value) * 100)],
+                    subsystem="driver",
+                    tag="dash-tx",
+                    soft_fail=True,
                     timeout=5,
                 )
-                if r.returncode == 0:
-                    r2 = _sp.run(
+                if rc == 0:
+                    _rc2, out, _err2 = CommandRunner.run(
                         ["iw", "dev", iface_name, "get", "txpower"],
-                        capture_output=True,
+                        subsystem="driver",
+                        tag="dash-tx-get",
+                        soft_fail=True,
                         timeout=3,
                     )
-                    out = (r2.stdout or b"").decode("utf-8", "replace")
-                    m = re.search(r"([\d.]+)\s*dBm", out)
+                    m = re.search(r"([\d.]+)\s*dBm", out or "")
                     actual = m.group(1) if m else str(value)
                     ok, msg = True, f"TX={actual} dBm (iw)"
                 else:
-                    msg = (r.stderr or b"").decode("utf-8", "replace")[:80]
-            except (FileNotFoundError, _sp.TimeoutExpired, OSError) as exc:
+                    msg = (err or "")[:80]
+            except (OSError, subprocess.SubprocessError) as exc:
                 msg = f"iw: {exc}"
             if not ok:
                 for cand_name, cand_args in (("set_tx_power", (iface_name, value)),):
@@ -67318,7 +67113,7 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             5: "Verschluesselung: OPEN < WEP < WPA < WPA2 < WPA3/SAE",
             6: "WPS (Wi-Fi Protected Setup): 🔴 aktiv, ⚪ aus, ✓ Locked",
             7: "Anzahl assoziierter Clients (geschaetzt)",
-            8: "Sicherheits-Score 0-100 (basierend auf Konfiguration)",
+            8: "Sicherheits-Score 0-100 (\u2713 gut, \u26a0 mittel, \u2717 kritisch)",
             9: "Konfidenz: Wie sicher ist diese Anzeige? (Sichtungen, Std)",
             10: "Trend: ↑ verbessernd, ↓ verschlechternd, → stabil",
             11: "Wie oft wurde dieses Netzwerk gesehen?",
@@ -70581,15 +70376,45 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         wps_row1.addStretch()
         wps_lay.addLayout(wps_row1)
 
-        self.hs_wps_table = QTableWidget(0, 5)
+        # v37-R34: 7 Spalten (BSSID, Kanal, RSSI, Version, Locked,
+        # Vendor, SSID). Version + Vendor liefert wash ohnehin — sie
+        # wurden vorher verworfen.
+        self.hs_wps_table = QTableWidget(0, 7)
         self.hs_wps_table.setHorizontalHeaderLabels(
-            ["BSSID", "Kanal", "RSSI", "WPS-Locked", "SSID"]
+            [
+                "BSSID",
+                "Kanal",
+                "RSSI",
+                "Version",
+                "Locked",
+                "Vendor",
+                "SSID",
+            ]
         )
-        self.hs_wps_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
+        _wps_hdr = self.hs_wps_table.horizontalHeader()
+        for _c in range(6):
+            _wps_hdr.setSectionResizeMode(
+                _c, QHeaderView.ResizeMode.ResizeToContents
+            )
+        _wps_hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.hs_wps_table.setMinimumHeight(120)
-        self.hs_wps_table.itemSelectionChanged.connect(self._wps_on_wps_selected)
+        self.hs_wps_table.itemSelectionChanged.connect(
+            self._wps_on_wps_selected
+        )
+        # v37-R34: cellClicked zusaetzlich, damit Klick auf eine
+        # bereits markierte Zeile ebenfalls das Ziel uebernimmt.
+        self.hs_wps_table.cellClicked.connect(
+            lambda _r, _c: self._wps_on_wps_selected()
+        )
+        self.hs_wps_table.itemDoubleClicked.connect(
+            self._wps_on_wps_double_click
+        )
+        self.hs_wps_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.hs_wps_table.customContextMenuRequested.connect(
+            self._wps_on_wps_context_menu
+        )
         wps_lay.addWidget(self.hs_wps_table)
 
         wps_row2 = QHBoxLayout()
@@ -73122,6 +72947,12 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         except (AttributeError, RuntimeError):
             pass
         self.network_table.setRowCount(0)
+        # v37-R30: Watchlist einmal laden
+        try:
+            _wl_gui = LiveWatchlist()
+            _wl_known = set(_wl_gui.known_macs.keys())
+        except (NameError, OSError, ValueError, AttributeError):
+            _wl_known = set()
         for net in self.aktuelle_netzwerke[:500]:
             try:
                 row = self.network_table.rowCount()
@@ -73136,7 +72967,26 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 self.network_table.setItem(
                     row, 1, QTableWidgetItem(net.ssid or "<hidden>")
                 )
-                self.network_table.setItem(row, 2, QTableWidgetItem(net.bssid))
+                # v37-R30: Watchlist-Markierung in BSSID-Spalte
+                _bssid_low = str(net.bssid).lower()
+                _known = _bssid_low in _wl_known
+                _bssid_str = str(net.bssid)
+                if not _known:
+                    _bssid_str = "! " + _bssid_str
+                _bssid_item = QTableWidgetItem(_bssid_str)
+                if not _known:
+                    _bssid_item.setForeground(
+                        QBrush(QColor(243, 156, 18))
+                    )
+                    _bssid_item.setToolTip(
+                        "Nicht in Watchlist (unbekannt)"
+                    )
+                else:
+                    _bssid_item.setForeground(
+                        QBrush(QColor(39, 174, 96))
+                    )
+                    _bssid_item.setToolTip("In Watchlist (bekannt)")
+                self.network_table.setItem(row, 2, _bssid_item)
                 # v8.4: row_builder - Kanal + Band + DFS
                 _ch = int(net.kanal or 0)
                 _band = ""
@@ -73201,6 +73051,31 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 self.network_table.setItem(
                     row, 7, QTableWidgetItem(str(net.client_anzahl))
                 )
+
+                # v37-R29: Sicherheits-Score (Spalte 8) befuellen
+                try:
+                    _sec_score = int(net.get_sicherheits_score() or 0)
+                except (AttributeError, TypeError, ValueError):
+                    _sec_score = 0
+                if _sec_score >= 80:
+                    _sec_sym = "\u2713"
+                    _sec_color = QColor(39, 174, 96)
+                elif _sec_score >= 50:
+                    _sec_sym = "\u26a0"
+                    _sec_color = QColor(243, 156, 18)
+                else:
+                    _sec_sym = "\u2717"
+                    _sec_color = QColor(231, 76, 60)
+                _sec_item = QTableWidgetItem(
+                    f"{_sec_sym} {_sec_score}"
+                )
+                _sec_item.setForeground(QBrush(_sec_color))
+                _sec_item.setToolTip(
+                    "Sicherheits-Score: " + str(_sec_score) + "/100"
+                    + "\n100 = optimal, 0 = sehr unsicher"
+                    + "\nBasis: Encryption, WPS, PMF, Cipher, Default-SSID"
+                )
+                self.network_table.setItem(row, 8, _sec_item)
 
                 # v4.1: Konfidenz aus ScanEngine holen
                 conf_data = {"score": 0, "signal_trend": "-", "sightings": 0}
@@ -73275,18 +73150,15 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 except (AttributeError, TypeError):
                     self.network_table.setItem(row, 12, QTableWidgetItem("-"))
 
-                score = net.get_sicherheits_score()
-                score_item = QTableWidgetItem(f"{score}/100")
-                if score >= 80:
-                    score_item.setForeground(QBrush(QColor(39, 174, 96)))
-                elif score >= 60:
-                    score_item.setForeground(QBrush(QColor(243, 156, 18)))
-                elif score >= 40:
-                    score_item.setForeground(QBrush(QColor(230, 126, 34)))
-                else:
-                    score_item.setForeground(QBrush(QColor(231, 76, 60)))
-                self.network_table.setItem(row, 8, score_item)
-            except (AttributeError, TypeError):
+                # v37-R32: alter Sec-Block entfernt (Patch Q
+                # schreibt die Spalte bereits korrekt in Zeile 8).
+
+            except (AttributeError, TypeError) as _row_exc:
+                # v37-R32: nur diese Zeile ueberspringen, nicht die
+                # gesamte Tabelle (vorher: continue == Tabelle kaputt)
+                self.logger.debug(
+                    "update_network_table row: " + str(_row_exc)
+                )
                 continue
 
         if hasattr(self, "network_count_label"):
@@ -74928,6 +74800,13 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         except (AttributeError, RuntimeError):
             clients = []
 
+        # v37-R30: Watchlist fuer Client-Markierung
+        try:
+            _wl_gui = LiveWatchlist()
+            _wl_known = set(_wl_gui.known_macs.keys())
+        except (NameError, OSError, ValueError, AttributeError):
+            _wl_known = set()
+
         # Optional: mit DiscoveryEngine-Fingerprints anreichern
         enrich = {}
         try:
@@ -75004,7 +74883,19 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 row = self.clients_table.rowCount()
                 self.clients_table.insertRow(row)
                 mac = c.get("mac", "")
-                self.clients_table.setItem(row, 0, QTableWidgetItem(mac))
+                _mac_low = str(mac).lower()
+                _known = _mac_low in _wl_known
+                _mac_str = str(mac)
+                if not _known:
+                    _mac_str = "! " + _mac_str
+                _mac_item = QTableWidgetItem(_mac_str)
+                if not _known:
+                    _mac_item.setForeground(QBrush(QColor(243, 156, 18)))
+                    _mac_item.setToolTip("Unbekannter Client")
+                else:
+                    _mac_item.setForeground(QBrush(QColor(39, 174, 96)))
+                    _mac_item.setToolTip("Bekannter Client (Watchlist)")
+                self.clients_table.setItem(row, 0, _mac_item)
 
                 # Hersteller
                 vendor = fp.vendor if fp else ""
@@ -75041,9 +74932,21 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                         ssids += f" [+{wildcards} Broadcast]"
                 self.clients_table.setItem(row, 4, QTableWidgetItem(ssids))
 
-                # Verbunden mit
+                # Verbunden mit (+ AP-Vendor, v37-R30)
                 ap = fp.bssid if fp else ""
-                self.clients_table.setItem(row, 5, QTableWidgetItem(ap or ""))
+                _ap_str = ap or ""
+                if ap:
+                    try:
+                        _ap_ven = _scan_oui_vendor_lookup(str(ap))
+                        if _ap_ven and _ap_ven not in (
+                            "Unknown", "Randomized MAC", ""
+                        ):
+                            _ap_str = str(ap) + " (" + _ap_ven[:20] + ")"
+                    except (NameError, AttributeError, TypeError):
+                        pass
+                self.clients_table.setItem(
+                    row, 5, QTableWidgetItem(_ap_str)
+                )
 
                 # Letzte Aktivität
                 self.clients_table.setItem(
@@ -75372,12 +75275,116 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             pass
         return None
 
+    def _wps_ensure_monitor(self, iface: str) -> str | None:
+        """v37-R34: Stellt sicher, dass iface im Monitor-Modus ist.
+
+        Returns:
+            Name des Monitor-Interfaces (kann von iface abweichen!)
+            oder None bei Fehler.
+        """
+        if not iface:
+            return None
+
+        # 1. aktuellen Zustand lesen
+        try:
+            _, _out, _ = CommandRunner.run(
+                ["iw", "dev"],
+                subsystem="driver",
+                tag="wps-monitor",
+                soft_fail=True,
+            )
+        except (NameError, AttributeError, RuntimeError, OSError):
+            return None
+
+        _ifaces: list[tuple[str, str]] = []
+        _cur: str | None = None
+        for _line in _out.splitlines():
+            _ls = _line.strip()
+            if _ls.startswith("Interface "):
+                _cur = _ls.split(" ", 1)[1].strip()
+            elif _cur and _ls.startswith("type "):
+                _ifaces.append((_cur, _ls.split(" ", 1)[1].strip()))
+                _cur = None
+
+        # 2. iface schon monitor?
+        for _name, _t in _ifaces:
+            if _name == iface and _t == "monitor":
+                return iface
+
+        # v37-R34 P13a: Watchdog pausieren, sonst Race auf 'iw dev'
+        _wd = getattr(self, "_adapter_watchdog", None)
+        if _wd is not None:
+            try:
+                _wd.pause()
+            except (AttributeError, RuntimeError):
+                pass
+
+        # 3. PlatformUtils.enable_monitor_mode versuchen
+        try:
+            _ok = PlatformUtils.enable_monitor_mode(iface)
+        except (AttributeError, TypeError, OSError, RuntimeError):
+            _ok = False
+
+        # v37-R34 P13a: Watchdog wieder anschalten, egal wie es ausging
+        if _wd is not None:
+            try:
+                _wd.resume()
+            except (AttributeError, RuntimeError):
+                pass
+
+        if not _ok:
+            return None
+
+        # 4. nach Monitor-Interface suchen (kann wlan0mon heissen)
+        try:
+            _, _out, _ = CommandRunner.run(
+                ["iw", "dev"],
+                subsystem="driver",
+                tag="wps-monitor",
+                soft_fail=True,
+            )
+        except (NameError, AttributeError, RuntimeError, OSError):
+            return None
+
+        _cur = None
+        for _line in _out.splitlines():
+            _ls = _line.strip()
+            if _ls.startswith("Interface "):
+                _cur = _ls.split(" ", 1)[1].strip()
+            elif _cur and _ls.startswith("type monitor"):
+                return _cur
+        return None
+
     def _wps_start_wash(self) -> None:
         """Startet wash (WPS-Scan) im Hintergrund."""
         iface = self._wps_get_iface()
         if not iface:
             QMessageBox.warning(self, "Kein Interface", "Kein WLAN-Adapter aktiv.")
             return
+
+        # v37-R34: Monitor-Modus sicherstellen, sonst liefert wash nichts
+        _mon = self._wps_ensure_monitor(iface)
+        if not _mon:
+            QMessageBox.warning(
+                self,
+                "Monitor-Modus",
+                "Adapter " + str(iface) + " konnte nicht in den "
+                "Monitor-Modus versetzt werden.\n\n"
+                "Bitte pruefen:\n"
+                "- Laeuft w.py mit sudo?\n"
+                "- Unterstuetzt der Adapter Monitor-Mode?\n\n"
+                "Manuell:\n"
+                "  sudo ip link set " + str(iface) + " down\n"
+                "  sudo iw dev " + str(iface) + " set type monitor\n"
+                "  sudo ip link set " + str(iface) + " up",
+            )
+            return
+        if _mon != iface:
+            self._wps_log(
+                "Monitor-Interface: " + str(_mon)
+                + " (statt " + str(iface) + ")", "INFO",
+            )
+        iface = _mon
 
         existing = getattr(self, "_wps_wash_runner", None)
         if existing is not None and existing.isRunning():
@@ -75414,30 +75421,137 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         runner.start()
 
     def _wps_on_wash_line(self, line: str, level: str) -> None:
-        """Parst wash-Ausgabezeilen und füllt die WPS-Tabelle."""
+        """v37-R34 Patch 10: Token-basierter wash-Parser.
+
+        Der alte Regex-Parser verlangte \\s{2,} zwischen Vendor und
+        SSID. ToolRunner normalisiert mehrfache Spaces -> Regex
+        matchte nie. Neuer Ansatz: split() + OUI-Lookup.
+        """
         try:
-            m = re.match(
-                r"^([0-9A-Fa-f:]{17})\s+(\d+)\s+(-?\d+)\s+"
-                r"([\d.]+)\s+(Yes|No)\s+(.*?)\s{2,}(.*)$",
-                line.strip(),
-            )
-            if not m:
-                self._wps_log(line[:140], level)
+            # 1) ANSI-Escapes strippen + trailing whitespace weg
+            _clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line).rstrip()
+            if not _clean:
                 return
-            bssid = m.group(1).lower()
-            ch = int(m.group(2))
-            rssi = int(m.group(3))
-            locked = m.group(5).lower() == "yes"
-            ssid = m.group(7).strip()
+
+            # 2) Header / Trenner / Info-Zeilen ignorieren
+            _strip = _clean.lstrip()
+            if (
+                _strip.startswith("---")
+                or _strip.startswith("BSSID")
+                or _strip.startswith("Wash")
+                or _strip.startswith("Scan")
+                or _strip.startswith("Warning")
+                or _strip.startswith("Found")
+            ):
+                self._wps_log(_clean[:140], level)
+                return
+
+            # 3) Tokens splitten
+            _tokens = _clean.split()
+            if len(_tokens) < 5:
+                self._wps_log(_clean[:140], level)
+                return
+
+            # 4) BSSID-Format pruefen
+            _bssid = _tokens[0]
+            if not re.match(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$", _bssid):
+                self._wps_log(_clean[:140], level)
+                return
+
+            # 5) Feste Felder
+            try:
+                ch = int(_tokens[1])
+                rssi = int(_tokens[2])
+            except (ValueError, IndexError):
+                self._wps_log(_clean[:140], level)
+                return
+
+            wps_ver = _tokens[3] if len(_tokens) > 3 else ""
+            locked = (
+                _tokens[4].lower() in ("yes", "ja", "true")
+                if len(_tokens) > 4 else False
+            )
+
+            # 6) Rest nach Lck-Token (aus dem ORIGINAL-String, damit
+            #    SSID mit Leerzeichen erhalten bleibt)
+            _rest = ""
+            if len(_tokens) > 5:
+                _lck_tok = _tokens[4]
+                _pos = _clean.find(_lck_tok)
+                if _pos >= 0:
+                    _rest = _clean[_pos + len(_lck_tok):].strip()
+
+            # 7) Vendor autoritativ via OUI-Lookup
+            vendor = ""
+            try:
+                _v = _lookup_oui(_bssid.lower())
+                if not _v:
+                    _v = _scan_oui_vendor_lookup(_bssid.lower())
+                vendor = str(_v or "").strip()[:12]
+            except (NameError, AttributeError, TypeError):
+                pass
+
+            # 8) SSID = _rest, Vendor-Prefix abgeschnitten falls vorhanden
+            ssid = _rest
+            if vendor and ssid:
+                _vp = vendor.lower()[:6]
+                _sp = ssid.lower()[:6]
+                if _vp and _vp == _sp:
+                    ssid = ssid[len(vendor):].strip()
+
+            # 9) Einmaliger Debug der ersten 3 Datenzeilen
+            _dbg = getattr(self, "_wps_dbg_count", 0)
+            if _dbg < 3:
+                self._wps_dbg_count = _dbg + 1
+                self._wps_log(
+                    "[DEBUG] roh=" + repr(_clean)[:120]
+                    + " | bssid=" + _bssid
+                    + " vendor=" + repr(vendor)
+                    + " ssid=" + repr(ssid),
+                    "INFO",
+                )
+
             if not hasattr(self, "hs_wps_table"):
                 return
+            # v37-R34 P11b: Fix F821 - bssid wurde nicht definiert
+            bssid = _bssid.lower()
             row = self.hs_wps_table.rowCount()
             self.hs_wps_table.insertRow(row)
             self.hs_wps_table.setItem(row, 0, QTableWidgetItem(bssid))
             self.hs_wps_table.setItem(row, 1, QTableWidgetItem(str(ch)))
             self.hs_wps_table.setItem(row, 2, QTableWidgetItem(str(rssi)))
-            self.hs_wps_table.setItem(row, 3, QTableWidgetItem("🔒" if locked else "—"))
-            self.hs_wps_table.setItem(row, 4, QTableWidgetItem(ssid))
+            self.hs_wps_table.setItem(row, 3, QTableWidgetItem(wps_ver))
+            # v37-R34: Badge-Logik
+            #   🔒     -> locked
+            #   🔓 ⚠   -> offen + WPS 1.0 (Pixie-Dust-anfaellig)
+            #   🔓     -> offen
+            if locked:
+                _badge = "🔒"
+            elif wps_ver.startswith("1.0") or wps_ver == "0.0":
+                _badge = "🔓 ⚠"
+            else:
+                _badge = "🔓"
+            self.hs_wps_table.setItem(row, 4, QTableWidgetItem(_badge))
+            self.hs_wps_table.setItem(row, 5, QTableWidgetItem(vendor))
+            self.hs_wps_table.setItem(row, 6, QTableWidgetItem(ssid))
+            # v37-R34 P12: wps_scan-Event persistieren (N1)
+            try:
+                _store = get_store()
+                if _store is not None:
+                    _store.log_event(
+                        "wps_scan",
+                        target=bssid,
+                        data={
+                            "ssid": ssid,
+                            "channel": int(ch),
+                            "rssi": int(rssi),
+                            "wps_version": str(wps_ver),
+                            "locked": bool(locked),
+                            "vendor": str(vendor),
+                        },
+                    )
+            except (NameError, AttributeError, TypeError, OSError):
+                pass
         except (AttributeError, RuntimeError, ValueError, IndexError):
             pass
 
@@ -75489,6 +75603,80 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         except (AttributeError, RuntimeError, ValueError):
             pass
 
+    def _wps_on_wps_double_click(self, item) -> None:
+        """v37-R34: Doppelklick in der WPS-Tabelle -> Ziel + Angriff.
+
+        Ruft erst _wps_on_wps_selected() (uebernimmt BSSID + Kanal in
+        die Ziel-Felder), dann _wps_start_attack(). Der Angriff selbst
+        hat einen eigenen Bestaetigungsdialog.
+        """
+        try:
+            if item is None:
+                return
+            self._wps_on_wps_selected()
+            self._wps_start_attack()
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+    def _wps_on_wps_context_menu(self, pos) -> None:
+        """v37-R34: Kontextmenue in der WPS-Tabelle.
+
+        Aktionen:
+          - Als Handshake-Ziel uebernehmen
+          - In Watchlist aufnehmen
+          - BSSID kopieren
+        """
+        try:
+            if not hasattr(self, "hs_wps_table"):
+                return
+            row = self.hs_wps_table.rowAt(pos.y())
+            if row < 0:
+                return
+            bssid_item = self.hs_wps_table.item(row, 0)
+            if bssid_item is None:
+                return
+            bssid = bssid_item.text().strip()
+            ssid_item = self.hs_wps_table.item(row, 6)
+            ssid = ssid_item.text().strip() if ssid_item else ""
+
+            menu = QMenu(self)
+            act_target = menu.addAction("🎯 Als Handshake-Ziel uebernehmen")
+            act_wl = menu.addAction("📝 In Watchlist aufnehmen")
+            act_cp = menu.addAction("📋 BSSID kopieren")
+            chosen = menu.exec(
+                self.hs_wps_table.viewport().mapToGlobal(pos)
+            )
+
+            if chosen is act_target:
+                self.hs_wps_table.setCurrentCell(row, 0)
+                self._wps_on_wps_selected()
+                self._wps_log(
+                    f"Ziel uebernommen: {bssid} ({ssid or '?'})", "INFO"
+                )
+            elif chosen is act_wl:
+                try:
+                    _label = ("WPS: " + ssid) if ssid else "WPS"
+                    LiveWatchlist().add(bssid, _label)
+                    self._wps_log(
+                        f"Watchlist: {bssid} ({_label}) hinzugefuegt.", "OK"
+                    )
+                except (
+                    NameError, OSError, ValueError, AttributeError
+                ):
+                    self._wps_log(
+                        f"Watchlist: {bssid} konnte nicht gespeichert "
+                        f"werden.", "WARN"
+                    )
+            elif chosen is act_cp:
+                try:
+                    from PyQt6.QtWidgets import QApplication as _QApp
+                    _QApp.clipboard().setText(bssid)
+                    self._wps_log(f"Kopiert: {bssid}", "INFO")
+                except (ImportError, AttributeError, RuntimeError):
+                    pass
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
     def _wps_start_attack(self) -> None:
         """Startet Reaver/Bully im Hintergrund."""
         bssid = ""
@@ -75497,21 +75685,141 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 bssid = self.hs_bssid_edit.text().strip()
         except (AttributeError, RuntimeError):
             pass
-        if not bssid or not re.match(r"^[0-9a-f:]{17}$", bssid.lower()):
+        # v37-R31: Strenge BSSID-Validierung
+        _bssid_re = re.compile(
+            r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$"
+        )
+        if not bssid or not _bssid_re.match(bssid.lower()):
             QMessageBox.warning(
-                self, "Ziel fehlt", "Bitte erst ein WPS-Netz auswählen."
+                self, "Ziel fehlt",
+                "Bitte erst ein gueltiges WPS-Netz auswaehlen.\n"
+                "Format erwartet: aa:bb:cc:dd:ee:ff"
             )
             return
+
+        # v37-R31: Watchlist-Block (eigene Geraete schuetzen)
+        try:
+            _wl_attack = LiveWatchlist()
+            if _wl_attack.is_known(bssid):
+                _lbl = _wl_attack.label(bssid) or "(kein Label)"
+                QMessageBox.critical(
+                    self,
+                    "Watchlist-Treffer!",
+                    "ABBRUCH: Diese BSSID steht in deiner Watchlist.\n\n"
+                    "BSSID: " + bssid + "\n"
+                    "Label: " + _lbl + "\n\n"
+                    "Wenn das dein eigenes Geraet ist, willst du es "
+                    "nicht angreifen."
+                )
+                return
+        except (NameError, OSError, ValueError, AttributeError):
+            pass
+
         iface = self._wps_get_iface()
         if not iface:
-            QMessageBox.warning(self, "Kein Interface", "Kein WLAN-Adapter aktiv.")
+            QMessageBox.warning(
+                self, "Kein Interface", "Kein WLAN-Adapter aktiv."
+            )
             return
+
+        # v37-R31: Adapter-Check
+        try:
+            _drv = ""
+            _link = "/sys/class/net/" + str(iface) + "/device/driver"
+            if os.path.islink(_link):
+                _drv = os.path.basename(os.path.realpath(_link))
+            if "88XXau" in _drv or "8812au" in _drv:
+                _ans = QMessageBox.warning(
+                    self,
+                    "Adapter-Warnung",
+                    "Der Adapter laeuft mit rtl88XXau-Treiber.\n\n"
+                    "Bekanntes Problem: Monitor-Modus filtert teilweise "
+                    "Management-Frames. WPS-Angriffe koennen fehlschlagen.\n\n"
+                    "Trotzdem fortfahren?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if _ans != QMessageBox.StandardButton.Yes:
+                    return
+        except (OSError, AttributeError, TypeError):
+            pass
+
+        # v37-R34: Preflight-Check (defensiv, kein Hard-Block).
+        # ready_for_deauth wird NICHT geprueft, weil injection_test_ok
+        # in VMs absichtlich False bleibt (aireplay-ng --test haengt).
+        try:
+            _pf = PreflightCheck.run(iface, force=False)
+            _pf_msgs: list[str] = []
+            if not getattr(_pf, "is_root", True):
+                _pf_msgs.append(
+                    "Root fehlt — WPS-Angriffe koennen nicht senden."
+                )
+            if not getattr(_pf, "supports_monitor", True):
+                _pf_msgs.append(
+                    "Adapter meldet keinen Monitor-Mode-Support."
+                )
+            if not getattr(_pf, "supports_injection", True):
+                _pf_msgs.append(
+                    "Adapter meldet keine Injection-Faehigkeit."
+                )
+            for _w in (getattr(_pf, "warnings", None) or [])[:4]:
+                _pf_msgs.append(str(_w))
+            for _e in (getattr(_pf, "errors", None) or [])[:4]:
+                _m = getattr(_e, "message", None) or str(_e)
+                _h = getattr(_e, "hint", "") or ""
+                _pf_msgs.append(str(_m) + (f" — {_h}" if _h else ""))
+            if _pf_msgs:
+                _ans = QMessageBox.warning(
+                    self,
+                    "Preflight-Warnung",
+                    "Adapter-Vorpruefung meldet:\n\n- "
+                    + "\n- ".join(_pf_msgs)
+                    + "\n\nTrotzdem WPS-Angriff starten?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if _ans != QMessageBox.StandardButton.Yes:
+                    self._wps_log(
+                        "WPS-Angriff abgebrochen (Preflight).", "WARN"
+                    )
+                    return
+        except (
+            NameError, AttributeError, RuntimeError,
+            TypeError, OSError, ValueError,
+        ):
+            pass
+
+        # v37-R34: Auto-Kanal — zuerst WPS-Tabellenzeile, dann Spin, dann 6
         channel = 6
         try:
             if hasattr(self, "hs_channel_spin"):
                 channel = int(self.hs_channel_spin.value())
         except (AttributeError, RuntimeError, ValueError):
             pass
+        try:
+            if hasattr(self, "hs_wps_table"):
+                _bssid_low = bssid.lower()
+                for _r in range(self.hs_wps_table.rowCount()):
+                    _it = self.hs_wps_table.item(_r, 0)
+                    if _it is None:
+                        continue
+                    if _it.text().strip().lower() == _bssid_low:
+                        _ch_it = self.hs_wps_table.item(_r, 1)
+                        if _ch_it is not None:
+                            try:
+                                _ch_tbl = int(_ch_it.text())
+                                if 1 <= _ch_tbl <= 233:
+                                    channel = _ch_tbl
+                            except (ValueError, TypeError):
+                                pass
+                        break
+        except (
+            AttributeError, RuntimeError, ValueError, TypeError,
+        ):
+            pass
+
         tool = "reaver"
         try:
             if hasattr(self, "hs_wps_tool_combo"):
@@ -75538,6 +75846,8 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             pass
 
         if tool == "reaver":
+            # v37-R34 P11c: -L (ignore-locks), -N (no-nacks),
+            # -r 2:10 (recurring delay), -d 5 (slow, lockout-safe)
             args = [
                 "-i",
                 iface,
@@ -75549,18 +75859,60 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 "-t",
                 "10",
                 "-d",
-                "1",
+                "5",
+                "-L",
+                "-N",
+                "-r",
+                "2:10",
             ]
             if pixie:
                 args.append("-K")
             if pin:
                 args += ["-p", pin]
         else:
-            args = ["-i", iface, "-b", bssid, "-c", str(channel), "-v", "3"]
+            # v37-R34 P11c: Bully mit -L (ignore lock) + -N (no NACK)
+            args = [
+                "-i", iface, "-b", bssid, "-c", str(channel),
+                "-v", "3", "-L", "-N",
+            ]
             if pixie:
                 args.append("-P")
             if pin:
                 args += ["-p", pin]
+
+        # v37-R34 P11c: Pixie-Warnung bei WPS 2.0-Ziel
+        if pixie:
+            _wps_ver_sel = ""
+            try:
+                if hasattr(self, "hs_wps_table"):
+                    for _r in range(self.hs_wps_table.rowCount()):
+                        _it = self.hs_wps_table.item(_r, 0)
+                        if (_it is not None
+                                and _it.text().strip().lower()
+                                == bssid.lower()):
+                            _v_it = self.hs_wps_table.item(_r, 3)
+                            if _v_it is not None:
+                                _wps_ver_sel = _v_it.text().strip()
+                            break
+            except (AttributeError, RuntimeError, ValueError):
+                pass
+            if _wps_ver_sel.startswith("2."):
+                _ans = QMessageBox.warning(
+                    self,
+                    "Pixie-Dust auf WPS 2.0",
+                    "Ziel-AP nutzt WPS " + _wps_ver_sel + ".\n\n"
+                    "Pixie-Dust wurde fuer WPS 1.0 entwickelt und "
+                    "funktioniert auf WPS 2.0 nur selten.\n\n"
+                    "Trotzdem versuchen?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if _ans != QMessageBox.StandardButton.Yes:
+                    self._wps_log(
+                        "Pixie auf WPS 2.0 abgebrochen.", "WARN"
+                    )
+                    return
 
         reply = QMessageBox.question(
             self,
@@ -75588,11 +75940,65 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 self.hs_wps_progress.setValue(0)
             self._wps_log(f"Starte {tool} auf {bssid} ...", "INFO")
 
-            runner = ToolRunner(tool, args, timeout=timeout, parse_progress=True)
+            runner = ToolRunner(
+                tool, args, timeout=timeout, parse_progress=True
+            )
             runner.line.connect(self._wps_on_attack_line)
             runner.progress.connect(self._wps_on_attack_progress)
             runner.done.connect(self._wps_on_attack_done)
             self._wps_attack_runner = runner
+
+            # v37-R31: Angriff in CentralStore protokollieren
+            try:
+                _store = get_store()
+                if _store is not None:
+                    _store.log_event(
+                        "wps_attack_started",
+                        target=bssid,
+                        data={
+                            "tool": tool,
+                            "iface": iface,
+                            "channel": channel,
+                            "pixie": bool(pixie),
+                            "pin": pin or "",
+                            "timeout": int(timeout),
+                        },
+                    )
+            except (NameError, AttributeError, TypeError):
+                pass
+
+            # v37-R34: State fuer Retry-Logik merken
+            self._wps_attack_tool = tool
+            self._wps_attack_iface = iface
+            self._wps_attack_bssid = bssid
+            self._wps_attack_channel = int(channel)
+            self._wps_attack_pixie = bool(pixie)
+            self._wps_attack_pin = pin or ""
+            self._wps_attack_timeout = int(timeout)
+            self._wps_retry_count = 0
+            # v37-R34 P12: Fail-Zaehler zuruecksetzen
+            self._wps_attack_fails = 0
+            self._wps_fails_same_pin = None
+
+            # v37-R34 P13b: wash-Runner stoppen, falls er noch laeuft.
+            # Sonst kaempfen wash (Kanal-Hopping) und reaver/bully um
+            # dasselbe Interface -> 'Receive timeout occurred'.
+            _wash_runner = getattr(self, "_wps_wash_runner", None)
+            if _wash_runner is not None:
+                try:
+                    if _wash_runner.isRunning():
+                        self._wps_log(
+                            "Wash laeuft noch - wird fuer WPS-Angriff "
+                            "gestoppt.", "WARN",
+                        )
+                        _wash_runner.abort()
+                        # kurz warten, damit wash das Interface freigibt
+                        import time as _t
+                        _t.sleep(0.5)
+                except (AttributeError, RuntimeError):
+                    pass
+                self._wps_wash_runner = None
+
             runner.start()
         except (NameError, TypeError, AttributeError) as exc:
             self._wps_log(f"{tool} nicht verfügbar: {exc}", "ERR")
@@ -75605,12 +76011,95 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 pass
 
     def _wps_on_attack_line(self, line: str, level: str) -> None:
+        """v37-R34: priorisierte PIN/PSK-Erkennung.
+
+        Reihenfolge: PSK (Endziel) > PIN-Erfolg > PIN-Kandidat.
+        Reaver/Bully loggen unterschiedlich, wir matchen daher
+        case-insensitiv auf mehreren Patterns.
+        """
         try:
-            low = line.lower()
             self._wps_log(line[:160], level)
-            m = re.search(r"wps pin.*?['\"]?(\d{8})['\"]?", low)
-            if m:
-                self._wps_log(f"🎯 WPS-PIN: {m.group(1)}", "OK")
+
+            # v37-R34 P12: Lockout-Erkennung (N4)
+            _low = line.lower()
+            _is_lockout = False
+            for _pat in (
+                "wps-locked",
+                "wps locked",
+                "detected ap rate limiting",
+                "10 successive start failures",
+                "ap rate limit",
+            ):
+                if _pat in _low:
+                    _is_lockout = True
+                    break
+            if _is_lockout:
+                self._wps_log(
+                    "!! AP im WPS-Lockout - Ziel wechseln oder "
+                    "Pixie-Dust testen.", "ERR"
+                )
+
+            # v37-R34 P12: Fail-Zaehler (M2-Timeout + NACK)
+            if ("receive timeout occurred" in _low
+                    or "wps transaction failed" in _low
+                    or "received wsc nack" in _low):
+                _fails = int(
+                    getattr(self, "_wps_attack_fails", 0)
+                ) + 1
+                self._wps_attack_fails = _fails
+                _cand = getattr(self, "_wps_last_candidate", None)
+                _seen = getattr(self, "_wps_fails_same_pin", None)
+                if _cand and _seen != _cand:
+                    self._wps_fails_same_pin = _cand
+                    self._wps_attack_fails = 0
+                    _fails = 0
+                if _fails == 20:
+                    self._wps_log(
+                        "!! 20 Fehlversuche ohne PIN-Wechsel - "
+                        "vermutlich Lockout oder AP ignoriert NACK.",
+                        "ERR"
+                    )
+
+            # 1) PSK (hoechste Prioritaet, Endziel)
+            for _pat in (
+                "[+]\\s+wpa\\s+psk\\s*[:=]\\s*[\x22']([^\x22']+)[\x22']",
+                "[+]\\s+psk\\s*[:=]\\s*[\x22']([^\x22']+)[\x22']",
+                "wpa\\s+psk\\s*[:=]\\s*[\x22']([^\x22']+)[\x22']",
+            ):
+                _m = re.search(_pat, line, re.IGNORECASE)
+                if _m:
+                    self._wps_last_psk = _m.group(1)
+                    self._wps_log(
+                        "[PSK] WPA-PSK gefunden: " + _m.group(1), "OK"
+                    )
+                    return
+
+            # 2) WPS-PIN (Erfolg)
+            for _pat in (
+                "[+]\\s+wps\\s+pin\\s*[:=]\\s*[\x22']?(\\d{8})[\x22']?",
+                "[+]\\s+pin\\s+cracked\\s*[:=]?\\s*"
+                "[\x22']?(\\d{8})[\x22']?",
+                "[+]\\s+pin\\s+[\x22']?(\\d{8})[\x22']?\\s+is\\s+correct",
+                "wps\\s+pin\\s*[:=]\\s*[\x22']?(\\d{8})[\x22']?",
+            ):
+                _m = re.search(_pat, line, re.IGNORECASE)
+                if _m:
+                    self._wps_last_pin = _m.group(1)
+                    self._wps_log(
+                        "[PIN] WPS-PIN gefunden: " + _m.group(1), "OK"
+                    )
+                    return
+
+            # 3) PIN-Kandidat (nur bei Wechsel loggen)
+            _m = re.search(
+                "trying\\s+pin\\s+[\x22']?(\\d{8})[\x22']?",
+                line, re.IGNORECASE,
+            )
+            if _m:
+                _cand = _m.group(1)
+                if getattr(self, "_wps_last_candidate", None) != _cand:
+                    self._wps_last_candidate = _cand
+                    self._wps_log("[CAND] PIN-Kandidat: " + _cand, "INFO")
         except (AttributeError, RuntimeError):
             pass
 
@@ -75622,6 +76111,146 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             pass
 
     def _wps_on_attack_done(self, result) -> None:
+        """v37-R34: Erfolgs-Pruefung + Retry-Kette + Bully-Fallback."""
+        try:
+            rc = getattr(result, "returncode", None)
+        except (AttributeError, TypeError):
+            rc = None
+        _timed_out = False
+        try:
+            _timed_out = bool(getattr(result, "timed_out", False))
+        except (AttributeError, TypeError):
+            pass
+
+        _has_result = bool(
+            getattr(self, "_wps_last_pin", None)
+            or getattr(self, "_wps_last_psk", None)
+        )
+
+        if rc == 0 or _has_result:
+            self._wps_log(
+                f"WPS-Angriff erfolgreich (rc={rc}).", "OK"
+            )
+            self._wps_retry_count = 0
+            self._wps_restore_buttons()
+            self._wps_attack_runner = None
+            self._wps_handle_success(rc)
+            return
+
+        _tool = getattr(self, "_wps_attack_tool", "reaver")
+        _retries = int(getattr(self, "_wps_retry_count", 0))
+
+        if _tool == "reaver" and _retries < 1:
+            _old_to = int(getattr(self, "_wps_attack_timeout", 300))
+            _new_to = min(_old_to * 2, 3600)
+            self._wps_retry_count = _retries + 1
+            self._wps_log(
+                f"Reaver rc={rc} timeout={_timed_out} - Retry mit "
+                f"Timeout {_new_to}s.",
+                "WARN",
+            )
+            self._wps_attack_runner = None
+            self._wps_retry_attack(tool="reaver", timeout=_new_to)
+            return
+
+        if _tool == "reaver" and _retries < 2:
+            self._wps_retry_count = _retries + 1
+            self._wps_log(
+                f"Reaver rc={rc} - Fallback auf Bully.", "WARN"
+            )
+            self._wps_attack_runner = None
+            self._wps_retry_attack(tool="bully", timeout=300)
+            return
+
+        self._wps_log(
+            f"WPS-Angriff beendet (rc={rc}, Retries={_retries}).", "WARN"
+        )
+        self._wps_restore_buttons()
+        self._wps_attack_runner = None
+
+    def _wps_handle_success(self, rc) -> None:
+        """v37-R34: Erfolgs-Handling fuer WPS-Angriff.
+
+        - Loggt 'wps_attack_success' in CentralStore.events
+        - Zeigt Dialog mit PIN/PSK (nur wenn Treffer)
+        - Opt-in: BSSID als 'Geknackt: <Datum>' in Watchlist
+        """
+        _pin = getattr(self, "_wps_last_pin", "") or ""
+        _psk = getattr(self, "_wps_last_psk", "") or ""
+        _bssid = getattr(self, "_wps_attack_bssid", "") or ""
+        _tool = getattr(self, "_wps_attack_tool", "") or ""
+        _iface = getattr(self, "_wps_attack_iface", "") or ""
+        _channel = int(getattr(self, "_wps_attack_channel", 0) or 0)
+
+        if not (_pin or _psk):
+            self._wps_log(
+                "Erfolg ohne PIN/PSK-Treffer - kein Dialog.", "WARN"
+            )
+            return
+
+        # 1) CentralStore-Event
+        try:
+            _store = get_store()
+            if _store is not None:
+                _store.log_event(
+                    "wps_attack_success",
+                    target=_bssid,
+                    data={
+                        "pin": _pin,
+                        "psk": _psk,
+                        "tool": _tool,
+                        "iface": _iface,
+                        "channel": _channel,
+                        "rc": rc,
+                    },
+                )
+        except (NameError, AttributeError, TypeError, OSError):
+            pass
+
+        # 2) Erfolgs-Dialog
+        _lines = []
+        if _pin:
+            _lines.append(f"PIN: {_pin}")
+        if _psk:
+            _lines.append(f"PSK: {_psk}")
+        _lines.append(f"BSSID: {_bssid}")
+        if _tool:
+            _lines.append(f"Tool: {_tool}")
+
+        _msg = QMessageBox(self)
+        _msg.setWindowTitle("WPS-Angriff erfolgreich")
+        _msg.setIcon(QMessageBox.Icon.Information)
+        _msg.setText("\n".join(_lines))
+        _msg.setInformativeText(
+            "BSSID in Watchlist als 'Geknackt' eintragen?"
+        )
+        _btn_yes = _msg.addButton(
+            "In Watchlist eintragen",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        _btn_no = _msg.addButton(
+            "Schliessen",
+            QMessageBox.ButtonRole.RejectRole,
+        )
+        _msg.setDefaultButton(_btn_no)
+        _msg.exec()
+
+        if _msg.clickedButton() is _btn_yes and _bssid:
+            try:
+                _stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+                _label = f"Geknackt: {_stamp}"
+                LiveWatchlist().add(_bssid, _label)
+                self._wps_log(
+                    f"Watchlist: {_bssid} ({_label}) hinzugefuegt.", "OK"
+                )
+            except (NameError, OSError, ValueError, AttributeError):
+                self._wps_log(
+                    f"Watchlist-Eintrag fuer {_bssid} fehlgeschlagen.",
+                    "WARN",
+                )
+
+    def _wps_restore_buttons(self) -> None:
+        """v37-R34: UI nach Angriff wieder freigeben."""
         try:
             if hasattr(self, "hs_wps_btn_start"):
                 self.hs_wps_btn_start.setEnabled(True)
@@ -75629,12 +76258,63 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 self.hs_wps_btn_stop.setEnabled(False)
         except (AttributeError, RuntimeError):
             pass
+
+    def _wps_retry_attack(self, tool=None, timeout=None) -> None:
+        """v37-R34: startet WPS-Angriff mit gespeicherten Parametern.
+
+        Wird von _wps_on_attack_done aufgerufen, um Reaver mit
+        verdoppeltem Timeout oder Bully als Fallback zu starten.
+        Kein User-Dialog - der erste Start hatte bereits einen.
+        """
+        _tool = tool or getattr(self, "_wps_attack_tool", "reaver")
+        _iface = getattr(self, "_wps_attack_iface", "")
+        _bssid = getattr(self, "_wps_attack_bssid", "")
+        _channel = int(getattr(self, "_wps_attack_channel", 6) or 6)
+        _pixie = bool(getattr(self, "_wps_attack_pixie", False))
+        _pin = getattr(self, "_wps_attack_pin", "") or ""
+        _timeout = int(timeout or getattr(self, "_wps_attack_timeout", 300))
+
+        if not (_iface and _bssid):
+            self._wps_log("Retry: Ziel unvollstaendig.", "ERR")
+            self._wps_restore_buttons()
+            return
+
+        if _tool == "reaver":
+            args = [
+                "-i", _iface, "-b", _bssid, "-c", str(_channel),
+                "-vv", "-t", "10", "-d", "1",
+            ]
+            if _pixie:
+                args.append("-K")
+            if _pin:
+                args += ["-p", _pin]
+        else:
+            args = [
+                "-i", _iface, "-b", _bssid, "-c", str(_channel),
+                "-v", "3",
+            ]
+            if _pixie:
+                args.append("-P")
+            if _pin:
+                args += ["-p", _pin]
+
         try:
-            rc = getattr(result, "returncode", None)
-            self._wps_log(f"WPS-Angriff beendet (rc={rc})", "OK" if rc == 0 else "WARN")
-        except (AttributeError, TypeError):
-            pass
-        self._wps_attack_runner = None
+            runner = ToolRunner(
+                _tool, args, timeout=_timeout, parse_progress=True
+            )
+            runner.line.connect(self._wps_on_attack_line)
+            runner.progress.connect(self._wps_on_attack_progress)
+            runner.done.connect(self._wps_on_attack_done)
+            self._wps_attack_runner = runner
+            self._wps_attack_tool = _tool
+            self._wps_attack_timeout = int(_timeout)
+            self._wps_log(
+                f"Retry: {_tool} (Timeout {_timeout}s) gestartet.", "INFO"
+            )
+            runner.start()
+        except (NameError, TypeError, AttributeError) as exc:
+            self._wps_log(f"Retry fehlgeschlagen: {exc}", "ERR")
+            self._wps_restore_buttons()
 
     def _wps_stop_attack(self) -> None:
         try:
@@ -77237,6 +77917,54 @@ def main() -> int:
         help="v38: decoded_ies als JSON ausgeben",
     )
     parser.add_argument(
+        "--pcap-analyze", metavar="FILE",
+        help="WP-F8: PCAP/PCAPNG analysieren (tshark, Meta/BSSIDs/Deauth)",
+    )
+    parser.add_argument(
+        "--pcap-out", metavar="FILE",
+        help="WP-F8: Analyse-Ergebnis in Datei (Default: stdout)",
+    )
+    parser.add_argument(
+        "--generate-psk", action="store_true", default=None,
+        help="WP-G10a: Diceware-Passphrase generieren (eigenes Netz)",
+    )
+    parser.add_argument(
+        "--psk-words", metavar="N", type=int, default=10,
+        help="WP-G10a: Woerter pro Passphrase (Default: 10)",
+    )
+    parser.add_argument(
+        "--psk-separator", metavar="SEP", default="-",
+        help="WP-G10a: Wort-Trennzeichen (Default: '-')",
+    )
+    parser.add_argument(
+        "--psk-count", metavar="N", type=int, default=1,
+        help="WP-G10a: Anzahl Passphrasen (Default: 1)",
+    )
+    parser.add_argument(
+        "--psk-add-number", action="store_true",
+        help="WP-G10a: 3-stellige Zufallszahl anhaengen",
+    )
+    parser.add_argument(
+        "--psk-wordfile", metavar="FILE", default="",
+        help="WP-G10a: alternative Wortliste (eine Zeile pro Wort)",
+    )
+    parser.add_argument(
+        "--router-reset-help", action="store_true", default=None,
+        help="WP-G10b: Reset-Anleitung fuer den eigenen Router",
+    )
+    parser.add_argument(
+        "--router-vendor", metavar="NAME", default="",
+        help="WP-G10b: Hersteller (fritzbox|speedport|tplink|asus|netgear|ubiquiti|dlink|generic)",
+    )
+    parser.add_argument(
+        "--router-access", action="store_true", default=None,
+        help="WP-G10c: Admin-Zugangs-Info (URL, Creds) fuer den eigenen Router",
+    )
+    parser.add_argument(
+        "--router-bssid", metavar="MAC", default="",
+        help="WP-G10c: BSSID fuer OUI-Lookup (Vendor-Erkennung)",
+    )
+    parser.add_argument(
         "--scan-channels", metavar="LIST",
         help="v38: Kanaele fuer --scan-once, z.B. '1,6,11' oder '1 6 11'",
     )
@@ -77308,6 +78036,18 @@ def main() -> int:
     parser.add_argument(
         "--scan-live-log", metavar="FILE",
         help="v38: Optionales Logfile (TSV: ts,bssid,signal,ssid,ch,enc)",
+    )
+    parser.add_argument(
+        "--watchlist-list", action="store_true",
+        help="v37-R25: zeigt bekannte MACs (Watchlist)"
+    )
+    parser.add_argument(
+        "--watchlist-add", nargs=2, metavar=("MAC", "LABEL"),
+        help="v37-R25: MAC mit Label zur Watchlist hinzufuegen"
+    )
+    parser.add_argument(
+        "--watchlist-remove", metavar="MAC",
+        help="v37-R25: MAC aus der Watchlist entfernen"
     )
 
     try:
@@ -77719,6 +78459,17 @@ def main() -> int:
                 log_file=str(getattr(a, "scan_live_log", "") or ""),
             ),
         ),
+        ("watchlist_list", lambda a: _watchlist_list_cli()),
+        (
+            "watchlist_add",
+            lambda a: _watchlist_add_cli(
+                a.watchlist_add[0], a.watchlist_add[1]
+            ),
+        ),
+        (
+            "watchlist_remove",
+            lambda a: _watchlist_remove_cli(a.watchlist_remove),
+        ),
         (
             "scan_iw_baseline",
             lambda a: _scan_iw_baseline_cli(
@@ -77820,6 +78571,13 @@ def main() -> int:
         ("store_import", lambda a: _store_import_cli(a.store_import)),
         ("store_live", lambda a: _store_live_cli(a.store_live)),
         ("store_search", lambda a: _store_search_cli(a.store_search)),
+        (
+            "pcap_analyze",
+            lambda a: _pcap_analyze_cli(
+                pcap_path=getattr(a, "pcap_analyze", "") or "",
+                out_file=getattr(a, "pcap_out", "") or "",
+            ),
+        ),
         ("hw_advisor", lambda a: _hw_advisor_cli(a.hw_advisor or "")),
         (
             "hw_antenna",
@@ -77851,6 +78609,29 @@ def main() -> int:
         ("diag_network", lambda a: _diag_network_cli(a.diag_network)),
         ("diag_crypto", lambda a: _diag_crypto_cli(a.diag_crypto)),
         ("trace_beacons", lambda a: _trace_beacons_cli(a.trace_beacons)),
+        (
+            "generate_psk",
+            lambda a: _generate_psk_cli(
+                words=int(getattr(a, "psk_words", 10) or 10),
+                separator=str(getattr(a, "psk_separator", "-") or "-"),
+                count=int(getattr(a, "psk_count", 1) or 1),
+                add_number=bool(getattr(a, "psk_add_number", False)),
+                wordfile=str(getattr(a, "psk_wordfile", "") or ""),
+            ),
+        ),
+        (
+            "router_reset_help",
+            lambda a: _router_reset_help_cli(
+                vendor=str(getattr(a, "router_vendor", "") or ""),
+            ),
+        ),
+        (
+            "router_access",
+            lambda a: _router_access_cli(
+                vendor=str(getattr(a, "router_vendor", "") or ""),
+                bssid=str(getattr(a, "router_bssid", "") or ""),
+            ),
+        ),
     ]
 
     for _attr_name, _fn in _param_dispatch:
@@ -79893,6 +80674,46 @@ class USBPerfTuner:
         for k, target in cls.SYSCTLS.items():
             lines.append(f"  {k:<32} = {cur.get(k,'?'):<10} (Ziel: {target})")
         return "\n".join(lines)
+
+
+def _watchlist_list_cli() -> int:
+    """v37-R25: --watchlist-list — zeigt bekannte MACs."""
+    wl = LiveWatchlist()
+    print("\u2550\u2550\u2550 Watchlist \u2550\u2550\u2550")
+    if not wl.known_macs:
+        print("  (leer)")
+        print()
+        print("  Einfuegen mit:")
+        print("    sudo python3 w.py --watchlist-add MAC \"Label\"")
+    else:
+        print(f"  {len(wl.known_macs)} Eintraege:")
+        for mac in sorted(wl.known_macs.keys()):
+            label = wl.known_macs[mac] or "(kein Label)"
+            print(f"    {mac}  {label}")
+    print()
+    print("  Pfad: " + str(wl.path))
+    return 0
+
+
+def _watchlist_add_cli(mac: str, label: str = "") -> int:
+    """v37-R25: --watchlist-add MAC [LABEL]."""
+    wl = LiveWatchlist()
+    if wl.add(mac, label):
+        print(f"[OK] {mac.lower()} hinzugefuegt"
+              + (f" ({label})" if label else ""))
+        return 0
+    print(f"[FEHLER] Ungueltige MAC: {mac}", file=sys.stderr)
+    return 1
+
+
+def _watchlist_remove_cli(mac: str) -> int:
+    """v37-R25: --watchlist-remove MAC."""
+    wl = LiveWatchlist()
+    if wl.remove(mac):
+        print(f"[OK] {mac.lower()} entfernt")
+        return 0
+    print(f"[FEHLER] Nicht in Watchlist: {mac}", file=sys.stderr)
+    return 1
 
 
 def _tools_cli(install=False):
@@ -88016,7 +88837,7 @@ def _scan_multi_cli(iface_managed: str = "",
     ]
     _total = sum(int(n.get("n_sightings", 0)) for n in nets)
 
-    if dump_ies:
+    if dump_ies and not dump_full:
         try:
             if out_file:
                 with open(out_file, "w", encoding="utf-8") as fh:
@@ -88304,21 +89125,76 @@ _OUI_VENDORS = {
 }
 
 
+def _is_valid_client_mac(mac: str) -> bool:
+    """v37-R24: Prueft, ob MAC ein gueltiger Unicast-Client ist.
+
+    Filtert:
+    - Broadcast (FF:FF:FF:FF:FF:FF)
+    - Multicast (LSB des ersten Bytes == 1: 01, 03, 33, ...)
+    - Ungueltige Laenge/Format
+    """
+    if not mac or not isinstance(mac, str):
+        return False
+    clean = mac.replace(":", "").replace("-", "").replace(".", "")
+    if len(clean) < 12:
+        return False
+    try:
+        first_byte = int(clean[:2], 16)
+    except (ValueError, TypeError):
+        return False
+    # LSB des ersten Bytes: 1 = Multicast/Broadcast
+    if first_byte & 0x01:
+        return False
+    return True
+
+
 def _scan_oui_vendor_lookup(mac: str) -> str:
     """Liefert den Hersteller anhand der OUI (erste 3 MAC-Bytes).
 
-    Normalisiert: 'aa:bb:cc:...' oder 'AA-BB-CC-...' -> 'aabbcc'.
-    Rueckgabe 'Unknown' bei unbekannter OUI oder ungueltigem Format.
+    v37-R20: Prueft zuerst die System-OUI-DB (44k+ Eintraege) ueber
+    _lookup_oui(), dann die kleine Built-in-Liste als Fallback.
+    Random-MACs (lokal verwaltet, Bit 0x02 gesetzt) werden markiert.
     """
     if not isinstance(mac, str) or not mac:
         return "Unknown"
+
     key = (
         mac.replace(":", "").replace("-", "").replace(".", "").lower()
     )
     if len(key) < 6:
         return "Unknown"
     oui = key[:6]
-    return _OUI_VENDORS.get(oui, "Unknown")
+
+    # 1. System-DB (44k+ Eintraege) - auch fuer Random MACs probieren,
+    #    falls die zufaellige OUI einen realen Eintrag trifft.
+    try:
+        vendor = _lookup_oui(mac)
+        if vendor and vendor not in ("Unbekannt", "Unknown", ""):
+            return vendor
+    except (NameError, AttributeError):
+        pass
+
+    # 2. Built-in-Liste
+    vendor = _OUI_VENDORS.get(oui, "")
+    if vendor:
+        return vendor
+
+    # 3. Random-MAC-Erkennung mit OUI-Prefix
+    #    (lokal verwaltetes Bit im ersten Byte = 0x02)
+    try:
+        first_byte = int(oui[:2], 16)
+        if first_byte & 0x02:
+            pretty = (
+                oui[0:2].upper() + ":" + oui[2:4].upper()
+                + ":" + oui[4:6].upper()
+            )
+            return "Random [" + pretty + "]"
+    except (ValueError, TypeError):
+        pass
+
+    return "Unknown"
+
+
 
 
 def _scan_live_ensure_monitor(iface: str) -> tuple:
@@ -88351,10 +89227,209 @@ def _scan_live_ensure_monitor(iface: str) -> tuple:
     return (True, f"Auto-Switch: {iface} {cur_mode} -> monitor")
 
 
+_SPARK_CHARS = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+
+
+def _sparkline(samples: list, width: int = 10) -> str:
+    """v37-R22: Signal-Verlauf als Unicode-Sparkline.
+
+    Nimmt die letzten `width` Werte aus signal_samples und mappt
+    sie auf Block-Zeichen (schwach -> stark). Fehlende Werte
+    werden mit Leerzeichen aufgefuellt.
+    """
+    if not samples:
+        return " " * width
+    s = list(samples)[-width:]
+    lo, hi = -95, -30
+    out: list[str] = []
+    for v in s:
+        try:
+            vi = int(v)
+        except (TypeError, ValueError):
+            vi = lo
+        vi = max(lo, min(hi, vi))
+        idx = int((vi - lo) / (hi - lo) * (len(_SPARK_CHARS) - 1))
+        out.append(_SPARK_CHARS[idx])
+    while len(out) < width:
+        out.insert(0, " ")
+    return "".join(out)
+
+
+class LiveWatchlist:
+    """v37-R25: Persistente Liste bekannter Geraete.
+
+    Speichert MAC-Adressen mit optionalem Label in
+    ~/.wlan_ultimate/watchlist.json. Wird beim scan-live
+    verwendet, um unbekannte Clients/APs zu markieren.
+    """
+
+    DEFAULT_PATH = Path.home() / ".wlan_ultimate" / "watchlist.json"
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path else self.DEFAULT_PATH
+        self.known_macs: dict[str, str] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if not self.path.exists():
+                return
+            import json as _j
+            data = _j.loads(self.path.read_text(encoding="utf-8"))
+            raw = data.get("known_macs", {})
+            if isinstance(raw, dict):
+                self.known_macs = {
+                    str(k).lower(): str(v) for k, v in raw.items()
+                }
+            elif isinstance(raw, list):
+                self.known_macs = {
+                    str(m).lower(): "" for m in raw
+                }
+        except (OSError, ValueError, AttributeError):
+            pass
+
+    def save(self) -> bool:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            import json as _j
+            payload = {"known_macs": dict(self.known_macs)}
+            self.path.write_text(
+                _j.dumps(payload, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def is_known(self, mac: str) -> bool:
+        if not mac:
+            return False
+        return str(mac).lower() in self.known_macs
+
+    def label(self, mac: str) -> str:
+        if not mac:
+            return ""
+        return self.known_macs.get(str(mac).lower(), "")
+
+    def add(self, mac: str, label: str = "") -> bool:
+        m = str(mac).lower().strip()
+        if len(m) < 12:
+            return False
+        self.known_macs[m] = str(label)
+        return self.save()
+
+    def remove(self, mac: str) -> bool:
+        m = str(mac).lower().strip()
+        if m in self.known_macs:
+            del self.known_macs[m]
+            self.save()
+            return True
+        return False
+
+
+_SEC_DEFAULT_PREFIXES = (
+    "FRITZ!Box", "Speedport", "Telekom", "Vodafone",
+    "TP-Link", "TP-LINK", "TP-Link_", "Netgear", "D-Link",
+    "Linksys", "EasyBox", "WLAN-", "MAGENTA", "Magenta",
+    "Unitymedia", "KabelBox", "HomeBox", "Speedport_",
+)
+
+
+def _wifi_security_check(n: dict) -> tuple:
+    """v37-R27: Bewertet WLAN-Sicherheit (Score 0-100).
+
+    Rueckgabe: (score, findings)
+      score    : int, 0-100 (100 = optimal)
+      findings : list[tuple[str, str, str]] = (severity, code, text)
+    """
+    score = 100
+    findings = []
+
+    enc = str(n.get("encryption") or "UNKNOWN").upper()
+    ssid = str(n.get("ssid") or "")
+    cipher = str(n.get("cipher") or "").upper()
+
+    if enc == "OPEN":
+        score -= 90
+        findings.append(
+            ("critical", "OPEN", "Offenes Netz ohne Verschluesselung")
+        )
+    elif enc == "WEP":
+        score -= 80
+        findings.append(
+            ("critical", "WEP", "WEP (seit Jahren gebrochen)")
+        )
+    elif enc == "WPA":
+        score -= 60
+        findings.append(
+            ("high", "WPA1", "WPA1 veraltet (TKIP-angreifbar)")
+        )
+    elif enc == "WPA3-TRANSITION":
+        score -= 25
+        findings.append(
+            ("medium", "WPA3-TRANS",
+             "WPA3-Transition erlaubt Downgrade auf WPA2")
+        )
+    elif enc == "UNKNOWN":
+        score -= 10
+        findings.append(("low", "ENC-UNK", "Verschluesselung unklar"))
+
+    if n.get("wps"):
+        if not n.get("wps_locked"):
+            score -= 30
+            findings.append(
+                ("high", "WPS-OPEN",
+                 "WPS aktiv, nicht gesperrt (Pixie-Dust)")
+            )
+        else:
+            score -= 5
+            findings.append(("low", "WPS-LOCK", "WPS aktiv, aber gesperrt"))
+
+    if enc in ("WPA2", "WPA3-TRANSITION", "ENTERPRISE"):
+        if not n.get("mfp_capable") and not n.get("mfp_required"):
+            score -= 20
+            findings.append(
+                ("medium", "NO-PMF",
+                 "PMF fehlt (anfaellig fuer Deauth)")
+            )
+        elif n.get("mfp_capable") and not n.get("mfp_required"):
+            score -= 8
+            findings.append(
+                ("low", "PMF-OPT", "PMF optional (Downgrade moeglich)")
+            )
+
+    if "TKIP" in cipher:
+        score -= 15
+        findings.append(
+            ("medium", "TKIP", "TKIP-Cipher (schwaecher als CCMP)")
+        )
+
+    for pref in _SEC_DEFAULT_PREFIXES:
+        if ssid.startswith(pref):
+            score -= 5
+            findings.append(
+                ("info", "DEF-SSID", "Default-SSID-Praefix: " + pref)
+            )
+            break
+
+    if not ssid or ssid == "<hidden>":
+        findings.append(
+            ("info", "HIDDEN", "Versteckte SSID")
+        )
+
+    return max(0, min(100, score)), findings
+
+
 def _scan_live_render(nets: list, iface: str, channels: list,
                       elapsed: float, refresh: float,
-                      total_frames: int) -> None:
-    """Rendert die Live-Tabelle. Loescht Terminal wenn TTY."""
+                      total_frames: int, clients: dict | None = None,
+                      deauth_counts: dict | None = None) -> None:
+    """Rendert die Live-Tabelle. Loescht Terminal wenn TTY.
+
+    v37-R21: Band-Spalte (2.4/5/6E) ergaenzt.
+    v37-R22: Signal-Verlauf (Sparkline) ergaenzt.
+    v37-R23: Client-Spalte + Client-AP-Mapping ergaenzt.
+    """
     try:
         if sys.stdout.isatty():
             sys.stdout.write("\033[2J\033[H")
@@ -88362,15 +89437,28 @@ def _scan_live_render(nets: list, iface: str, channels: list,
     except (OSError, AttributeError):
         pass
 
-    print("=" * 96)
+    print("=" * 122)
     _ch_s = ",".join(str(c) for c in (channels or [])) or "-"
     print(f"  SCAN-LIVE [{iface}]  t={elapsed:6.1f}s  "
           f"Kanaele={_ch_s}  Frames={total_frames}  "
           f"Refresh={refresh:.1f}s  (Strg-C = Ende)")
-    print("=" * 96)
-    print(f"  {'SSID':<22} {'BSSID':<18} {'Vendor':<20} {'Ch':>3} "
-          f"{'dBm':>4} {'n':>5} {'Trend':<10} {'Enc':<14} {'Alter':>6}")
-    print("  " + "-" * 92)
+    print("=" * 122)
+
+    # Client-Count pro BSSID (aus ap_bssid-Feld)
+    _cl_count: dict[str, int] = {}
+    _cli_list: list[dict] = []
+    if clients:
+        for cl in clients.values():
+            _ap = (cl.get("ap_bssid") or "").lower()
+            if _ap:
+                _cl_count[_ap] = _cl_count.get(_ap, 0) + 1
+                _cli_list.append(cl)
+
+    print(f"  {'SSID':<22} {'BSSID':<18} {'Vendor':<18} "
+          f"{'Bnd':>3} {'Ch':>3} {'dBm':>4} {'n':>5} "
+          f"{'Signal':<10} {'Trend':<11} {'Enc':<15} "
+          f"{'Cl':>3} {'!':>2} {'Da':>3} {'Sec':>4} {'Age':>5}")
+    print("  " + "-" * 130)
     if not nets:
         print("  (keine Frames - warte auf erste Uebertragung ...)")
 
@@ -88385,11 +89473,31 @@ def _scan_live_render(nets: list, iface: str, channels: list,
         except (TypeError, ValueError):
             return 100
 
+    def _band_str(n: dict) -> str:
+        band = n.get("band")
+        if band in ("2.4", "5"):
+            return band
+        if band in ("6", "6E"):
+            return "6E"
+        ch = n.get("channel") or 0
+        try:
+            ch = int(ch)
+        except (TypeError, ValueError):
+            return "?"
+        if 1 <= ch <= 14:
+            return "2.4"
+        if 36 <= ch <= 177:
+            return "5"
+        if 200 <= ch <= 233:
+            return "6E"
+        return "?"
+
     for n in sorted(nets, key=_key):
         ssid_raw = n.get("ssid")
         ssid = "<hidden>" if not ssid_raw else str(ssid_raw)[:21]
         bssid = str(n.get("bssid", "?"))[:17]
         vendor = str(n.get("vendor") or "Unknown")[:19]
+        band = _band_str(n)
         ch = int(n.get("channel") or 0)
         sig = n.get("signal_median")
         if sig is None:
@@ -88402,25 +89510,125 @@ def _scan_live_render(nets: list, iface: str, channels: list,
             ns = int(n.get("n_sightings") or 0)
         except (TypeError, ValueError):
             ns = 0
-        trend = str(n.get("signal_trend") or "?")[:9]
-        enc = str(n.get("encryption") or "?")[:13]
+        spark = _sparkline(n.get("signal_samples") or [], width=10)
+        trend = str(n.get("signal_trend") or "?")[:10]
+        enc = str(n.get("encryption") or "?")[:14]
+        _cl = _cl_count.get(bssid.lower(), 0)
         _ts = n.get("last_seen_ts")
         try:
             alter_s = now - float(_ts) if _ts is not None else 0.0
         except (TypeError, ValueError):
             alter_s = 0.0
-        if alter_s < 1.0:
-            alter_str = "jetzt"
-        elif alter_s < 60:
+        if alter_s < 60:
             alter_str = f"{alter_s:.0f}s"
         else:
             alter_str = f"{alter_s/60:.0f}m"
+        if _cl > 0:
+            _has_unknown = any(
+                not c.get("known", True)
+                for c in _cli_list
+                if (c.get("ap_bssid") or "").lower() == bssid.lower()
+            )
+            _alarm = "!" if _has_unknown else "\u25cf"
+        else:
+            _alarm = "-"
+        _da = 0
+        if deauth_counts:
+            _da = deauth_counts.get(bssid.lower(), 0)
+        _da_s = str(_da) if _da > 0 else "-"
+        _sec_score, _sec_findings = _wifi_security_check(n)
+        if _sec_score >= 80:
+            _sec_sym = "\u2713"
+        elif _sec_score >= 50:
+            _sec_sym = "\u26a0"
+        else:
+            _sec_sym = "\u2717"
+        _sec_s = f"{_sec_sym}{_sec_score}"
         print(
-            f"  {ssid:<22} {bssid:<18} {vendor:<20} {ch:>3} "
-            f"{sig_i:>4} {ns:>5} {trend:<10} {enc:<14} {alter_str:>6}"
+            f"  {ssid:<22} {bssid:<18} {vendor:<18} "
+            f"{band:>3} {ch:>3} {sig_i:>4} {ns:>5} "
+            f"{spark:<10} {trend:<11} {enc:<15} "
+            f"{_cl:>3} {_alarm:>2} {_da_s:>3} {_sec_s:>4} {alter_str:>5}"
         )
-    print("  " + "-" * 92)
-    print(f"  {len(nets)} BSSIDs aktiv")
+    print("  " + "-" * 130)
+    _unknown_cnt = sum(
+        1 for c in _cli_list if not c.get("known", True)
+    )
+    _sum_line = (f"  {len(nets)} BSSIDs aktiv, "
+                 f"{len(_cli_list)} Clients assoziiert")
+    if _unknown_cnt:
+        _sum_line += f" ({_unknown_cnt} unbekannt!)"
+    print(_sum_line)
+
+    _sec_list = []
+    _sev_rank = {"critical": 0, "high": 1, "medium": 2,
+                 "low": 3, "info": 4}
+    for _n in nets:
+        _sc, _findings = _wifi_security_check(_n)
+        _rel = [f for f in _findings
+                if f[0] in ("critical", "high", "medium")]
+        if _rel:
+            _sec_list.append((
+                _sc,
+                str(_n.get("ssid") or "<hidden>"),
+                str(_n.get("bssid") or "?"),
+                _rel,
+            ))
+    if _sec_list:
+        _sec_list.sort(
+            key=lambda x: (_sev_rank.get(x[3][0][0], 9), x[0])
+        )
+        print()
+        print("  " + "-" * 90)
+        print("  Schwachstellen (kritisch / hoch / mittel):")
+        for _sc, _ss, _bs, _fnd in _sec_list:
+            _sym = ("\u2717" if _sc < 50
+                    else ("\u26a0" if _sc < 80 else "\u2713"))
+            print(f"    {_sym} {_ss:<22} {_bs:<18} (Score {_sc:>3})")
+            for _sev, _code, _txt in _fnd:
+                print(f"         [{_sev:>8}] {_txt}")
+
+    # ── Client-Sektion ────────────────────────────────────────
+    if _cli_list:
+        _cli_list.sort(
+            key=lambda c: (
+                c.get("ap_bssid") or "zzz",
+                -int(c.get("n_frames") or 0),
+            )
+        )
+        _ap_vend_cache: dict[str, str] = {}
+        print()
+        print("  " + "-" * 90)
+        print("  Clients (Top 25):")
+        print(f"  {'MAC':<18} {'Vendor':<18} {'AP-Vendor':<20} "
+              f"{'AP-BSSID':<18} {'dBm':>4} {'Frames':>6} "
+              f"{'Probes':<16}")
+        for c in _cli_list[:25]:
+            _mac = str(c.get("mac") or "?")[:17]
+            _ven = str(c.get("vendor") or "?")[:19]
+            _ap = str(c.get("ap_bssid") or "?")[:17]
+            try:
+                _fr = int(c.get("n_frames") or 0)
+            except (TypeError, ValueError):
+                _fr = 0
+            _probes = c.get("probe_ssids") or []
+            _pr = ",".join(str(p) for p in _probes[:2])[:19] or "-"
+            _flag = " " if c.get("known", True) else "!"
+            _ap_lo = _ap.lower()
+            if _ap_lo in _ap_vend_cache:
+                _ap_ven = _ap_vend_cache[_ap_lo]
+            elif _ap and _ap != "?":
+                _ap_ven = _scan_oui_vendor_lookup(_ap_lo)[:19]
+                _ap_vend_cache[_ap_lo] = _ap_ven
+            else:
+                _ap_ven = "?"
+            _sig = c.get("signal")
+            _sig_s = str(int(_sig)) if _sig is not None else "-"
+            print(f" {_flag}{_mac:<18} {_ven:<18} {_ap_ven:<20} "
+                  f"{_ap:<18} {_sig_s:>4} {_fr:>6} {_pr:<16}")
+        if len(_cli_list) > 25:
+            print(f"  ... und {len(_cli_list) - 25} weitere")
+
     try:
         sys.stdout.flush()
     except (OSError, AttributeError):
@@ -88955,6 +90163,8 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
         max_duration = 0
 
     processor = PacketProcessor(dedupe=False)
+    _wl = LiveWatchlist()
+    deauth_counts: dict = {}
     seen: dict = {}
     clients: dict = {}
     lock = threading.Lock()
@@ -88986,9 +90196,61 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
                 _st = int(getattr(pkt, "subtype", -1))
                 _is_probe_req = (_t == 0 and _st == 4)
                 _is_data = (_t == 2)
-                if _is_probe_req or _is_data:
+                _is_deauth = (_t == 0 and _st == 12)
+                _is_disas = (_t == 0 and _st == 10)
+                _ap_for_cli = None
+                # v37-R26: Deauth/Disassoc-Frames zaehlen
+                if _is_deauth or _is_disas:
+                    _da_bssid = getattr(pkt, "addr3", None)
+                    if _da_bssid:
+                        with lock:
+                            _dk = str(_da_bssid).lower()
+                            deauth_counts[_dk] = (
+                                deauth_counts.get(_dk, 0) + 1
+                            )
+                # v37-R26: Client-Signal aus RadioTap
+                _pkt_sig = None
+                if _is_data or _is_probe_req:
+                    for _sattr in (
+                        "dBm_AntSignal", "dBm_antsignal", "dBm_signal",
+                    ):
+                        _sv = getattr(pkt, _sattr, None)
+                        if _sv is None:
+                            continue
+                        try:
+                            _siv = int(_sv)
+                            if -110 <= _siv <= 0:
+                                _pkt_sig = _siv
+                                break
+                        except (TypeError, ValueError):
+                            continue
+                if _is_data:
+                    # v37-R23: ToDS/FromDS-Bits korrekt auswerten.
+                    # ToDS=1,FromDS=0 -> Uplink  (addr1=AP,addr2=client)
+                    # ToDS=0,FromDS=1 -> Downlink(addr1=client,addr2=AP)
+                    # ToDS=0,FromDS=0 -> Ad-hoc  (addr1=dest,addr2=src)
+                    _fc = int(getattr(pkt, "FCfield", 0) or 0)
+                    _to_ds = bool(_fc & 0x01)
+                    _from_ds = bool(_fc & 0x02)
+                    if _to_ds and not _from_ds:
+                        _cli = getattr(pkt, "addr2", None)
+                        _ap_for_cli = getattr(pkt, "addr1", None)
+                        _peer = _ap_for_cli
+                    elif _from_ds and not _to_ds:
+                        _cli = getattr(pkt, "addr1", None)
+                        _ap_for_cli = getattr(pkt, "addr2", None)
+                        _peer = _ap_for_cli
+                    else:
+                        _cli = getattr(pkt, "addr2", None)
+                        _peer = getattr(pkt, "addr1", None)
+                elif _is_probe_req:
                     _cli = getattr(pkt, "addr2", None)
                     _peer = getattr(pkt, "addr1", None)
+                if _is_probe_req or _is_data:
+                    # v37-R24: Multicast/Broadcast/ungueltige MACs
+                    # aus der Client-Liste herausfiltern.
+                    if _cli and not _is_valid_client_mac(str(_cli)):
+                        _cli = None
                     if _cli:
                         _ck = str(_cli).lower()
                         _pk = str(_peer).lower() if _peer else ""
@@ -89006,6 +90268,12 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
                                     "n_frames": 1,
                                     "probe_ssids": [],
                                     "peers": {},
+                                    "ap_bssid": (
+                                        str(_ap_for_cli).lower()
+                                        if _ap_for_cli else ""
+                                    ),
+                                    "known": _wl.is_known(_ck),
+                                    "signal": _pkt_sig,
                                 }
                                 cl = clients[_ck]
                                 if _pk:
@@ -89013,6 +90281,16 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
                             else:
                                 cl["last_seen_ts"] = _now
                                 cl["n_frames"] += 1
+                                if _pkt_sig is not None:
+                                    cl["signal"] = _pkt_sig
+                                if (_ap_for_cli
+                                        and not cl.get("ap_bssid")
+                                        and _is_valid_client_mac(
+                                            str(_ap_for_cli)
+                                        )):
+                                    cl["ap_bssid"] = str(
+                                        _ap_for_cli
+                                    ).lower()
                                 if _pk:
                                     cl["peers"][_pk] = (
                                         cl["peers"].get(_pk, 0) + 1
@@ -89063,6 +90341,33 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
                 _new_ies = result.get("decoded_ies") or {}
                 if _new_ies:
                     ex["decoded_ies"] = _new_ies
+                for _k, _v in (
+                    ("cipher", result.get("cipher", "")),
+                    ("akm", result.get("akm", "")),
+                ):
+                    if _v and not ex.get(_k):
+                        ex[_k] = _v
+                for _k in ("wps", "wps_locked",
+                           "mfp_capable", "mfp_required"):
+                    if result.get(_k) and not ex.get(_k):
+                        if _k == "wps":
+                            try:
+                                with open(
+                                    "/tmp/wlan_wps_diag.log", "a",
+                                    encoding="utf-8"
+                                ) as _dfh:
+                                    _dfh.write(
+                                        f"{time.time():.3f} "
+                                        f"bssid={bssid} "
+                                        f"ssid={result.get('ssid', '')!r} "
+                                        f"type={result.get('type', '?')} "
+                                        f"ver={result.get('wps_version', '')!r} "
+                                        f"locked={result.get('wps_locked', False)}"
+                                        "\n"
+                                    )
+                            except OSError:
+                                pass
+                        ex[_k] = True
                 return
             seen[key] = {
                 "ssid": result.get("ssid", ""),
@@ -89077,6 +90382,13 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
                 "first_seen_ts": _now,
                 "last_seen_ts": _now,
                 "vendor": _scan_oui_vendor_lookup(str(bssid)),
+                "cipher": result.get("cipher", ""),
+                "akm": result.get("akm", ""),
+                "wps": bool(result.get("wps", False)),
+                "wps_version": result.get("wps_version", ""),
+                "wps_locked": bool(result.get("wps_locked", False)),
+                "mfp_capable": bool(result.get("mfp_capable", False)),
+                "mfp_required": bool(result.get("mfp_required", False)),
             }
             if log_handle[0] is not None:
                 try:
@@ -89161,8 +90473,12 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
                             n["signal_trend"] = "stable"
                     else:
                         n["signal_trend"] = "?"
-            _scan_live_render(_snap, iface, _ch_list, elapsed,
-                              refresh, frame_count[0])
+            _scan_live_render(
+                _snap, iface, _ch_list, elapsed,
+                refresh, frame_count[0],
+                clients=dict(clients),
+                deauth_counts=dict(deauth_counts),
+            )
             if max_duration > 0 and elapsed >= max_duration:
                 break
             time.sleep(refresh)
@@ -89183,8 +90499,13 @@ def _scan_live_cli(iface: str = "", channels=None, dwell: float = 0.3,
         try:
             if sniffer is not None:
                 sniffer.stop()
-        except (OSError, RuntimeError, AttributeError):
-            pass
+        except (OSError, RuntimeError, AttributeError, ValueError) as exc:
+            # v37-R34: Interface kann zwischen Start und Stop
+            # verschwunden sein (z.B. mon0 nach Monitor-Reset).
+            _say(
+                f"[scan] Sniffer-Stop: {exc}",
+                file=sys.stderr,
+            )
         if log_handle[0] is not None:
             try:
                 log_handle[0].close()
@@ -89533,7 +90854,7 @@ def _scan_iw_cli(iface: str = "", repeats: int = 1,
         for n in nets:
             n.pop("signal_samples", None)
 
-    if dump_ies:
+    if dump_ies and not dump_full:
         try:
             if out_file:
                 with open(out_file, "w", encoding="utf-8") as _fh:
@@ -90126,10 +91447,244 @@ def _scan_once_family_summary(nets: list) -> list:
     return out
 
 
+class PcapAnalyzer:
+    """WP-F8: liest PCAP/PCAPNG und liefert strukturierte Analyse.
+
+    Backend: tshark (schnell, korrekt, kein eigenes Parser-Rad).
+    Defensiv bei fehlendem tshark, fehlender Datei, kaputtem PCAP.
+    """
+
+    _SUBTYPE = {
+        0: "assoc_req", 1: "assoc_resp", 2: "reassoc_req",
+        3: "reassoc_resp", 4: "probe_req", 5: "probe_resp",
+        8: "beacon", 9: "atim", 10: "disassoc",
+        11: "auth", 12: "deauth", 13: "action",
+    }
+
+    _DEAUTH_FLOOD_THRESHOLD = 20
+    _BEACON_FLOOD_THRESHOLD = 500
+
+    def __init__(self, pcap_path: str = ""):
+        self.path = str(pcap_path or "").strip()
+        self.errors: list = []
+
+    @staticmethod
+    def _parse_int(val):
+        s = (val or "").strip()
+        if not s:
+            return None
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            return int(s)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _decode_ssid(raw: str) -> str:
+        """WP-F8: tshark liefert SSIDs als Hex-String. -> UTF-8 str."""
+        if not raw:
+            return ""
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+            raw = raw[1:-1]
+        if not raw:
+            return ""
+        # Hex-Erkennung: gerade Laenge + alle Zeichen hex
+        if len(raw) % 2 == 0 and all(c in "0123456789abcdefABCDEF" for c in raw):
+            try:
+                b = bytes.fromhex(raw)
+            except ValueError:
+                return raw
+            return b.decode("utf-8", errors="replace").rstrip("\x00")
+        return raw
+
+    @staticmethod
+    def _clean(s):
+        s = (s or "").strip()
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            return s[1:-1]
+        return s
+
+    def _run(self, args, timeout=120):
+        try:
+            r = subprocess.run(
+                args, check=False, timeout=timeout,
+                capture_output=True, text=True,
+            )
+            return r.returncode, r.stdout, r.stderr
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            return -1, "", str(exc)
+
+    def analyze(self) -> dict:
+        result = {
+            "schema_version": 1,
+            "kind": "pcap_analysis",
+            "pcap": {"path": self.path, "exists": False, "size_bytes": 0},
+            "capture_meta": {"tshark_available": False, "tshark_version": ""},
+            "frames_total": 0,
+            "frames_by_type": {},
+            "bssids": [],
+            "clients": [],
+            "deauth_events": [],
+            "anomalies": [],
+            "errors": [],
+        }
+        if not self.path:
+            self.errors.append("kein Pfad angegeben")
+            result["errors"] = list(self.errors)
+            return result
+        if not _os.path.isfile(self.path):
+            self.errors.append(f"Datei nicht gefunden: {self.path}")
+            result["errors"] = list(self.errors)
+            return result
+        result["pcap"]["exists"] = True
+        try:
+            result["pcap"]["size_bytes"] = _os.path.getsize(self.path)
+        except OSError:
+            pass
+
+        tshark = shutil.which("tshark") or ""
+        if not tshark:
+            self.errors.append(
+                "tshark nicht installiert (apt install tshark)"
+            )
+            result["errors"] = list(self.errors)
+            return result
+        result["capture_meta"]["tshark_available"] = True
+
+        rc, out, _ = self._run([tshark, "-v"], timeout=10)
+        if rc == 0:
+            for line in out.splitlines():
+                if line.strip().startswith("TShark"):
+                    result["capture_meta"]["tshark_version"] = line.strip()
+                    break
+
+        fields = [
+            "wlan.fc.type_subtype", "wlan.bssid", "wlan.ta", "wlan.ra",
+            "wlan.ssid", "wlan_radio.channel", "wlan_radio.signal_dbm",
+            "wlan.fixed.reason_code",
+        ]
+        args = [tshark, "-r", self.path, "-T", "fields",
+                "-E", "separator=\t", "-E", "quote=d",
+                "-E", "occurrence=a"]
+        for f in fields:
+            args += ["-e", f]
+
+        rc, out, err = self._run(args, timeout=180)
+        if rc != 0:
+            self.errors.append(f"tshark rc={rc}: {(err or '')[:200]}")
+            result["errors"] = list(self.errors)
+            return result
+
+        self._aggregate(out, result)
+        self._detect_anomalies(result)
+        result["errors"] = list(self.errors)
+        return result
+
+    def _aggregate(self, tshark_out: str, result: dict) -> None:
+        frames_by_type: dict = {}
+        bssids: dict = {}
+        clients: dict = {}
+        deauth_events: dict = {}
+        total = 0
+        cl = self._clean
+        pi = self._parse_int
+        for line in tshark_out.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            while len(parts) < 8:
+                parts.append("")
+            st, bssid, ta, ra, ssid, ch, sig, reason = parts[:8]
+            st, bssid = cl(st), cl(bssid).lower()
+            ta, ra = cl(ta).lower(), cl(ra).lower()
+            ssid = self._decode_ssid(ssid)
+            ch, sig = cl(ch), cl(sig)
+            reason = cl(reason)
+
+            total += 1
+            st_int = pi(st)
+            name = (self._SUBTYPE.get(st_int, f"other_{st_int}")
+                    if st_int is not None else "unknown")
+            frames_by_type[name] = frames_by_type.get(name, 0) + 1
+
+            if name in ("beacon", "probe_resp") and bssid:
+                entry = bssids.setdefault(bssid, {
+                    "bssid": bssid, "ssid": ssid,
+                    "channel": pi(ch), "signal_dbm": pi(sig),
+                    "n_beacons": 0, "n_probe_resp": 0, "sources": [],
+                })
+                if name == "beacon":
+                    entry["n_beacons"] += 1
+                else:
+                    entry["n_probe_resp"] += 1
+                if name not in entry["sources"]:
+                    entry["sources"].append(name)
+                if ssid and not entry["ssid"]:
+                    entry["ssid"] = ssid
+                if pi(ch) and not entry["channel"]:
+                    entry["channel"] = pi(ch)
+                if pi(sig) is not None:
+                    entry["signal_dbm"] = pi(sig)
+
+            if name == "probe_req" and ta:
+                entry = clients.setdefault(
+                    ta, {"mac": ta, "probe_ssids": []}
+                )
+                if ssid and ssid not in entry["probe_ssids"]:
+                    entry["probe_ssids"].append(ssid)
+
+            if name == "deauth" and ta:
+                ev = deauth_events.setdefault(
+                    ta, {"src": ta, "count": 0, "reasons": []}
+                )
+                ev["count"] += 1
+                rc_ = pi(reason)
+                if rc_ is not None and rc_ not in ev["reasons"]:
+                    ev["reasons"].append(rc_)
+
+        result["frames_total"] = total
+        result["frames_by_type"] = frames_by_type
+        result["bssids"] = sorted(
+            bssids.values(),
+            key=lambda x: -(x["n_beacons"] + x["n_probe_resp"]),
+        )
+        result["clients"] = sorted(
+            clients.values(), key=lambda x: x["mac"]
+        )
+        result["deauth_events"] = sorted(
+            deauth_events.values(), key=lambda x: -x["count"]
+        )
+
+    def _detect_anomalies(self, result: dict) -> None:
+        anomalies = []
+        for ev in result["deauth_events"]:
+            if ev["count"] >= self._DEAUTH_FLOOD_THRESHOLD:
+                anomalies.append({
+                    "type": "deauth_flood",
+                    "severity": "high" if ev["count"] >= 100 else "medium",
+                    "src": ev["src"],
+                    "count": ev["count"],
+                })
+        for b in result["bssids"]:
+            if b["n_beacons"] >= self._BEACON_FLOOD_THRESHOLD:
+                anomalies.append({
+                    "type": "beacon_flood",
+                    "severity": "high" if b["n_beacons"] >= 2000 else "medium",
+                    "bssid": b["bssid"],
+                    "count": b["n_beacons"],
+                })
+        result["anomalies"] = anomalies
+
+
+
+
 def _scan_once_envelope(nets: list, iface: str, channels_req: list,
                         started: float, ended: float, dwell: float,
                         total_beacons: int, channels_obs: list,
-                        hop_stats: dict | None = None) -> dict:
+                        hop_stats: dict | None = None,
+                        heatmap: dict | None = None) -> dict:
     """Baut das vollstaendige Envelope-Dict (Schema v1)."""
     _revealed_count = sum(
         1 for n in nets
@@ -90172,6 +91727,7 @@ def _scan_once_envelope(nets: list, iface: str, channels_req: list,
             "duration_s": round(float(ended) - float(started), 3),
             "channels_requested": list(channels_req),
             "channels_observed": sorted(channels_obs),
+            "channel_heatmap": dict(heatmap or {}),  # WP-A2b
             "dwell_s": float(dwell),
             "total_beacons_seen": int(total_beacons),
         },
@@ -90202,20 +91758,61 @@ def _scan_once_parse_channels(spec) -> list:
     return out
 
 
+def _scan_next_hop_channels(channels: list,
+                              heatmap: dict | None = None) -> list:
+    """WP-A2: liefert die Kanal-Reihenfolge fuer einen Hop-Zyklus.
+
+    Ohne heatmap: unveraenderte Reihenfolge (Round-Robin).
+    Mit heatmap: Kanaele mit Score >= Median (und > 0) werden
+    doppelt eingefuegt, sodass die naechste Runde sie 2x besucht.
+    Leere/ungueltige heatmap -> Fallback auf Round-Robin.
+    """
+    if not channels:
+        return []
+    if not heatmap:
+        return list(channels)
+    try:
+        scored = [(int(ch), int(heatmap.get(ch, 0) or 0))
+                  for ch in channels]
+    except (TypeError, ValueError, AttributeError):
+        return list(channels)
+    positive = [sc for _, sc in scored if sc > 0]
+    if not positive:
+        return list(channels)
+    positive.sort()
+    median = positive[len(positive) // 2]
+    hot = {ch for ch, sc in scored if sc > 0 and sc >= median}
+    if not hot:
+        return list(channels)
+    result: list = []
+    for ch in channels:
+        result.append(ch)
+        if ch in hot:
+            result.append(ch)
+    return result
+
+
 def _scan_once_hopper(iface: str, channels: list, dwell: float,
                       stop_event: threading.Event,
-                      hop_stats: dict | None = None) -> None:
+                      hop_stats: dict | None = None,
+                      heatmap: dict | None = None) -> None:
     """Hintergrund-Thread: wechselt Kanal per iw, bis stop_event gesetzt.
 
     hop_stats (optional): dict mit "visits" (channel -> n) und "cycles" (int).
     Wird am Ende jedes vollstaendigen Durchlaufs hochgezaehlt.
+    heatmap (optional): {channel: score}. WP-A2: heisse Kanaele
+    (Score >= Median) werden pro Zyklus doppelt besucht. None -> Round-Robin.
     """
     if not channels:
         return
     idx = 0
-    total = len(channels)
+    cycle = _scan_next_hop_channels(channels, heatmap)
+    if not cycle:
+        return
+    total = len(cycle)
+    _next_recompute = total  # WP-A2b: naechster Recompute-Punkt
     while not stop_event.is_set():
-        ch = channels[idx % total]
+        ch = cycle[idx % total]
         if hop_stats is not None:
             try:
                 hop_stats["visits"][ch] = (
@@ -90237,6 +91834,13 @@ def _scan_once_hopper(iface: str, channels: list, dwell: float,
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             pass
         idx += 1
+        # WP-A2b: Heatmap hat sich ggf. geaendert -> Kanal-Reihenfolge neu
+        if heatmap and idx >= _next_recompute:
+            _new_cycle = _scan_next_hop_channels(channels, heatmap)
+            if _new_cycle:
+                cycle = _new_cycle
+                total = len(cycle)
+                _next_recompute = idx + total
         stop_event.wait(max(0.1, float(dwell)))
 
 
@@ -90282,6 +91886,7 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
     hidden_ssids: dict = {}  # bssid_lower -> set(ssid)
     lock = threading.Lock()
     started_ts = time.time()
+    _heatmap: dict = {}  # WP-A2b: {channel: n_new_bssids}
 
     def _collect(pkt) -> None:
         # Direkt-Sniff fuer Probe-Response-SSIDs (hidden-Aufdeckung)
@@ -90350,6 +91955,26 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
                 new_ies = result.get("decoded_ies") or {}
                 if new_ies:
                     existing["decoded_ies"] = new_ies
+                for _k, _v in (
+                    ("cipher", result.get("cipher", "")),
+                    ("akm", result.get("akm", "")),
+                    ("wps_version", result.get("wps_version", "")),
+                    ("wps_state", result.get("wps_state", "")),
+                    ("wps_device_name", result.get("wps_device_name", "")),
+                    ("wps_manufacturer", result.get("wps_manufacturer", "")),
+                    ("wps_model", result.get("wps_model", "")),
+                    ("wps_model_number", result.get("wps_model_number", "")),
+                    ("wps_serial", result.get("wps_serial", "")),
+                    ("wps_device_type", result.get("wps_device_type", "")),
+                    ("wps_rf_bands", result.get("wps_rf_bands", "")),
+                ):
+                    if _v and not existing.get(_k):
+                        existing[_k] = _v
+                for _k in (
+                    "wps", "wps_locked", "mfp_capable", "mfp_required"
+                ):
+                    if result.get(_k) and not existing.get(_k):
+                        existing[_k] = True
                 return
             _now = time.time()
             seen[bssid_key] = {
@@ -90362,7 +91987,29 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
                 "signal_samples": [_sig_int] if _sig_int is not None else [],
                 "first_seen_ts": _now,
                 "last_seen_ts": _now,
+                "vendor": _scan_oui_vendor_lookup(str(bssid)),
+                "cipher": result.get("cipher", ""),
+                "akm": result.get("akm", ""),
+                "wps": bool(result.get("wps", False)),
+                "wps_locked": bool(result.get("wps_locked", False)),
+                "wps_version": result.get("wps_version", ""),
+                "wps_state": result.get("wps_state", ""),
+                "wps_config_methods": list(
+                    result.get("wps_config_methods") or []
+                ),
+                "wps_device_name": result.get("wps_device_name", ""),
+                "wps_manufacturer": result.get("wps_manufacturer", ""),
+                "wps_model": result.get("wps_model", ""),
+                "wps_model_number": result.get("wps_model_number", ""),
+                "wps_serial": result.get("wps_serial", ""),
+                "wps_device_type": result.get("wps_device_type", ""),
+                "wps_rf_bands": result.get("wps_rf_bands", ""),
+                "mfp_capable": bool(result.get("mfp_capable", False)),
+                "mfp_required": bool(result.get("mfp_required", False)),
             }
+            _ch_new = int(result.get("channel") or 0)
+            if _ch_new > 0:  # WP-A2b: neuer BSSID -> Kanal hotter
+                _heatmap[_ch_new] = _heatmap.get(_ch_new, 0) + 1
 
     _ch_list = list(channels) if channels else []
     if _ch_list:
@@ -90399,6 +92046,7 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
         hopper_thread = threading.Thread(
             target=_scan_once_hopper,
             args=(iface, _ch_list, dwell, stop_hopping, hop_stats),
+            kwargs={"heatmap": _heatmap},
             daemon=True,
             name="scan_once_hopper",
         )
@@ -90427,8 +92075,13 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
         try:
             if sniffer is not None:
                 sniffer.stop()
-        except (OSError, RuntimeError, AttributeError):
-            pass
+        except (OSError, RuntimeError, AttributeError, ValueError) as exc:
+            # v37-R34: Interface kann zwischen Start und Stop
+            # verschwunden sein (z.B. mon0 nach Monitor-Reset).
+            _say(
+                f"[scan] Sniffer-Stop: {exc}",
+                file=sys.stderr,
+            )
 
     nets = list(seen.values())
     _revealed = _scan_once_apply_probe_ssids(nets, hidden_ssids)
@@ -90479,6 +92132,7 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
                 nets, iface, list(_ch_list), _scan_started, _scan_ended,
                 dwell, _total_beacons, _channels_obs,
                 hop_stats=hop_stats,
+                heatmap=_heatmap,
             )
         except (TypeError, ValueError) as exc:
             _say(f"Envelope-Aufbau fehlgeschlagen: {exc}",
@@ -90508,7 +92162,7 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
             return 1
         return 0
 
-    if dump_ies:
+    if dump_ies and not dump_full:
         try:
             if out_file:
                 with open(out_file, "w", encoding="utf-8") as _fh:
@@ -90571,9 +92225,537 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
             f"{_trend:<10} {ie_count:>4}"
         )
     _say("=" * 100)
+
+    # v37-R34: WPS-Detailblock (Patch 2b)
+    _wps_nets = [n for n in nets if n.get("wps")]
+    if _wps_nets:
+        _say("")
+        _say("-" * 92)
+        _say(f"  WPS-NETZE ({len(_wps_nets)})")
+        _say("-" * 92)
+        _say(
+            f"{'BSSID':<18} {'Ch':>3} {'Ver':>5} "
+            f"{'Lk':>3} {'State':<13} "
+            f"{'Methods':<28} {'Device':<14}"
+        )
+        for n in sorted(_wps_nets, key=_tbl_key):
+            _bssid = str(n.get("bssid", "?"))[:17]
+            _ch = int(n.get("channel") or 0)
+            _ver = str(n.get("wps_version") or "?")[:5]
+            _lk = "[L]" if n.get("wps_locked") else "[ ]"
+            _state = str(n.get("wps_state") or "")[:13]
+            _methods = ",".join(n.get("wps_config_methods") or [])[:28]
+            if not _methods:
+                _methods = "-"
+            _dev = str(n.get("wps_device_name") or "")[:14]
+            if not _dev:
+                _dev = "-"
+            _say(
+                f"{_bssid:<18} {_ch:>3} {_ver:>5} "
+                f"{_lk:>3} {_state:<13} "
+                f"{_methods:<28} {_dev:<14}"
+            )
+        _say("-" * 92)
+        _mfg_count = sum(
+            1 for n in _wps_nets if n.get("wps_manufacturer")
+        )
+        _mdl_count = sum(
+            1 for n in _wps_nets if n.get("wps_model")
+        )
+        _say(
+            f"WPS-Netze mit Hersteller-Info: {_mfg_count} | "
+            f"mit Model-Info: {_mdl_count}"
+        )
+
     total_ies = sum(len(n.get("decoded_ies") or {}) for n in nets)
     _say(f"Summe IE-Typen: {total_ies} | --scan-dump-ies fuer Rohdaten")
     _say("Tipp: --scan-explain zeigt dBm-Legende + Feldbeschreibung.")
+    return 0
+
+
+_ROUTER_RESET_DB: dict = {
+    "fritzbox": {
+        "vendor": "AVM FritzBox",
+        "url": "http://fritz.box oder http://192.168.178.1",
+        "reset_position": "Rueckseite, kleiner versenkter Knopf",
+        "reset_duration": "15 Sekunden gedrueckt halten (Netzstecker steckt)",
+        "after_reset_ip": "192.168.178.1",
+        "default_user": "(leer)",
+        "default_pass": "(leer nach Werksreset, wird beim ersten Login gesetzt)",
+        "reconfig": [
+            "WLAN-SSID + WPA3-Passphrase neu setzen",
+            "Internet-Zugangsdaten (Provider) erneut eintragen",
+            "Telefonie-Konfiguration neu einspielen",
+            "FritzBox-Updates aktivieren",
+        ],
+    },
+    "speedport": {
+        "vendor": "Telekom Speedport",
+        "url": "http://speedport.ip oder http://192.168.2.1",
+        "reset_position": "Rueckseite, Reset-Knopf (teils Nadel notwendig)",
+        "reset_duration": "10 Sekunden gedrueckt halten bis alle LEDs blinken",
+        "after_reset_ip": "192.168.2.1",
+        "default_user": "(leer)",
+        "default_pass": "Gerätespezifisch (steht auf Geraeterueckseite)",
+        "reconfig": [
+            "Zugangsdaten Telekom (Anschlusskennung + Passwort) eintragen",
+            "WLAN neu einrichten",
+            "Telefonie-Profile neu laden",
+        ],
+    },
+    "tplink": {
+        "vendor": "TP-Link (Archer / TL-WR)",
+        "url": "http://tplinkwifi.net oder http://192.168.0.1",
+        "reset_position": "Rueckseite, RESET-Knopf",
+        "reset_duration": "10 Sekunden gedrueckt halten bis LEDs schnell blinken",
+        "after_reset_ip": "192.168.0.1",
+        "default_user": "admin",
+        "default_pass": "admin (aelt. Modelle) oder selbst gesetzt beim Erststart",
+        "reconfig": [
+            "WAN-Typ (PPPoE/DHCP) eintragen",
+            "WLAN-SSID + WPA3-Passphrase setzen",
+            "Firmware-Update pruefen",
+        ],
+    },
+    "asus": {
+        "vendor": "ASUS (RT-AX / RT-AC)",
+        "url": "http://router.asus.com oder http://192.168.1.1",
+        "reset_position": "Rueckseite, WPS-Button fuer Reset mitbenutzt",
+        "reset_duration": "5-10 Sekunden gedrueckt halten",
+        "after_reset_ip": "192.168.1.1",
+        "default_user": "admin",
+        "default_pass": "admin (aelt.) oder selbst gesetzt beim Erststart",
+        "reconfig": [
+            "AiMesh-Setup erneut durchlaufen",
+            "WLAN-SSID + Passphrase neu setzen",
+            "DDNS + Port-Forwards neu konfigurieren",
+        ],
+    },
+    "netgear": {
+        "vendor": "Netgear (Nighthawk / Orbi)",
+        "url": "http://routerlogin.net oder http://192.168.1.1",
+        "reset_position": "Rueckseite, Reset-Knopf",
+        "reset_duration": "7-10 Sekunden gedrueckt halten bis Power-LED blinkt",
+        "after_reset_ip": "192.168.1.1",
+        "default_user": "admin",
+        "default_pass": "password",
+        "reconfig": [
+            "Nighthawk-App-Erstkonfiguration erneut durchlaufen",
+            "WLAN-Zugangsdaten setzen",
+        ],
+    },
+    "ubiquiti": {
+        "vendor": "Ubiquiti UniFi / EdgeRouter",
+        "url": "http://unifi (via Controller) oder http://192.168.1.1",
+        "reset_position": "Rueckseite, RESET (teils versenkt)",
+        "reset_duration": "10 Sekunden gedrueckt halten (UniFi-APs: bis LED wechselt)",
+        "after_reset_ip": "192.168.1.1 / DHCP-Fallback 192.168.1.x",
+        "default_user": "ubnt",
+        "default_pass": "ubnt",
+        "reconfig": [
+            "Controller-Adoption erneut",
+            "Netzwerk-Profile neu anwenden",
+            "SSIDs ueber Controller neu pushen",
+        ],
+    },
+    "dlink": {
+        "vendor": "D-Link (DIR / COVR)",
+        "url": "http://dlinkrouter.local oder http://192.168.0.1",
+        "reset_position": "Rueckseite, RESET-Knopf",
+        "reset_duration": "10 Sekunden gedrueckt halten",
+        "after_reset_ip": "192.168.0.1",
+        "default_user": "admin",
+        "default_pass": "(leer) oder selbst gesetzt beim Erststart",
+        "reconfig": [
+            "Setup-Assistent durchlaufen",
+            "WLAN + Internet-Zugang neu setzen",
+        ],
+    },
+    "generic": {
+        "vendor": "Generischer Router",
+        "url": "Haeufig 192.168.1.1 / 192.168.0.1 / 192.168.178.1",
+        "reset_position": "Rueckseite, meist kleiner RESET-Knopf (Nadel)",
+        "reset_duration": "10-30 Sekunden gedrueckt halten (LEDs beobachten)",
+        "after_reset_ip": "Siehe Geraete-Aufkleber (Rueckseite/Unterseite)",
+        "default_user": "Siehe Geraete-Aufkleber",
+        "default_pass": "Siehe Geraete-Aufkleber oder (leer)",
+        "reconfig": [
+            "Aufkleber auf Geraeterueckseite pruefen",
+            "Hersteller-Support-Seite aufsuchen",
+            "Alle Zugangsdaten neu eintragen",
+        ],
+    },
+}
+
+
+def _router_reset_help_cli(vendor: str = "") -> int:
+    """WP-G10b: --router-reset-help — Anleitung fuer den EIGENEN Router.
+
+    Reine Textausgabe. Kein Netzzugriff. Nur fuer den Fall, dass das
+    Admin-Passwort des EIGENEN Routers verloren wurde.
+    """
+    key = str(vendor or "").strip().lower()
+    if not key:
+        print("Verfuegbare Hersteller:")
+        for k, v in _ROUTER_RESET_DB.items():
+            print(f"  {k:<10}  {v['vendor']}")
+        print()
+        print("Aufruf: --router-reset-help --router-vendor fritzbox")
+        print("(oder einen anderen Schluessel aus obiger Liste)")
+        return 0
+    if key not in _ROUTER_RESET_DB:
+        _say(
+            f"[router-reset-help] Unbekannter Hersteller: {vendor!r}. "
+            f"Verfuegbar: {', '.join(sorted(_ROUTER_RESET_DB))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    r = _ROUTER_RESET_DB[key]
+    sep = "=" * 72
+    dash = "-" * 72
+    print(sep)
+    print(f"  Router-Reset-Anleitung: {r['vendor']}")
+    print(sep)
+    print()
+    print(f"  Admin-URL:           {r['url']}")
+    print(f"  Reset-Knopf:         {r['reset_position']}")
+    print(f"  Drueckdauer:         {r['reset_duration']}")
+    print()
+    print(dash)
+    print("  Nach Werksreset:")
+    print(dash)
+    print(f"  IP-Adresse:          {r['after_reset_ip']}")
+    print(f"  Standard-Benutzer:   {r['default_user']}")
+    print(f"  Standard-Passwort:   {r['default_pass']}")
+    print()
+    print(dash)
+    print("  Neu einzurichten:")
+    print(dash)
+    for i, item in enumerate(r["reconfig"], 1):
+        print(f"  {i}. {item}")
+    print()
+    print(sep)
+    print("  HINWEIS: Diese Anleitung gilt fuer den EIGENEN Router, wenn")
+    print("  das Admin-Passwort verloren wurde. Bei einem Miet-/Fremdgeraet")
+    print("  wende dich an den Eigentuemer oder Provider.")
+    print(sep)
+    return 0
+
+
+_PSK_WORDS: list = """
+able acid acre ally alpha amber angel ankle apple arrow aspen atlas
+autumn bacon badge bagel bison blaze blend blink bliss block bloom
+blues bluff blush board bonus boost booth brace braid brain brake
+brand brave bread break brick bride brief bring brisk broad brook
+broom brown brush bugle build bulge bulky bunch bunny burst cabin
+cable cache cadet camel candy canoe cargo carry carve catch cedar
+chain chair chalk charm chart cheer chess chief child chili chunk
+cider civic clamp clash clasp class clean clear cliff climb cloak
+clock close cloud clove coach coast cobra cocoa coral couch count
+court cover crack craft crane crate crawl crazy cream creek crest
+crime crisp cross crowd crown crude cruise crumb crush crust cycle
+daily dairy dance dared dealer debut decal decor delay delta dense
+depth diary digit diner dirty ditch diver dizzy dodge donor doubt
+dozen draft drain drama drank drape drawn dream dress dried drift
+drill drink drive drone drove drown druid dryer dwell eagle early
+earth easel eaten ebony eight elbow elder elect elite ember empty
+ended enemy enjoy enter entry equal equip erase error essay event
+every exact excel exile exist extra fable faced fairy faith false
+fancy fatal fault favor feast fence ferry fever fiber field fiery
+fifth fight final finch first flair flame flash fleet flesh flint
+float flock flood floor flour flown fluid flush flute focal focus
+foggy force forge forth forty forum found frame frank fraud fresh
+fried front frost fruit fully funny gauge gecko genre ghost giant
+given giver glade gland glass gleam globe gloom glory glove going
+goose gorge grace grade grain grand grape graph grasp grass grave
+gravy great greed green greet grief grill grind groan groom gross
+group grove grown guard guess guest guide guild guilt habit handy
+happy harsh haste hatch haunt haven havoc heart heavy hedge hello
+hence herbal hilly hinge hippo hoard hobby honey honor horse hotel
+hound house hover human humor hurry ideal image imply inbox index
+inner input intro iron issue ivory jelly jewel joker judge juice
+jumbo knack kneel knife knock known koala label labor laden lance
+large laser latch later latex laugh layer leafy learn lease least
+legal lemon level lever light lilac limbo linen liner liter liver
+llama lobby local lodge logic loose loser lower loyal lucid lunar
+lunch lyric magic magma major maker mango manor maple march marsh
+match medal media mercy merge merit merry metal meter midst might
+mimic miner minor mixed model moist money month moral moped motel
+motor mound mount mourn mouse mouth mover movie muddy mummy mural
+music musty naive naked nasty naval needy nerve never newer nexus
+niche night ninja noble noisy north notch novel nudge nurse oasis
+occur ocean offer often olive omega onion opera orbit order organ
+other otter ought outer owner oxide ozone pact paint panda panel
+panic paper party pasta patch patio pause peace peach pearl pedal
+penny perch peril petal phase phone photo piano piece pilot pinch
+pinky piped pitch pivot pixel pizza place plain plane plant plate
+plaza plead pluck plumb plush point polar policy polka porch pouch
+pound power prank press price pride prime print prior prism prize
+probe prone proof proud prove prune pulse punch pupil puppy purse
+quack quail quake quart queen query quest queue quick quiet quilt
+quirk quota quote rabbi radar radio rainy raise rally ranch range
+rapid ratio raven razor reach react ready realm rebel recap refer
+regal reign relax relay remix renew repay reply rerun reset resin
+retro rider ridge rifle right rigid rinse riper risky rival river
+roast robin robot rocky rogue roman rover royal rugby ruler rumor
+rural sadly safer saint salad salon salsa salty sandy satin sauce
+saved scale scarf scene scent scoop scope score scout screw scrub
+sedan seize sense serum serve seven sever sewer shack shade shady
+shaft shake shall shame shape share shark sharp shave shear sheep
+sheet shelf shell shift shine shiny shirt shock shoot shore short
+shown shrub shrug sight silly since siren sixth sixty skate skill
+skirt skull slack slain slate slave sleek sleep slide slime slope
+small smart smash smell smile smoke snack snail snake sneak sniff
+snowy sober socks solar solid solve sonic sorry sound south space
+spade spare spark speak spear speed spell spend spent spice spicy
+spike spine spiral spite splat split spoke spoon sport spout spray
+spree squad squat squid stack staff stage stain stair stake stale
+stall stamp stand stark start state steak steal steam steel steep
+steer stern stick still sting stock stole stone stood stool stoop
+store storm story stout stove strap straw stray strip stuck study
+stuff stump stung style suave sugar suite sunny super surge sushi
+swamp swarm swear sweat sweep sweet swell swept swift swing swirl
+sword syrup table taboo tacky taffy taken tally tango tapir tarot
+taste tasty tawny teach teary tease teeth tempo tempt tenor tense
+tenth thank theft their theme there these thick thief thigh thing
+think third thorn those three threw throw thumb thump tibia tidal
+tiger tight timer timid tipsy tired title toast today token tonal
+tonic tooth topaz topic torch total touch tough towel tower toxic
+trace track trade trail train trait tramp trash tread treat trend
+trial tribe trick tried tripe troop trout truce truck truly trunk
+trust truth tulip tumor tuna tuner turbo tutor twice twine twist
+tying udder ultra umbra uncle under undue unfit unify union unite
+unity unlit until upset urban usage usher usual utter vague valid
+valor value valve vapor vault vegan venue verge verse video vigor
+villa vinyl viola viral virus visit vital vivid vocal vodka vogue
+voice voter vowel wafer wagon waist waive waltz wares waste watch
+water weary weave wedge weigh weird whale wharf wheat wheel where
+which while whirl whisk white whole whose widow width wield wince
+windy wiped wiser witch witty woken woman woody world worry worse
+worst worth wound woven wrath wreck wrist write wrong wrote yacht
+yeast yield young yours youth zebra zesty zippy zombie
+""".split()  # noqa: SIM905 — 1000 Ein-Wort-Zeilen haesslicher als String
+
+
+_ROUTER_OUI_MAP: dict = {
+    "24:65:11": "fritzbox", "38:2C:4A": "fritzbox", "5C:49:79": "fritzbox",
+    "08:96:D7": "fritzbox", "3C:A6:2F": "fritzbox", "C8:0E:14": "fritzbox",
+    "4C:1B:86": "speedport", "68:54:FD": "speedport", "F8:0B:BE": "speedport",
+    "00:27:19": "tplink", "14:CC:20": "tplink", "50:C7:BF": "tplink",
+    "AC:84:C6": "tplink", "B0:4E:26": "tplink", "F4:F2:6D": "tplink",
+    "9C:53:22": "tplink", "C4:6E:1F": "tplink", "EC:08:6B": "tplink",
+    "00:0C:6E": "asus", "08:60:6E": "asus", "1C:87:2C": "asus",
+    "2C:56:DC": "asus", "38:D5:47": "asus", "AC:9E:17": "asus",
+    "B0:6E:BF": "asus", "D8:50:E6": "asus",
+    "00:09:5B": "netgear", "00:14:6C": "netgear", "20:4E:7F": "netgear",
+    "2C:30:33": "netgear", "9C:3D:CF": "netgear", "A0:40:A0": "netgear",
+    "B0:39:56": "netgear", "C4:3D:C7": "netgear",
+    "00:15:6D": "ubiquiti", "04:18:D6": "ubiquiti", "24:A4:3C": "ubiquiti",
+    "44:D9:E7": "ubiquiti", "74:83:C2": "ubiquiti", "78:8A:20": "ubiquiti",
+    "80:2A:A8": "ubiquiti", "F0:9F:C2": "ubiquiti",
+    "00:1B:11": "dlink", "00:1E:58": "dlink", "14:D6:4D": "dlink",
+    "1C:7E:E5": "dlink", "28:10:7B": "dlink", "34:08:04": "dlink",
+    "74:DA:88": "dlink", "CC:B2:55": "dlink",
+}
+
+
+def _router_normalize_mac(mac: str) -> str:
+    """WP-G10c: MAC nach xx:yy:zz:aa:bb:cc normalisieren."""
+    t = str(mac or "").strip().replace("-", ":").replace(".", ":")
+    if ":" not in t and len(t) == 12:
+        t = ":".join(t[i:i+2] for i in range(0, 12, 2))
+    parts = [q for q in t.split(":") if q]
+    return ":".join(q.zfill(2).lower() for q in parts)
+
+
+def _router_vendor_from_bssid(bssid: str) -> str:
+    """WP-G10c: OUI-Lookup -> Router-Vendor-Key oder ''."""
+    mac = _router_normalize_mac(bssid)
+    parts = mac.split(":")
+    if len(parts) < 3:
+        return ""
+    return _ROUTER_OUI_MAP.get(":".join(parts[:3]).upper(), "")
+
+
+def _router_access_cli(vendor: str = "", bssid: str = "") -> int:
+    """WP-G10c: --router-access — Admin-Info fuer den EIGENEN Router."""
+    key = str(vendor or "").strip().lower()
+    if not key and bssid:
+        detected = _router_vendor_from_bssid(bssid)
+        if detected:
+            key = detected
+            print(
+                f"BSSID {bssid} -> OUI-Lookup ergibt: "
+                f"{_ROUTER_RESET_DB[key]['vendor']}"
+            )
+            print()
+
+    if not key:
+        print("Router-Admin-Zugang — Info fuer den EIGENEN Router")
+        print("=" * 60)
+        print()
+        print("Aufruf-Varianten:")
+        print("  --router-access --router-vendor fritzbox")
+        print("  --router-access --router-bssid 4C:1B:86:xx:xx:xx")
+        print()
+        print("Verfuegbare Hersteller:")
+        for k, v in _ROUTER_RESET_DB.items():
+            print(f"  {k:<10}  {v['vendor']}")
+        print()
+        print("Hinweis: '--router-access' zeigt nur Zugangs-URL,")
+        print("Standard-Credentials und Erst-Einrichtung. Fuer Reset-")
+        print("Anleitung: '--router-reset-help <vendor>'.")
+        return 0
+
+    if key not in _ROUTER_RESET_DB:
+        _say(
+            f"[router-access] Unbekannter Hersteller: {vendor!r}. "
+            f"Verfuegbar: {', '.join(sorted(_ROUTER_RESET_DB))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    r = _ROUTER_RESET_DB[key]
+    sep = "=" * 72
+    dash = "-" * 72
+    print(sep)
+    print(f"  Admin-Zugang: {r['vendor']}")
+    print(sep)
+    print()
+    print(dash)
+    print("  Admin-Oberflaeche:")
+    print(dash)
+    print(f"  URL:                 {r['url']}")
+    print()
+    print(dash)
+    print("  Standard-Zugangsdaten (falls nie geaendert):")
+    print(dash)
+    print(f"  Benutzer:            {r['default_user']}")
+    print(f"  Passwort:            {r['default_pass']}")
+    print()
+    print(dash)
+    print("  Erst-Einrichtung nach Reset:")
+    print(dash)
+    for i, item in enumerate(r["reconfig"], 1):
+        print(f"  {i}. {item}")
+    print()
+    print(dash)
+    print("  Wenn Standard-Credentials NICHT funktionieren:")
+    print(dash)
+    print("  - Geraete-Aufkleber pruefen (Rueckseite/Unterseite)")
+    print("  - Ggf. vom Provider gesetztes Passwort erfragen")
+    print("  - Wenn Passwort verloren: --router-reset-help <vendor>")
+    print()
+    print(sep)
+    print("  HINWEIS: Diese Info gilt fuer den EIGENEN Router.")
+    print("  Kein automatischer Login-Versuch, kein Brute-Force.")
+    print(sep)
+    return 0
+
+
+def _generate_psk_cli(words: int = 10, separator: str = "-",
+                     count: int = 1, add_number: bool = False,
+                     wordfile: str = "") -> int:
+    """WP-G10a: --generate-psk — Diceware-Passphrasen.
+
+    Reine lokale Generierung. Kein Netzzugriff. Fuer den Fall,
+    dass ein eigenes Netz neu aufgesetzt werden soll und eine
+    starke Passphrase benoetigt wird.
+    """
+    import secrets as _secrets
+    import math as _math
+
+    if wordfile:
+        try:
+            with open(wordfile, encoding="utf-8") as fh:
+                word_list = [w.strip() for w in fh.read().splitlines()
+                             if w.strip() and not w.startswith("#")]
+        except OSError as exc:
+            _say(f"[generate-psk] Wortliste nicht lesbar: {exc}",
+                 file=sys.stderr)
+            return 1
+    else:
+        word_list = list(_PSK_WORDS)
+
+    if len(word_list) < 32:
+        _say(f"[generate-psk] Wortliste zu klein ({len(word_list)}).",
+             file=sys.stderr)
+        return 1
+
+    words = max(4, min(20, int(words or 10)))
+    count = max(1, min(100, int(count or 1)))
+    separator = str(separator or "-")[:3]
+
+    bits_per_word = _math.log2(len(word_list))
+    total_bits = words * bits_per_word
+    if add_number:
+        total_bits += _math.log2(1000)
+
+    for _ in range(count):
+        chosen = [_secrets.choice(word_list) for _ in range(words)]
+        phrase = separator.join(chosen)
+        if add_number:
+            phrase += separator + f"{_secrets.randbelow(1000):03d}"
+        print(phrase)
+
+    _say(
+        f"[generate-psk] {count} Passphrase(n) x {words} Woerter, "
+        f"Wortliste={len(word_list)}, ~{total_bits:.1f} Bit Entropie",
+        file=sys.stderr,
+    )
+    if total_bits < 60:
+        _say(
+            "[generate-psk] WARNUNG: < 60 Bit — erhoehe --psk-words.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _pcap_analyze_cli(pcap_path: str = "", out_file: str = "") -> int:
+    """WP-F8: --pcap-analyze FILE — tshark-basierte PCAP-Analyse."""
+    if not pcap_path:
+        _say("[pcap-analyze] Kein --pcap-analyze FILE angegeben.",
+             file=sys.stderr)
+        return 1
+
+    analyzer = PcapAnalyzer(pcap_path)
+    data = analyzer.analyze()
+
+    if not data.get("pcap", {}).get("exists"):
+        for e in data.get("errors", []):
+            _say(f"[pcap-analyze] {e}", file=sys.stderr)
+        return 1
+
+    payload = json.dumps(data, indent=2, default=str, ensure_ascii=False)
+    if out_file:
+        try:
+            with open(out_file, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            try:
+                os.chmod(out_file, 0o644)
+            except OSError:
+                pass
+            _say(
+                f"[pcap-analyze] {data['frames_total']} Frames -> {out_file}",
+                file=sys.stderr,
+            )
+        except OSError as exc:
+            _say(f"[pcap-analyze] Schreibfehler: {exc}", file=sys.stderr)
+            return 1
+    else:
+        print(payload)
+
+    for e in data.get("errors", []):
+        _say(f"[pcap-analyze] {e}", file=sys.stderr)
+
+    if data.get("anomalies"):
+        for a in data["anomalies"]:
+            _say(
+                f"[pcap-analyze] ANOMALIE {a.get('type')} "
+                f"({a.get('severity')}): {a}",
+                file=sys.stderr,
+            )
     return 0
 
 
