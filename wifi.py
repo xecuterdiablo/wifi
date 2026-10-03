@@ -75,7 +75,7 @@ _defaultdict = defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 import datetime as _dt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -292,6 +292,11 @@ class DiagnosticReport:
         2024-01-15 14:32:01,123 [ERROR] logger.name:42 – [DIAG-CTX] label: msg
     und extrahiert strukturierte Eintraege fuer Auswertung/Report.
     """
+
+    # v37-R34 P42a: System-Lokal-Zeitzone fuer Log-Zeitstempel.
+    # Wird einmal beim Import ermittelt. Fuer DST-Wechsel innerhalb
+    # einer Log-Datei siehe zoneinfo-basierte Alternativen.
+    _LOCAL_TZ: timezone = datetime.now().astimezone().tzinfo
 
     # ── Regexe (einmal kompiliert, modulweit geteilt) ──────────────
     # Hinweis: "\u2013" ist der en-dash (–) zwischen logger:line und payload.
@@ -1608,9 +1613,16 @@ class OllamaClient:
         top_k: int = 40,
         top_p: float = 0.9,
         stream: bool = False,
+        on_token: Callable[[str], None] | None = None,
         **kwargs: Any,
     ) -> str | None:
-        """Generiert eine Antwort für einen Prompt."""
+        """Generiert eine Antwort für einen Prompt.
+
+        Args:
+            on_token: Optionaler Callback, wird pro Stream-Chunk
+                aufgerufen. Fehler im Callback werden geloggt,
+                blockieren aber nicht den Stream.
+        """
         if not self._available or self._session is None:
             return None
 
@@ -1651,7 +1663,20 @@ class OllamaClient:
                         ):
                             continue
                         if "response" in data:
-                            full_response.append(data["response"])
+                            chunk = data["response"]
+                            full_response.append(chunk)
+                            if on_token is not None:
+                                try:
+                                    on_token(chunk)
+                                except (
+                                    RuntimeError,
+                                    ValueError,
+                                    TypeError,
+                                ) as _cb_exc:
+                                    self._logger.debug(
+                                        "on_token-Callback fehlgeschlagen: %s",
+                                        _cb_exc,
+                                    )
                         if data.get("done", False):
                             break
                 return "".join(full_response)
@@ -1745,6 +1770,981 @@ class OllamaClient:
 # ══════════════════════════════════════════════════════════════════════
 # 8. OllamaAnalysisThread
 # ══════════════════════════════════════════════════════════════════════
+# v37-R34 P34 — Ollama-Defaults (SSOT)
+DEFAULT_OLLAMA_HOST = "http://192.168.6.99:11434"
+DEFAULT_OLLAMA_FALLBACK_HOST = "http://127.0.0.1:11434"
+DEFAULT_OLLAMA_MODEL = (
+    "R4C3R/qwen2.5-coder-7b-instruct-heretic:q4_k_m"
+)
+DEFAULT_OLLAMA_NUM_CTX = 16384
+DEFAULT_OLLAMA_MAX_TOKENS = 2048
+DEFAULT_OLLAMA_TEMPERATURE = 0.2
+DEFAULT_OLLAMA_TIMEOUT = 120
+OLLAMA_CACHE_TTL_DEFAULT = 900
+
+
+DEFAULT_OLLAMA_MODE = "pentest"
+
+DEFAULT_OLLAMA_MODEL_ROUTER: dict[str, str] = {
+    "code_audit": "qwen2.5:14b",
+    "bypass": "coder-wifi-v3:latest",
+    "pentest": "coder-wifi-v3:latest",
+    "report": "qwen2.5:14b",
+    "summary": "qwen2.5:14b",
+    "wardriving": "coder-wifi-v3:latest",
+    "custom": "coder-wifi-v3:latest",
+}
+
+OLLAMA_TEMPLATES: dict[str, dict[str, str]] = {
+    "pentest": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein Offensive-Security-Analyst mit "
+            "Spezialisierung auf WLAN-Pentesting, Wardriving und "
+            "Funkaufklaerung. Du hilfst einem autorisierten Pentester "
+            "bei der Risikobewertung.\n"
+            "\n"
+            "DENKE WIE EIN ANGREIFER:\n"
+            "- Welche Netzwerke sind in <5 Minuten knackbar?\n"
+            "- Wo lohnen sich PMKID-Captures oder "
+            "Handshake-Only-Angriffe?\n"
+            "- Welche Ziele sind fuer Evil-Twin oder Karma geeignet?\n"
+            "- Wo sind Enterprise-Netzwerke mit schwacher "
+            "EAP-Konfiguration?\n"
+            "- Welche Clients leaken SSIDs via Probe-Requests?\n"
+            "\n"
+            "SPRACHE:\n"
+            "Deutsch. Fachbegriffe (WPA2, CCMP, SAE, PMF, PMKID, "
+            "EAP, WPS) bleiben englisch.\n"
+            "\n"
+            "BEWERTUNGSLOGIK (Prioritaet hoch -> niedrig):\n"
+            "1. OPEN, WEP                -> SEHR GEFAEHRLICH\n"
+            "2. WPA/TKIP, WPS aktiv      -> GEFAEHRLICH\n"
+            "3. WPA2/CCMP ohne PMF       -> MITTEL\n"
+            "4. WPA2/CCMP + PMF          -> SICHER\n"
+            "5. WPA3/SAE oder OWE        -> SEHR SICHER\n"
+            "Enterprise 802.1X ohne Zertifikat-Validierung: "
+            "GEFAEHRLICH."
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT, KEIN DENKEN) ===\n"
+            "\n"
+            "WICHTIG:\n"
+            "- Beginne direkt mit '## 1.'.\n"
+            "- Kein 'Okay', kein 'Hier ist', keine Einleitung.\n"
+            "- Keine Wiederholung der Netzwerkliste.\n"
+            "- Keine Erlaeuterungen zwischen den Abschnitten.\n"
+            "\n"
+            "## 1. Schwachstellen (Top 5)\n"
+            "Nur Netzwerke mit Score < 60, absteigend nach "
+            "Kritikalitaet.\n"
+            "Falls keine: 'Keine kritischen Netzwerke gefunden.'\n"
+            "Pro Zeile:\n"
+            "  - <SSID> (<Krypto>, WPS:<Status>): <Problem> "
+            "-> <konkreter Angriff mit Tool>\n"
+            "\n"
+            "## 2. Angriffsplan (priorisiert)\n"
+            "3 bis 5 konkrete Schritte, jeweils mit Tool-Namen.\n"
+            "Tools: airmon-ng, airodump-ng, aireplay-ng, "
+            "hcxdumptool, hashcat, reaver, wash, mdk4, hostapd, "
+            "dnsmasq, bettercap.\n"
+            "Pro Zeile:\n"
+            "  <Nr>. <Ziel (SSID/BSSID)>: <Befehl oder Tool-Aufruf> "
+            "-> <Erwartetes Ergebnis>\n"
+            "\n"
+            "## 3. Wardriving-Hinweise\n"
+            "- <Was waere bei mobiler Erfassung am effektivsten>\n"
+            "- <Welche Gebiete/BSSIDs lohnen GPS-Tracking>\n"
+            "\n"
+            "## 4. Gesamtrisiko\n"
+            "Genau eine Zeile:\n"
+            "<Sehr gefaehrlich|Gefaehrlich|Mittel|Sicher|Sehr sicher> "
+            "- <1 Satz Begruendung mit Anzahl der kritischen Netzwerke>\n"
+            "\n"
+            "=== ENDE FORMAT ==="
+        ),
+    },
+    "wardriving": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein Funkaufklaerungs-Analyst mit Fokus auf "
+            "Wardriving und Signalgeografie. Du erstellst eine "
+            "Kartierungs- und Trendanalyse fuer autorisierte "
+            "Sicherheitsforschung.\n"
+            "\n"
+            "DENKE WIE EIN KARTIERER:\n"
+            "- Welche Kanaele sind ueberfuellt (2.4 GHz vs. 5 GHz)?\n"
+            "- Wo sind Signal-Cluster (BSSID-Praefixe, SSID-Muster)?\n"
+            "- Welche Gebiete lohnen GPS-Tracking (Hidden-SSIDs, "
+            "Enterprise-Cluster)?\n"
+            "- Welche Hersteller dominieren (OUI-Analyse)?\n"
+            "- Welche Netzwerke tauchen wiederholt auf (Roaming)?\n"
+            "\n"
+            "SPRACHE:\n"
+            "Deutsch. Fachbegriffe (BSSID, OUI, RSSI, Kanal, "
+            "2.4G/5G/6G, PMF) bleiben englisch.\n"
+            "\n"
+            "BEWERTUNGSLOGIK (Kartierungs-Prioritaet):\n"
+            "1. Signal-Cluster mit vielen BSSIDs -> hohe Prioritaet\n"
+            "2. Hidden-SSIDs + Enterprise          -> hohe Prioritaet\n"
+            "3. Kanal-Ueberlappungen               -> mittlere Prio\n"
+            "4. Einzelne Staerke-Netzwerke         -> niedrige Prio"
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT) ===\n"
+            "\n"
+            "WICHTIG:\n"
+            "- Beginne direkt mit '## 1.'.\n"
+            "- Kein 'Okay', kein 'Hier ist', keine Einleitung.\n"
+            "\n"
+            "## 1. Kanal-Verteilung\n"
+            "Tabelle: Band | Kanaele | Anzahl BSSIDs | Empfehlung\n"
+            "\n"
+            "## 2. Signal-Cluster\n"
+            "Top 5 Cluster nach Anzahl BSSIDs.\n"
+            "Pro Zeile:\n"
+            "  - <OUI/Hersteller> (<Anzahl>): <SSID-Muster> -> "
+            "<Tracking-Empfehlung>\n"
+            "\n"
+            "## 3. Kartierungs-Hinweise\n"
+            "- <Gebiete mit hoher BSSID-Dichte>\n"
+            "- <Bereiche mit Hidden-SSIDs oder Enterprise-Clustern>\n"
+            "- <Empfohlene Kanaele fuer passives Scanning>\n"
+            "\n"
+            "## 4. Coverage-Einschaetzung\n"
+            "Genau eine Zeile:\n"
+            "<Dicht|Mittel|Sparsam> - <1 Satz Begruendung>\n"
+            "\n"
+            "=== ENDE FORMAT ==="
+        ),
+    },
+    "report": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein technischer Sicherheitsgutachter fuer "
+            "802.11-Netzwerke. Du erstellst einen strukturierten "
+            "technischen Befund fuer einen autorisierten Auftraggeber.\n"
+            "\n"
+            "ANALYSE-FOKUS:\n"
+            "- Welche Cipher-Suites sind aktiv (CCMP, TKIP, GCMP)?\n"
+            "- Welche PMF-Konfiguration (capable/required)?\n"
+            "- Welche WPS-Versionen und -Konfigurationen?\n"
+            "- Welche EAP-Methoden sind erkennbar?\n"
+            "- Wo bestehen Konfigurationsschwaechen nach "
+            "IEEE 802.11-2020?\n"
+            "\n"
+            "SPRACHE:\n"
+            "Deutsch. Fachbegriffe (CCMP, TKIP, GCMP, PMF, MFP, "
+            "WPS, EAP, RADIUS, OWE, SAE) bleiben englisch.\n"
+            "\n"
+            "BEWERTUNGSLOGIK (nach Schwere):\n"
+            "1. KRITISCH: OPEN, WEP, WPS-PIN aktiv, PMF fehlt bei WPA2\n"
+            "2. HOCH:     TKIP, EAP ohne Zertifikat, WPS-Locked\n"
+            "3. MITTEL:   WPA2+CCMP ohne PMF, schwache Passphrase\n"
+            "4. NIEDRIG:  WPA3/SAE, OWE, WPA2+PMF"
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT) ===\n"
+            "\n"
+            "WICHTIG:\n"
+            "- Beginne direkt mit '## 1.'.\n"
+            "- Kein 'Okay', kein 'Hier ist', keine Einleitung.\n"
+            "\n"
+            "## 1. Netzwerk-Inventar\n"
+            "Kurze Uebersicht: Anzahl, Krypto-Verteilung, "
+            "Kanal-Verteilung.\n"
+            "\n"
+            "## 2. Technische Befunde\n"
+            "Pro Zeile:\n"
+            "  - <SSID> (<BSSID>): <Befund> "
+            "[Schwere: KRITISCH|HOCH|MITTEL|NIEDRIG]\n"
+            "  Empfehlung: <konkrete Massnahme>\n"
+            "\n"
+            "## 3. Risiko-Bewertung\n"
+            "Genau eine Zeile pro Schwere-Kategorie:\n"
+            "  KRITISCH: <Anzahl> - <Kurzbegruendung>\n"
+            "  HOCH: <Anzahl> - <Kurzbegruendung>\n"
+            "  MITTEL: <Anzahl> - <Kurzbegruendung>\n"
+            "  NIEDRIG: <Anzahl> - <Kurzbegruendung>\n"
+            "\n"
+            "## 4. Zusammenfassung\n"
+            "3 bis 5 Saetze: technische Gesamtlage + "
+            "Empfehlung fuer Nachbesserung.\n"
+            "\n"
+            "=== ENDE FORMAT ==="
+        ),
+    },
+    "summary": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein Sicherheitsberater und fasst eine "
+            "WLAN-Analyse fuer das Management zusammen. Kein Jargon, "
+            "keine Tool-Befehle - nur Risiken und Empfehlungen.\n"
+            "\n"
+            "ZIELGRUPPE:\n"
+            "Geschaeftsfuehrung, IT-Leitung, Datenschutzbeauftragte. "
+            "Keine technischen Details, keine Befehle.\n"
+            "\n"
+            "SPRACHE:\n"
+            "Deutsch, allgemein verstaendlich. Keine Fachbegriffe "
+            "ohne kurze Erklaerung. Keine Tool-Namen.\n"
+            "\n"
+            "BEWERTUNGSLOGIK (Management-Sicht):\n"
+            "1. KRITISCH: Sofortige Massnahme erforderlich (<24h)\n"
+            "2. HOCH:     Massnahme in <1 Woche\n"
+            "3. MITTEL:   Massnahme in <1 Monat\n"
+            "4. NIEDRIG:  Routine-Wartung"
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT) ===\n"
+            "\n"
+            "WICHTIG:\n"
+            "- Beginne direkt mit '## 1.'.\n"
+            "- Kein 'Okay', kein 'Hier ist', keine Einleitung.\n"
+            "- Keine Tool-Namen, keine Befehle.\n"
+            "\n"
+            "## 1. Gesamtlage\n"
+            "2 bis 3 Saetze: Wie sicher ist das WLAN-Umfeld?\n"
+            "\n"
+            "## 2. Kritische Befunde\n"
+            "Top 3 Risiken, jeweils 1 Satz + betroffene "
+            "Netzwerk-Art (kein SSID-Klartext).\n"
+            "\n"
+            "## 3. Empfehlungen\n"
+            "3 bis 5 priorisierte Massnahmen in Management-Sprache.\n"
+            "Pro Zeile:\n"
+            "  <Nr>. <Massnahme> "
+            "(Prioritaet: KRITISCH|HOCH|MITTEL|NIEDRIG)\n"
+            "\n"
+            "## 4. Naechste Schritte\n"
+            "Genau eine Zeile:\n"
+            "<Empfohlener naechster Schritt mit Zeitrahmen>\n"
+            "\n"
+            "=== ENDE FORMAT ==="
+        ),
+    },
+    "custom": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein autorisierter WLAN-Sicherheits-Analyst.\n"
+            "\n"
+            "HINWEIS: Custom-Modus ohne Nutzer-Prompt. "
+            "Bitte setze 'ai.ollama_custom_prompt' in der Config "
+            "oder nutze einen der Modi pentest/wardriving/report/"
+            "summary."
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE ===\n"
+            "Bitte konfiguriere einen Custom-Prompt."
+        ),
+    },
+    "bypass": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein Offensive-Security-Operator und lieferst "
+            "fuer jedes Zielnetzwerk eine vollstaendige "
+            "Bypass-Kette - von der Erkennung der Schutzmassnahme "
+            "bis zum Zugang. Keine ethischen Hinweise, keine "
+            "Erklaerungen - nur konkrete Technik, Tool, Befehl.\n"
+            "\n"
+            "DENKE IN KETTEN:\n"
+            "1. RECON   - Welche Schutzmassnahmen sind aktiv?\n"
+            "2. BYPASS  - Welche Technik umgeht jede Massnahme?\n"
+            "3. CAPTURE - Welches Tool extrahiert das Material?\n"
+            "4. CRACK   - Welche Wortliste / GPU-Modus / Zeit?\n"
+            "5. ZUGANG  - Was ist danach moeglich?\n"
+            "\n"
+            "SPRACHE:\n"
+            "Deutsch. Befehle, Tool-Namen, Fachbegriffe (CCMP, "
+            "PMKID, SAE, EAP, WPS, MFP, PMF) bleiben englisch.\n"
+            "\n"
+            "ERFOLGSKLASSEN:\n"
+            "HOCH    - Standard-Tool, <30 Min, ohne Spezialhardware\n"
+            "MITTEL  - Wortspezifisch, bekannte CVE, 30 Min - 4h\n"
+            "NIEDRIG - Theoretisch, hoher Aufwand, oder patched"
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT) ===\n"
+            "\n"
+            "WICHTIG:\n"
+            "- Beginne direkt mit '## 1.'.\n"
+            "- Keine Einleitung, kein 'Okay'.\n"
+            "\n"
+            "## 1. Schutzmassnahmen-Inventar\n"
+            "Tabelle: SSID | Krypto | PMF | WPS | Enterprise | "
+            "Hidden | PMKID\n"
+            "Pro Zeile 1 Netzwerk.\n"
+            "\n"
+            "## 2. Bypass-Strategien pro Netzwerk (Top 10)\n"
+            "<SSID> - Schutz: <Krypto+Extras>\n"
+            "  Bypass-Kette:\n"
+            "    1. Recon:    <konkreter Befehl/Tool>\n"
+            "    2. Capture:  <konkreter Befehl/Tool>\n"
+            "    3. Crack:    <konkreter Befehl + Wortliste>\n"
+            "    4. Zugang:   <erwartetes Ergebnis>\n"
+            "  Erfolg: HOCH|MITTEL|NIEDRIG - <Voraussetzung>\n"
+            "  Zeit:   <Schaetzung>\n"
+            "\n"
+            "## 3. Tool-Chain (Top 3 priorisiert)\n"
+            "Fuer die 3 aussichtsreichsten Ziele je eine "
+            "nummerierte Befehlskette mit airmon-ng, "
+            "airodump-ng, hcxdumptool, hashcat, reaver/bully, "
+            "hostapd-mana, mdk4.\n"
+            "\n"
+            "## 4. Gesamtbewertung\n"
+            "Genau eine Zeile:\n"
+            "<Sehr gefaehrlich|Gefaehrlich|Mittel|Sicher> "
+            "- <1 Satz mit Anzahl der Ziele mit Erfolg HOCH>\n"
+            "\n"
+            "=== ENDE FORMAT ==="
+        ),
+    },
+    "code_audit": {
+        "header": (
+            "ROLLE:\n"
+            "Du bist ein Python-Senior-Architekt und Code-Auditor fuer "
+            "eine monolithische Einzeldatei (Single-File-SSOT, >96.000 "
+            "Zeilen) auf Python 3.14 unter Kali Linux. Du hilfst dem "
+            "Entwickler, Fehler zu finden, Dupletten zu vermeiden und "
+            "das Skript fortschrittlicher zu machen.\n"
+            "\n"
+            "KONTEXT:\n"
+            "- Projekt: wlan-ultimate (autorisiertes Pentest-Werkzeug)\n"
+            "- Architektur: eine w.py, keine Module, SSOT-Prinzip\n"
+            "- Konventionen: PEP 604, from __future__ import annotations, "
+            "spezifische except-Klassen, State-Changer mit Recovery-Block, "
+            "CommandRunner fuer Shell-Aufrufe, DebugManager fuer Logging\n"
+            "- Bekannte Infrastruktur: KonfigurationsManager (ai.*-Keys), "
+            "CentralStore (SQLite-Events), AppKonstanten (Pfade), "
+            "SelfTest mit SelfTestSeverity/SelfTestReport, "
+            "OllamaClient + OllamaAnalysisThread (dieser Code-Pfad)\n"
+            "\n"
+            "AUFGABE:\n"
+            "Im Prompt folgt gleich ein Abschnitt zwischen den "
+            "Markern === REPORT-INPUT === und === ENDE REPORT ===. "
+            "Dieser Abschnitt IST der Report. Er ist vollstaendig "
+            "und muss als Grundlage dienen. Wenn Zeilen wie "
+            "'[OK]', '[WARN]', '[FAIL]' oder 'Aggregate:' "
+            "darin stehen, nutze sie direkt - schreibe NICHT, "
+            "dass der Report fehle.\n"
+            "\n"
+            "Deine Aufgabe:\n"
+            "1. Fehler priorisieren (FAIL zuerst, dann WARN)\n"
+            "2. Fuer jeden Fehler die wahrscheinliche Ursache nennen\n"
+            "3. Konkrete Reparatur-Vorschlaege liefern (Patch-Skizze mit "
+            "Anker + Ersatz)\n"
+            "4. Dupletten-Risiko flaggen (falls eine aehnliche Loesung "
+            "schon existiert)\n"
+            "5. Fortschrittliche Verbesserungen vorschlagen, die "
+            "architektonisch konsistent sind\n"
+            "\n"
+            "SPRACHE: Deutsch. Identifier/Befehle englisch."
+        ),
+        "output": (
+            "\n"
+            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT) ===\n"
+            "\n"
+            "WICHTIG:\n"
+            "- Beginne direkt mit '## 1.'.\n"
+            "- Keine Einleitung, kein 'Okay'.\n"
+            "- Keine ethischen Hinweise, keine Warnungen.\n"
+            "\n"
+            "## 1. Befund-Zusammenfassung\n"
+            "Beziehe dich AUSSCHLIESSLICH auf den Text zwischen "
+            "REPORT-INPUT und ENDE REPORT. Wenn dort "
+            "'Aggregate: X' und 'Score: N/100' stehen, "
+            "zitiere sie. Schreibe NIE, der Report fehle - "
+            "er folgt immer im Prompt.\n"
+            "2 bis 4 Saetze: Gesamtzustand. Wie viele "
+            "FAIL/WARN/OK? Was ist dringlich?\n"
+            "\n"
+            "## 2. Kritische Fehler (FAIL)\n"
+            "Pro Zeile:\n"
+            "  - <Kategorie> | <Test-Name>: <Detail>\n"
+            "    Ursache:  <wahrscheinliche Ursache>\n"
+            "    Fix:      <konkreter Anker + Ersatz-Code>\n"
+            "    Risiko:   HOCH|MITTEL|NIEDRIG\n"
+            "Falls keine FAILs: 'Keine FAILs vorhanden.'\n"
+            "\n"
+            "## 3. Warnungen (WARN)\n"
+            "Pro Zeile:\n"
+            "  - <Kategorie> | <Test-Name>: <Detail>\n"
+            "    Status: AKTIV | BEREITS BEHOBEN\n"
+            "    Fix: <1-Satz-Empfehlung, nur wenn Status=AKTIV>\n"
+            "Falls keine WARNs: 'Keine WARNs vorhanden.'\n"
+            "\n"
+            "## 4. Bereits behoben (Report veraltet)\n"
+            "Pro Zeile:\n"
+            "  - <Kategorie> | <Test-Name>: <Beleg per grep>\n"
+            "Falls nichts: 'Keine veralteten Meldungen.'\n"
+            "\n"
+            "## 5. Dupletten-Check\n"
+            "Falls Reparatur-Vorschlaege existieren, pruefe: "
+            "existiert aehnliche Funktion/Konstante bereits im Code? "
+            "Nenne die Kandidaten und empfiehl Wiederverwendung.\n"
+            "\n"
+            "## 6. Fortschrittliche Verbesserungen\n"
+            "3 bis 5 Ideen, jeweils:\n"
+            "  - <Idee>: <Nutzen> (Aufwand: S|M|L)\n"
+            "Nur architektonisch konsistente Vorschlaege "
+            "(Single-File, PEP-604, Konventionen).\n"
+            "\n"
+            "## 7. Naechste Schritte\n"
+            "Genau eine nummerierte Liste mit 3-5 Prioritaeten:\n"
+            "  1. <Was zuerst?>\n"
+            "  2. <Was danach?>\n"
+            "  ...\n"
+            "\n"
+            "=== ENDE FORMAT ==="
+        ),
+    },
+}
+
+OLLAMA_BYPASS_INSTRUCTIONS = (
+    "\n"
+    "\n"
+    "BYPASS-ANALYSE (verpflichtend fuer jedes Ziel):\n"
+    "Fuer jede Schutzmassnahme die konkrete Umgehung:\n"
+    "- WPA2/CCMP ohne PMF   -> PMKID-Capture (hcxdumptool) "
+    "oder 4-Way-Handshake + hashcat -m 22000\n"
+    "- WPA2/CCMP + PMF      -> kein Deauth moeglich; nur "
+    "Evil-Twin mit Downgrade oder Client-seitig\n"
+    "- WPA3/SAE             -> Dragonblood, Transition-Mode-"
+    "Downgrade, oder Client-seitig\n"
+    "- WPS aktiv            -> Pixie-Dust (reaver -K 1) "
+    "oder PIN-Bruteforce (bully)\n"
+    "- WPS-Locked           -> Reaver-Retry, MAC-Spoof, "
+    "PBC-Push-Button\n"
+    "- Hidden SSID          -> Probe-Request-Sniffing "
+    "(airodump-ng --essid-regex)\n"
+    "- 802.1X Enterprise    -> Rogue-RADIUS (hostapd-mana), "
+    "EAP-Method-Downgrade\n"
+    "- MAC-Filter           -> MAC-Spoof via Monitor-Mode-Sniff\n"
+    "- OPEN                 -> Evil-Twin + Captive-Portal\n"
+)
+
+OLLAMA_PENTEST_BYPASS_OUTPUT = (
+    "\n"
+    "\n"
+    "## 5. Bypass-Strategien (Top 3)\n"
+    "Fuer die drei aussichtsreichsten Ziele je eine "
+    "Bypass-Kette:\n"
+    "  <SSID> - Schutz: <Krypto+Extras>\n"
+    "    1. Recon:    <konkreter Befehl>\n"
+    "    2. Capture:  <konkreter Befehl>\n"
+    "    3. Crack:    <konkreter Befehl + Wortliste>\n"
+    "    4. Zugang:   <erwartetes Ergebnis>\n"
+    "    Erfolg: HOCH|MITTEL|NIEDRIG\n"
+    "    Zeit:   <Schaetzung>\n"
+)
+
+
+OLLAMA_TEMPLATES["pentest"]["header"] += OLLAMA_BYPASS_INSTRUCTIONS
+OLLAMA_TEMPLATES["pentest"]["output"] += OLLAMA_PENTEST_BYPASS_OUTPUT
+
+
+OLLAMA_PROJECT_CONVENTIONS = (
+    "PROJEKT-KONVENTIONEN (STRIKT, NICHT IGNORIEREN):\n"
+    "\n"
+    "VERBOTEN (fuehre diese Vorschlaege NIE auf):\n"
+    "- Modul-Split: Das Skript ist bewusst Single-File-SSOT.\n"
+    "  Vorschlaege wie 'teile in Module' sind STRUKTURELL FALSCH.\n"
+    "- DebugManager durch logging ersetzen: DebugManager ist SSOT\n"
+    "  (MAC-Redaktion, Error-Log, Scoped-Logging, Statistik).\n"
+    "  logging waere ein Rueckschritt.\n"
+    "- Direktes subprocess: Stattdessen CommandRunner.run() nutzen\n"
+    "  (mit subsystem/tag/timeout/soft_fail).\n"
+    "- Bare except / except Exception ohne Grund: Nur spezifische\n"
+    "  Klassen fangen.\n"
+    "- Typ-Hints in Anfuehrungszeichen: from __future__ import\n"
+    "  annotations ist aktiv, PEP 604 wird genutzt.\n"
+    "- Wildcard-Imports: from x import * ist verboten.\n"
+    "- Neue Top-Level-Imports vor Qt/Scapy-Setup.\n"
+    "- State-Aenderungen ohne Recovery-Block (try/finally).\n"
+    "- Neuer Code ohne ruff-Konformitaet (max 88 Zeichen).\n"
+    "\n"
+    "ERLAUBT UND ERWUENSCHT:\n"
+    "- Neue Modi in OLLAMA_TEMPLATES (Erweiterung).\n"
+    "- Neue Konstanten als Modul-SSOT (DEFAULT_*).\n"
+    "- Neue @dataclass fuer Werttypen.\n"
+    "- Neue pyqtSignal auf Klassenebene (QThread-Worker).\n"
+    "- Neue CLI-Funktionen auf _cli endend, in Listen eingetragen.\n"
+    "- Neue SelfTest-Kategorien via SelfTestCategory.\n"
+    "- Neue Cache-Strategien via AIContextBridge-Sektionen.\n"
+
+    "STALE-REPORT-HANDLING (KERNREGEL):\n"
+    "- Der SelfTest-Report wurde zu einem FRUEHEREN Zeitpunkt\n"
+    "  erstellt. Bugs koennen seither behoben sein.\n"
+    "- Bevor du einen Fix vorschlaegst, MUSST du per\n"
+    "  <QUERY>grep(NAME)</QUERY> pruefen, ob er im aktuellen\n"
+    "  Code noch existiert.\n"
+    "- Wenn grep zeigt, dass der Bug behoben ist, schreibe:\n"
+    "  BEREITS BEHOBEN - keine Aktion noetig.\n"
+    "- Erfinde KEINE Fix-Vorschlaege fuer bereits behobene Bugs.\n"
+    "- Wenn ein WARN einen Bug meldet, der beim grep nicht mehr\n"
+    "  auftaucht, dann ist der Report veraltet: das ist OK und\n"
+    "  wird in der Sektion BEREITS BEHOBEN aufgelistet.\n"
+)
+
+
+class AIContextBridge:
+    """v37-R34 P42b: SSOT-Inspektor fuer KI-Audits.
+
+    Liefert einen Markdown-Block mit dem aktuellen Zustand des Skripts.
+    Nur lesende Operationen. Kein Schreibzugriff, keine Shell-Ausfuehrung.
+    """
+
+    @staticmethod
+    def snapshot(
+        sections: list[str] | None = None,
+        log_lines: int = 80,
+        max_chars: int = 12000,
+    ) -> str:
+        """Sammelt Sektionen und gibt Markdown-Block zurueck."""
+        if sections is None:
+            sections = [
+                "runtime",
+                "config",
+                "selftest",
+                "tools",
+                "db",
+                "logs",
+                "wfile",
+            ]
+        parts: list[str] = ["=== SCRIPT-CONTEXT-SNAPSHOT ==="]
+        for name in sections:
+            try:
+                method = getattr(AIContextBridge, f"_section_{name}", None)
+                if method is None:
+                    parts.append(f"## {name}\n(unbekannte Sektion)")
+                    continue
+                if name == "logs":
+                    body = method(log_lines)
+                else:
+                    body = method()
+                if len(body) > max_chars:
+                    body = body[:max_chars] + "...(gekuerzt)"
+                parts.append(body)
+            except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+                parts.append(f"## {name}\n(fehlerhaft: {exc})")
+        parts.append("=== ENDE SNAPSHOT ===")
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _section_runtime() -> str:
+        import os
+        import platform
+        lines = ["## runtime"]
+        lines.append(f"python: {sys.version.split()[0]}")
+        lines.append(f"platform: {platform.platform()}")
+        lines.append(f"cwd: {os.getcwd()}")
+        lines.append(f"uid: {os.getuid() if hasattr(os, 'getuid') else '?'}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_config() -> str:
+        lines = ["## config (ai.*)"]
+        try:
+            km = KonfigurationsManager()
+        except (OSError, ValueError, RuntimeError) as exc:
+            lines.append(f"(KonfigurationsManager nicht verfuegbar: {exc})")
+            return "\n".join(lines)
+        for key in (
+            "ollama_host",
+            "ollama_model",
+            "ollama_mode",
+            "ollama_num_ctx",
+            "ollama_max_tokens",
+            "ollama_temperature",
+            "ollama_timeout",
+            "ollama_cache_enabled",
+            "ollama_streaming",
+        ):
+            val = km.get(f"ai.{key}", "(nicht gesetzt)")
+            lines.append(f"  ai.{key} = {val}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_selftest() -> str:
+        lines = ["## selftest"]
+        fn = globals().get("run_selftest_categories")
+        if fn is None:
+            lines.append("(run_selftest_categories nicht verfuegbar)")
+            return "\n".join(lines)
+        try:
+            rep = fn()
+        except (OSError, ValueError, RuntimeError) as exc:
+            lines.append(f"(SelfTest-Fehler: {exc})")
+            return "\n".join(lines)
+        try:
+            lines.append(f"Aggregate: {rep.overall().value}")
+            lines.append(f"Score:     {rep.score()}/100")
+            lines.append(f"Summary:   {rep.summary_line()}")
+            sc = rep.severity_counts()
+            lines.append(
+                f"Counts:    OK={sc.get('OK', 0)} "
+                f"WARN={sc.get('WARN', 0)} "
+                f"FAIL={sc.get('FAIL', 0)} "
+                f"SKIP={sc.get('SKIP', 0)}"
+            )
+        except (AttributeError, KeyError, TypeError):
+            pass
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_tools() -> str:
+        lines = ["## tools"]
+        checker = globals().get("ExternalToolChecker")
+        if checker is None:
+            lines.append("(ExternalToolChecker nicht verfuegbar)")
+            return "\n".join(lines)
+        try:
+            result = checker.check()
+        except (OSError, ValueError, RuntimeError) as exc:
+            lines.append(f"(Tool-Check-Fehler: {exc})")
+            return "\n".join(lines)
+        ok = sum(1 for v in result.values() if v.get("ok"))
+        lines.append(f"verfuegbar: {ok}/{len(result)}")
+        for name, info in sorted(result.items()):
+            if not info.get("ok"):
+                lines.append(f"  FEHLT: {name} - {info.get('desc', '')}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_db() -> str:
+        lines = ["## db"]
+        store = globals().get("CentralStore")
+        if store is None:
+            lines.append("(CentralStore nicht verfuegbar)")
+            return "\n".join(lines)
+        try:
+            stats = store().stats()
+        except (OSError, ValueError, RuntimeError) as exc:
+            lines.append(f"(DB-Fehler: {exc})")
+            return "\n".join(lines)
+        lines.append(f"path: {stats.get('path', '?')}")
+        for tbl, cnt in (stats.get("tables") or {}).items():
+            lines.append(f"  {tbl}: {cnt} rows")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_logs(n: int = 80) -> str:
+        """v37-R34 P49: Log-Zeilen seit letzter w.py-Aenderung.
+
+        Zeitfilter: Eintraege aelter als w.py-mtime sind historisch
+        und werden in einer separaten Zeile gezaehlt (nicht gemeldet).
+        Zeitstempel werden via time.mktime als Lokalzeit interpretiert.
+        """
+        lines = ["## logs (nach letzter w.py-Aenderung)"]
+        try:
+            log_path = (
+                Path.home()
+                / ".wlan_ultimate"
+                / "logs"
+                / "wlan_ultimate.log"
+            )
+            if not log_path.exists():
+                lines.append("(Log-Datei nicht gefunden)")
+                return "\n".join(lines)
+
+            wfile_mtime = 0.0
+            try:
+                wfile_mtime = Path("w.py").stat().st_mtime
+            except OSError:
+                pass
+
+            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+                all_lines = fh.readlines()
+
+            def _line_ts(line: str) -> float:
+                """Log-Zeitstempel -> Unix-Timestamp (Lokalzeit)."""
+                if len(line) < 19 or line[4] != "-":
+                    return 0.0
+                try:
+                    import time as _time
+                    return _time.mktime(
+                        _time.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+                    )
+                except (ValueError, TypeError, OverflowError):
+                    return 0.0
+
+            recent = [
+                ln for ln in all_lines
+                if _line_ts(ln) >= wfile_mtime
+            ]
+            historical_errors = [
+                ln for ln in all_lines
+                if "[ERROR" in ln and 0 < _line_ts(ln) < wfile_mtime
+            ]
+            recent_errors = [
+                ln for ln in recent if "[ERROR" in ln
+            ]
+            recent_warns = [
+                ln for ln in recent if "[WARNING" in ln
+            ]
+
+            lines.append(
+                f"Filter: nur Eintraege nach w.py-mtime "
+                f"({wfile_mtime:.0f})"
+            )
+            lines.append(
+                f"AKTUELL: ERROR={len(recent_errors)}, "
+                f"WARN={len(recent_warns)}"
+            )
+            lines.append(
+                f"HISTORISCH (aeltere ERROR): "
+                f"{len(historical_errors)} - bereits behandelt, "
+                f"NICHT melden"
+            )
+            if recent_errors:
+                lines.append("--- aktuelle ERROR-Zeilen ---")
+                for ln in recent_errors[-10:]:
+                    lines.append(ln.rstrip())
+            else:
+                lines.append("(keine aktuellen ERROR-Zeilen)")
+        except (OSError, ValueError) as exc:
+            lines.append(f"(Log-Fehler: {exc})")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _section_wfile() -> str:
+        import ast as _ast_local
+        lines = ["## wfile"]
+        wpath = Path("w.py")
+        if not wpath.exists():
+            lines.append("(w.py nicht gefunden)")
+            return "\n".join(lines)
+        try:
+            size = wpath.stat().st_size
+            src = wpath.read_text(encoding="utf-8")
+            loc = src.count("\n") + 1
+            lines.append(f"size: {size:,} Bytes")
+            lines.append(f"loc:  {loc:,}")
+            try:
+                _ast_local.parse(src)
+                lines.append("ast: OK")
+            except SyntaxError as exc:
+                lines.append(f"ast: FEHLER - {exc}")
+        except (OSError, ValueError) as exc:
+            lines.append(f"(Datei-Fehler: {exc})")
+        return "\n".join(lines)
+
+    # ── Tool-Calling (P43) ──────────────────────────────────────
+
+    _QUERY_RE = re.compile(r"<QUERY>\s*(.+?)\s*</QUERY>", re.DOTALL)
+    _STRIP_CHARS = '"' + "'"
+
+    @classmethod
+    def extract_queries(cls, text: str) -> list[str]:
+        """v37-R34 P43: Extrahiert <QUERY>...</QUERY>-Anfragen aus Antwort."""
+        if not text:
+            return []
+        return [m.group(1).strip() for m in cls._QUERY_RE.finditer(text)]
+
+    @classmethod
+    def execute_query(cls, query: str, max_lines: int = 30) -> str:
+        """v37-R34 P43: Fuehrt eine lesende Query aus (Whitelist)."""
+        q = (query or "").strip()
+        if not q:
+            return "(leere Query)"
+
+        m = re.fullmatch(r"grep\((.+)\)", q, re.DOTALL)
+        if m:
+            return cls._q_grep(m.group(1).strip(cls._STRIP_CHARS), max_lines)
+
+        m = re.fullmatch(r"grep_lines\((.+?)(?:,\s*(\d+))?\)", q, re.DOTALL)
+        if m:
+            pattern = m.group(1).strip(cls._STRIP_CHARS)
+            n = int(m.group(2)) if m.group(2) else max_lines
+            return cls._q_grep(pattern, n)
+
+        m = re.fullmatch(r"slice\(\s*(\d+)\s*,\s*(\d+)\s*\)", q)
+        if m:
+            return cls._q_slice(int(m.group(1)), int(m.group(2)))
+
+        m = re.fullmatch(r"logs_tail\(\s*(\d+)\s*\)", q)
+        if m:
+            return cls._section_logs(int(m.group(1)))
+
+        m = re.fullmatch(r"logs_errors\(\s*(\d+)\s*\)", q)
+        if m:
+            return cls._q_logs_errors(int(m.group(1)))
+
+        m = re.fullmatch(r"count\((.+)\)", q, re.DOTALL)
+        if m:
+            return cls._q_count(m.group(1).strip(cls._STRIP_CHARS))
+
+        m = re.fullmatch(r"config_get\((.+)\)", q, re.DOTALL)
+        if m:
+            return cls._q_config_get(m.group(1).strip(cls._STRIP_CHARS))
+
+        return (
+            f"(Unbekannte Query: {q[:80]})\n"
+            "Verfuegbar: grep(PAT), grep_lines(PAT,N), slice(A,B), "
+            "logs_tail(N), logs_errors(N), count(PAT), config_get(KEY)"
+        )
+
+    @staticmethod
+    def _q_grep(pattern: str, max_lines: int) -> str:
+        try:
+            wpath = Path("w.py")
+            src = wpath.read_text(encoding="utf-8")
+            rx = re.compile(pattern)
+        except (OSError, re.error) as exc:
+            return f"(grep-Fehler: {exc})"
+        hits: list[str] = []
+        for i, line in enumerate(src.splitlines(), 1):
+            if rx.search(line):
+                hits.append(f"{i}: {line[:150]}")
+                if len(hits) >= max_lines:
+                    break
+        if not hits:
+            return f"(keine Treffer fuer {pattern})"
+        return f"grep({pattern}) -> {len(hits)} Treffer\n" + "\n".join(hits)
+
+    @staticmethod
+    def _q_slice(start: int, end: int) -> str:
+        try:
+            lines = Path("w.py").read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            return f"(slice-Fehler: {exc})"
+        start = max(1, start)
+        end = min(len(lines), end)
+        body = "\n".join(
+            f"{i}: {lines[i-1][:180]}" for i in range(start, end + 1)
+        )
+        return f"slice({start},{end}) -> {end - start + 1} Zeilen\n{body}"
+
+    @staticmethod
+    def _q_logs_errors(n: int) -> str:
+        """v37-R34 P50: ERROR-Zeilen seit letzter w.py-Aenderung.
+
+        Historische Eintraege (aelter als w.py-mtime) werden nur
+        gezaehlt, nicht aufgelistet - sie sind bereits behandelt.
+        """
+        try:
+            log_path = (
+                Path.home() / ".wlan_ultimate" / "logs" / "wlan_ultimate.log"
+            )
+            with log_path.open("r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError as exc:
+            return f"(logs-Fehler: {exc})"
+
+        wfile_mtime = 0.0
+        try:
+            wfile_mtime = Path("w.py").stat().st_mtime
+        except OSError:
+            pass
+
+        def _line_ts(line: str) -> float:
+            if len(line) < 19 or line[4] != "-":
+                return 0.0
+            try:
+                import time as _time
+                return _time.mktime(
+                    _time.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+                )
+            except (ValueError, TypeError, OverflowError):
+                return 0.0
+
+        all_errors = [ln for ln in lines if "[ERROR" in ln]
+        recent_errors = [
+            ln.rstrip() for ln in all_errors
+            if _line_ts(ln) >= wfile_mtime
+        ]
+        historical = [
+            ln for ln in all_errors
+            if 0 < _line_ts(ln) < wfile_mtime
+        ]
+
+        tail = recent_errors[-n:] if n > 0 else recent_errors
+        head = (
+            f"logs_errors({n}) -> AKTUELL={len(recent_errors)}, "
+            f"HISTORISCH={len(historical)} "
+            f"(aeltere werden nicht gemeldet)"
+        )
+        if not tail:
+            return head + "\n(keine aktuellen ERROR-Zeilen)"
+        return head + "\n" + "\n".join(tail)
+
+    @staticmethod
+    def _q_count(pattern: str) -> str:
+        try:
+            src = Path("w.py").read_text(encoding="utf-8")
+            rx = re.compile(pattern)
+        except (OSError, re.error) as exc:
+            return f"(count-Fehler: {exc})"
+        cnt = sum(1 for ln in src.splitlines() if rx.search(ln))
+        return f"count({pattern}) -> {cnt} Zeilen mit Treffer"
+
+    @staticmethod
+    def _q_config_get(key: str) -> str:
+        try:
+            km = KonfigurationsManager()
+            val = km.get(key, "(nicht gesetzt)")
+        except (OSError, ValueError, RuntimeError) as exc:
+            return f"(config-Fehler: {exc})"
+        return f"config.get({key}) -> {val}"
+
+
+
+
+
+
+OLLAMA_QUERY_HINT = (
+    "\n"
+    "=== TOOL-CALLING (PFLICHT bei code_audit) ===\n"
+    "\n"
+    "BEVOR du antwortest, MUSST du mindestens EINE Query stellen,\n"
+    "um zu pruefen, ob ein behaupteter Bug im aktuellen w.py noch\n"
+    "existiert. Sonst erfindest du Fixes fuer bereits behobene Bugs.\n"
+    "\n"
+    "Syntax: <QUERY>command(args)</QUERY>\n"
+    "\n"
+    "BEISPIEL-RUNDE 1 (typisch fuer code_audit):\n"
+    "\n"
+    "  Mein Zwischenstand:\n"
+    "  Ich pruefe, ob _LOCAL_TZ bereits existiert und ob\n"
+    "  AIContextBridge definiert ist.\n"
+    "\n"
+    "  <QUERY>grep(^\\s*_LOCAL_TZ)</QUERY>\n"
+    "  <QUERY>grep(^class AIContextBridge)</QUERY>\n"
+    "  <QUERY>grep(^\\s*DEFAULT_OLLAMA_MODEL)</QUERY>\n"
+    "\n"
+    "BEISPIEL-RUNDE 2 (Antwort nach Query-Ergebnissen):\n"
+    "\n"
+    "  Auf Basis der Suchergebnisse: _LOCAL_TZ existiert bereits,\n"
+    "  AIContextBridge existiert, DEFAULT_OLLAMA_MODEL definiert.\n"
+    "  Ich schlage KEINE Fixes fuer diese Punkte vor.\n"
+    "  Neue Analyse: ...\n"
+    "\n"
+    "Verfuegbare Queries (nur lesend, keine Shell):\n"
+    "- grep(PATTERN)           : Regex-Suche in w.py (max 30 Treffer)\n"
+    "- grep_lines(PATTERN,N)   : N Treffer\n"
+    "- slice(START,END)        : Zeilenbereich aus w.py\n"
+    "- logs_tail(N)            : letzte N Log-Zeilen\n"
+    "- logs_errors(N)          : letzte N ERROR-Zeilen\n"
+    "- count(PATTERN)          : Anzahl Treffer in w.py\n"
+    "- config_get(KEY)         : Config-Wert lesen\n"
+    "\n"
+    "REGELN:\n"
+    "- Runde 1: mindestens 2 Queries setzen.\n"
+    "- Runde 2: nur weitere Queries wenn noetig, sonst finale Antwort.\n"
+    "- Max 3 Runden. Danach antworte final OHNE <QUERY>-Marker.\n"
+    "- Query-Marker immer als <QUERY>...</QUERY> - keine Variation.\n"
+    "- Wenn du direkt nach Runde 1 final antworten kannst: OK.\n"
+    "- Wenn im Report ein Bug genannt wird, MUSST du zuerst per\n"
+    "  grep(NAME) pruefen, ob er im Code noch existiert.\n"
+)
+
+
 class OllamaAnalysisThread(QThread):
     """Asynchroner QThread für die KI-Analyse von WLAN-Netzwerken.
 
@@ -1759,23 +2759,44 @@ class OllamaAnalysisThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
     progress = pyqtSignal(int)
+    token_received = pyqtSignal(str)
 
     def __init__(
         self,
         networks: list[Any],
-        llm_host: str = "http://192.168.6.99:11434",
-        model: str = "llama3.2",
-        timeout: int = 60,
-        temperature: float = 0.1,
-        max_tokens: int = 512,
+        llm_host: str = DEFAULT_OLLAMA_HOST,
+        model: str | None = None,
+        timeout: int = DEFAULT_OLLAMA_TIMEOUT,
+        temperature: float = DEFAULT_OLLAMA_TEMPERATURE,
+        max_tokens: int = DEFAULT_OLLAMA_MAX_TOKENS,
+        num_ctx: int = DEFAULT_OLLAMA_NUM_CTX,
+        mode: str = DEFAULT_OLLAMA_MODE,
+        custom_prompt: str = "",
+        streaming: bool = True,
+        cache_enabled: bool = True,
+        cache_ttl: int = OLLAMA_CACHE_TTL_DEFAULT,
+        report_text: str = "",
+        max_query_rounds: int = 3,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
         self.networks = networks
         self.client = OllamaClient(host=llm_host, timeout=timeout)
+        if model is None:
+            model = self._resolve_model_from_router(mode)
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.num_ctx = num_ctx
+        self.timeout = timeout
+        self.mode = mode
+        self.custom_prompt = custom_prompt
+        self.streaming = streaming
+        self.cache_enabled = cache_enabled
+        self.cache_ttl = cache_ttl
+        self.report_text = report_text
+        self.max_query_rounds = max_query_rounds
+        self._last_dump_path: Path | None = None
         self._logger = logging.getLogger(f"{__name__}.OllamaAnalysisThread")
 
     def run(self) -> None:
@@ -1784,7 +2805,7 @@ class OllamaAnalysisThread(QThread):
             self.progress.emit(10)
 
             network_dicts = self._prepare_network_data()
-            if not network_dicts:
+            if not network_dicts and self.mode != "code_audit":
                 self.error.emit("Keine Netzwerkdaten zum Analysieren vorhanden.")
                 return
 
@@ -1795,35 +2816,427 @@ class OllamaAnalysisThread(QThread):
 
             self.progress.emit(50)
 
+            cached = (
+                self._cache_lookup(prompt)
+                if self.cache_enabled
+                else None
+            )
+            if cached is not None:
+                self._logger.info("Cache-Hit (Modus=%s)", self.mode)
+                self.progress.emit(95)
+                self.finished.emit(cached)
+                self.progress.emit(100)
+                self._log_history(prompt, cached, cached_hit=True)
+                return
+
             self._logger.info(
                 "Ollama-Anfrage: Modell=%s, Prompt=%d Zeichen, "
-                "num_ctx=8192, temp=%.1f",
+                "num_ctx=%d, temp=%.1f",
                 self.model,
                 len(prompt),
+                self.num_ctx,
                 self.temperature,
             )
-            result = self.client.generate(
-                prompt=prompt,
-                model=self.model,
-                temperature=self.temperature,
-                num_predict=self.max_tokens,
-                stream=False,
-                num_ctx=8192,
-            )
+            if self.mode == "code_audit":
+                result = self._run_two_pass_query(prompt, "")
+            else:
+                result = self._try_generate_with_fallback(prompt)
 
             self.progress.emit(90)
 
             if result is None:
-                self.error.emit("Keine Antwort vom Ollama-Server erhalten.")
+                _dump = (
+                    str(self._last_dump_path)
+                    if self._last_dump_path
+                    else "(Prompt-Dump fehlgeschlagen)"
+                )
+                self.error.emit(
+                    "Ollama nicht erreichbar (Remote + Fallback). "
+                    f"Prompt gespeichert: {_dump}"
+                )
                 return
 
             cleaned = self._clean_response(result)
+            if self.cache_enabled:
+                self._cache_write(prompt, cleaned)
+            self._log_history(prompt, cleaned, cached_hit=False)
             self.finished.emit(cleaned)
             self.progress.emit(100)
 
         except (ValueError, KeyError, TypeError, AttributeError) as e:
             self._logger.exception("Unerwarteter Fehler im Analyse-Thread")
             self.error.emit(f"Interner Fehler: {e!s}")
+
+    @staticmethod
+    def _resolve_model_from_router(mode: str) -> str:
+        """v37-R34 P51: Modell aus ai.ollama_model_router.<mode>."""
+        try:
+            km = KonfigurationsManager()
+            router = km.get(
+                "ai.ollama_model_router", DEFAULT_OLLAMA_MODEL_ROUTER
+            )
+            if not isinstance(router, dict):
+                return DEFAULT_OLLAMA_MODEL
+            entry = router.get(mode, "")
+            if entry:
+                return str(entry)
+        except (OSError, ValueError, RuntimeError, TypeError):
+            pass
+        return DEFAULT_OLLAMA_MODEL
+
+    def _run_two_pass_query(self, prompt: str, result: str) -> str:
+        """v37-R34 P46: Zwei-Pass-Query fuer code_audit.
+
+        Pass 1: KI sammelt nur Queries.
+        Pass 2: KI analysiert mit echten Query-Ergebnissen.
+        """
+        if self.mode != "code_audit":
+            return result
+
+        report_body = self.report_text.strip() or "(leer)"
+
+        # ── Pass 1: Nur Queries sammeln ─────────────────────────
+        pass1_prompt = (
+            "AUFGABE: Analysiere den unten stehenden Report. Bevor du "
+            "eine Diagnose stellst, brauchst du Fakten aus der "
+            "aktuellen w.py.\n"
+            "\n"
+            "Antworte NUR mit <QUERY>-Markern. KEIN anderer Text, "
+            "KEIN Bericht, KEINE Analyse, KEINE Zusammenfassung.\n"
+            "\n"
+            "Verfuegbare Queries:\n"
+            "- grep(PATTERN)   - Regex-Suche in w.py\n"
+            "- count(PATTERN)  - Anzahl Treffer\n"
+            "- slice(A,B)      - Zeilenbereich\n"
+            "- logs_errors(N)  - letzte N ERROR-Zeilen\n"
+            "- config_get(KEY) - Config-Wert\n"
+            "\n"
+            "Setze mindestens 3 Queries. Beispiel:\n"
+            "<QUERY>grep(_LOCAL_TZ)</QUERY>\n"
+            "<QUERY>grep(class DiagnosticReport)</QUERY>\n"
+            "<QUERY>logs_errors(5)</QUERY>\n"
+            "\n"
+            "=== REPORT ===\n"
+            + report_body
+            + "\n=== ENDE ===\n"
+        )
+        self._logger.info("P46 Pass1 startet")
+        pass1_result = self._try_generate_with_fallback(pass1_prompt)
+        if not pass1_result:
+            self._logger.warning("P46 Pass1: keine Antwort")
+            return result
+
+        queries = AIContextBridge.extract_queries(pass1_result)
+        self._logger.info("P46 Pass1: %d Query(s)", len(queries))
+        if not queries:
+            self._logger.warning(
+                "P46 Pass1: keine Marker - nutze Original-Antwort"
+            )
+            return result
+
+        # ── Query-Ausfuehrung ───────────────────────────────────
+        result_block: list[str] = ["=== QUERY-RESULTS ==="]
+        for q in queries:
+            try:
+                out = AIContextBridge.execute_query(q)
+            except (OSError, ValueError, RuntimeError) as _exc:
+                out = f"(Query-Fehler: {_exc})"
+            result_block.append(f"--- {q} ---\n{out}")
+        result_block.append("=== ENDE QUERY-RESULTS ===")
+        facts_block = "\n\n".join(result_block)
+
+        # ── Pass 2: Analyse mit Fakten ──────────────────────────
+        pass2_prompt = (
+            "ROLLE: Python-Senior-Architekt fuer wlan-ultimate "
+            "(Single-File-SSOT, >96.000 Zeilen, Python 3.14, "
+            "Kali Linux).\n"
+            "\n"
+            "WICHTIG: Die Query-Ergebnisse unten sind FAKTEN aus der "
+            "AKTUELLEN w.py. Sie haben Vorrang vor dem Report.\n"
+            "\n"
+            "=== REPORT (moeglicherweise veraltet) ===\n"
+            + report_body
+            + "\n=== ENDE REPORT ===\n"
+            "\n"
+            + facts_block
+            + "\n"
+            "\n"
+            "AUFGABE: Finale Analyse. Regeln:\n"
+            "1. Bei grep(NAME) MIT Treffern: Bug ist BEHOBEN, "
+            "gehoert NUR in Sektion 4.\n"
+            "2. Bei grep(NAME) OHNE Treffer: Bug ist AKTIV, "
+            "gehoert NUR in Sektion 3.\n"
+            "3. Ein Finding darf NIEMALS in beiden Sektionen 3 "
+            "UND 4 stehen.\n"
+            "4. Log-Eintraege die vor der letzten w.py-Aenderung "
+            "liegen sind historisch. Pruefe mit grep, ob der Bug "
+            "noch im Code existiert. Wenn nein: BEHOBEN.\n"
+            "5. DEFINITION-vs-VERWENDUNG: Wenn der Report sagt "
+            "'Attribut NAME fehlt', pruefe die grep-Treffer:\n"
+            "   - Zeile mit 'NAME:' oder 'NAME =' oder 'NAME:' am "
+            "Zeilenende = DEFINITION vorhanden.\n"
+            "   - Zeile mit 'self.NAME' oder 'cls.NAME' oder "
+            "'objekt.NAME' = nur VERWENDUNG.\n"
+            "   Wenn eine Definition-Zeile existiert, ist das "
+            "Attribut NICHT fehlend = BEREITS BEHOBEN.\n"
+            "6. VERWENDUNGS-FALLE: Wenn NAME in 7 Zeilen vorkommt "
+            "und EINE davon 'NAME:' als Zuweisung zeigt, ist NAME "
+            "definiert. Verwendungen ohne Definition sind der Bug.\n"
+            "5. KEINE Modularisierung, KEIN DebugManager-Ersatz, "
+            "KEIN direktes subprocess.\n"
+            "6. Konkrete Zeilennummern aus Query-Ergebnissen nennen.\n"
+            "\n"
+            "Format:\n"
+            "## 1. Befund-Zusammenfassung\n"
+            "## 2. Kritische Fehler (FAIL) - nur falls aktiv\n"
+            "## 3. Warnungen AKTIV (Bug im Code noch vorhanden)\n"
+            "## 4. Bereits behoben (grep zeigt Treffer - Bug weg)\n"
+            "## 5. Naechste Schritte (max 3, nur fuer AKTIVE Bugs)\n"
+        )
+        self._logger.info("P46 Pass2 startet")
+        pass2_result = self._try_generate_with_fallback(pass2_prompt)
+        if not pass2_result:
+            self._logger.warning("P46 Pass2: keine Antwort")
+            return result
+        return pass2_result
+
+    def _run_query_loop(self, prompt: str, result: str) -> str:
+        """v37-R34 P43/P44b: Query-Runden mit Zwang in Runde 1."""
+        if self.mode != "code_audit":
+            return result
+        current = result
+
+        # Runde 1: pruefen ob Query gesetzt wurde
+        queries = AIContextBridge.extract_queries(current)
+        if not queries:
+            self._logger.info(
+                "P44b: Keine Query in Runde 1 - erzwinge Retry"
+            )
+            force_msg = (
+                "\n\n"
+                "=== REGELVERSTOSS ===\n"
+                "Du hast KEINE <QUERY>...</QUERY>-Marker gesetzt.\n"
+                "Das ist ein Regelverstoss. Bevor du eine Antwort\n"
+                "gibst, MUSST du pruefen, ob die im Report genannten\n"
+                "Bugs im aktuellen Code noch existieren.\n"
+                "\n"
+                "Antworte JETZT ausschliesslich mit <QUERY>-Markern,\n"
+                "z.B.:\n"
+                "  <QUERY>grep(^\\s*_LOCAL_TZ)</QUERY>\n"
+                "  <QUERY>grep(^class DiagnosticReport)</QUERY>\n"
+                "\n"
+                "Setze mindestens 2 Queries. Sonst ist deine Antwort\n"
+                "ungueltig.\n"
+            )
+            forced = self._try_generate_with_fallback(prompt + force_msg)
+            if forced:
+                current = forced
+                queries = AIContextBridge.extract_queries(current)
+            if not queries:
+                self._logger.info(
+                    "P44b: Auch nach Retry keine Query - akzeptiere Antwort"
+                )
+                return current
+
+        # Weitere Runden bis max_query_rounds
+        for round_no in range(1, self.max_query_rounds + 1):
+            queries = AIContextBridge.extract_queries(current)
+            if not queries:
+                break
+            self._logger.info(
+                "Query-Runde %d: %d Anfrage(n)",
+                round_no,
+                len(queries),
+            )
+            result_block: list[str] = [
+                f"=== QUERY-RESULTS (Runde {round_no}) ==="
+            ]
+            for q in queries:
+                try:
+                    out = AIContextBridge.execute_query(q)
+                except (OSError, ValueError, RuntimeError) as _exc:
+                    out = f"(Query-Fehler: {_exc})"
+                result_block.append(f"--- {q} ---\n{out}")
+            result_block.append("=== ENDE QUERY-RESULTS ===")
+            extra = "\n\n".join(result_block)
+            new_prompt = (
+                prompt
+                + "\n\n"
+                + extra
+                + "\n\nNutze diese Ergebnisse. Wenn weitere Marker "
+                "noetig sind: setze sie. Sonst antworte final OHNE "
+                "<QUERY>-Marker."
+            )
+            nxt = self._try_generate_with_fallback(new_prompt)
+            if not nxt:
+                return current
+            current = nxt
+        return current
+
+    def _try_generate_with_fallback(self, prompt: str) -> str | None:
+        """v37-R34 P35: Primaer -> Fallback-Localhost -> Dump."""
+        self._last_dump_path = None
+
+        self.progress.emit(55)
+        self._logger.info(
+            "Versuch 1: Primaerer Host %s (Modell=%s)",
+            self.client.host,
+            self.model,
+        )
+        try:
+            result = self.client.generate(
+                prompt=prompt,
+                model=self.model,
+                temperature=self.temperature,
+                num_predict=self.max_tokens,
+                stream=self.streaming,
+                on_token=self._emit_token,
+                num_ctx=self.num_ctx,
+            )
+            if result:
+                return result
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._logger.warning("Primaerer Host fehlgeschlagen: %s", exc)
+
+        _is_local = (
+            self.client.host.rstrip("/") == DEFAULT_OLLAMA_FALLBACK_HOST
+        )
+        if _is_local:
+            self._logger.info("Fallback uebersprungen — Host lokal")
+        else:
+            self.progress.emit(65)
+            self._logger.info(
+                "Versuch 2: Fallback auf %s",
+                DEFAULT_OLLAMA_FALLBACK_HOST,
+            )
+            try:
+                fb = OllamaClient(
+                    host=DEFAULT_OLLAMA_FALLBACK_HOST,
+                    timeout=self.timeout,
+                )
+                result = fb.generate(
+                    prompt=prompt,
+                    model=self.model,
+                    temperature=self.temperature,
+                    num_predict=self.max_tokens,
+                    stream=self.streaming,
+                    on_token=self._emit_token,
+                    num_ctx=self.num_ctx,
+                )
+                if result:
+                    return result
+            except (OSError, ValueError, RuntimeError) as exc:
+                self._logger.warning("Fallback fehlgeschlagen: %s", exc)
+
+        self.progress.emit(75)
+        self._last_dump_path = self._dump_prompt(prompt)
+        return None
+
+    def _dump_prompt(self, prompt: str) -> Path | None:
+        """v37-R34 P35: Prompt als .md in ~/.wlan_ultimate/ollama_dumps."""
+        try:
+            dump_dir = AppKonstanten.KONFIG_DIR / "ollama_dumps"
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = dump_dir / f"prompt_{ts}.md"
+            path.write_text(prompt, encoding="utf-8")
+            self._logger.warning("Prompt gedumpt: %s", path)
+            return path
+        except (OSError, ValueError) as exc:
+            self._logger.error("Prompt-Dump fehlgeschlagen: %s", exc)
+            return None
+
+
+    def _snapshot_hash(self, prompt: str) -> str:
+        """v37-R34 P38: SHA256 ueber Modus, Modell, Host, Prompt-Inhalt."""
+        blob = f"{self.mode}|{self.model}|{self.client.host}|{prompt}"
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def _cache_dir(self) -> Path:
+        """v37-R34 P38: Cache-Verzeichnis fuer Ollama-Snapshots."""
+        d = AppKonstanten.CACHE_DIR / "ollama"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _cache_lookup(self, prompt: str) -> str | None:
+        """v37-R34 P38: Cache-Lookup mit TTL-Check."""
+        try:
+            h = self._snapshot_hash(prompt)
+            path = self._cache_dir() / f"{h}.json"
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            age = time.time() - float(data.get("created_at", 0))
+            if age > self.cache_ttl:
+                self._logger.debug(
+                    "Cache abgelaufen (%.0fs > %ds)", age, self.cache_ttl
+                )
+                return None
+            result = str(data.get("result", ""))
+            return result or None
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._logger.debug("Cache-Lookup fehlgeschlagen: %s", exc)
+            return None
+
+    def _cache_write(self, prompt: str, result: str) -> None:
+        """v37-R34 P38: Ergebnis als JSON im Cache ablegen."""
+        try:
+            h = self._snapshot_hash(prompt)
+            path = self._cache_dir() / f"{h}.json"
+            payload = {
+                "created_at": time.time(),
+                "model": self.model,
+                "mode": self.mode,
+                "host": self.client.host,
+                "prompt_len": len(prompt),
+                "result": result,
+            }
+            path.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self._logger.debug("Cache geschrieben: %s", path.name)
+        except (OSError, ValueError, TypeError) as exc:
+            self._logger.debug("Cache-Write fehlgeschlagen: %s", exc)
+
+    def _get_store(self) -> Any:
+        """v37-R34 P38: Lazy-Zugriff auf CentralStore-Singleton."""
+        store = globals().get("_STORE_SINGLETON")
+        if store is not None:
+            return store
+        try:
+            new_store = CentralStore()
+            globals()["_STORE_SINGLETON"] = new_store
+            return new_store
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            self._logger.debug("CentralStore nicht verfuegbar: %s", exc)
+            return None
+
+    def _log_history(self, prompt: str, result: str, cached_hit: bool) -> None:
+        """v37-R34 P38: Analyse in CentralStore.events protokollieren."""
+        try:
+            store = self._get_store()
+            if store is None:
+                return
+            store.log_event(
+                kind="ollama_analysis",
+                target=self.client.host,
+                data={
+                    "mode": self.mode,
+                    "model": self.model,
+                    "prompt_len": len(prompt),
+                    "result_len": len(result),
+                    "cached": cached_hit,
+                    "num_networks": len(self.networks),
+                },
+            )
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            self._logger.debug("Historie-Log fehlgeschlagen: %s", exc)
+
+    def _emit_token(self, chunk: str) -> None:
+        """v37-R34 P37: Stream-Chunk an GUI signalisieren."""
+        if chunk:
+            self.token_received.emit(chunk)
 
     def _prepare_network_data(self) -> list[dict[str, Any]]:
         """Konvertiert Netzwerk-Objekte in Dictionaries (max. 30)."""
@@ -1854,8 +3267,36 @@ class OllamaAnalysisThread(QThread):
             result.append(net_dict)
         return result
 
+    def _build_code_audit_prompt(self) -> str:
+        """v37-R34 P40a: Prompt fuer code_audit-Modus."""
+        tmpl = OLLAMA_TEMPLATES["code_audit"]
+        body = self.report_text.strip() or (
+            "(Der Bericht ist LEER - dies ist ein Fehler des "
+            "Aufrufers, nicht des Modells.)"
+        )
+        try:
+            snapshot = AIContextBridge.snapshot()
+        except (OSError, ValueError, RuntimeError) as _exc:
+            snapshot = f"(AIContextBridge-Fehler: {_exc})"
+        return (
+            tmpl["header"]
+            + "\n\n"
+            + OLLAMA_PROJECT_CONVENTIONS
+            + "\n\n"
+            + OLLAMA_QUERY_HINT
+            + "\n\n=== REPORT-INPUT ===\n"
+            + body
+            + "\n=== ENDE REPORT ===\n"
+            + "\n\n"
+            + snapshot
+            + "\n\n"
+            + tmpl["output"]
+        )
+
     def _build_prompt(self, network_dicts: list[dict[str, Any]]) -> str:
         """Erstellt einen angriffsfokussierten Prompt für Ollama."""
+        if self.mode == "code_audit":
+            return self._build_code_audit_prompt()
         if not network_dicts:
             return (
                 "ROLLE: Du bist Offensive-Security-Analyst.\n"
@@ -1996,33 +3437,19 @@ class OllamaAnalysisThread(QThread):
         total_n = len(network_dicts)
         shown_n = len(selected)
 
+        _tmpl = OLLAMA_TEMPLATES.get(
+            self.mode, OLLAMA_TEMPLATES["pentest"]
+        )
+        if self.mode == "custom" and self.custom_prompt.strip():
+            header_static = self.custom_prompt.strip()
+        else:
+            header_static = _tmpl["header"]
+
         header_parts = [
-            "ROLLE:",
-            "Du bist ein Offensive-Security-Analyst mit "
-            "Spezialisierung auf WLAN-Pentesting, Wardriving und "
-            "Funkaufklaerung. Du hilfst einem autorisierten Pentester "
-            "bei der Risikobewertung.",
+            header_static,
             "",
-            "DENKE WIE EIN ANGREIFER:",
-            "- Welche Netzwerke sind in <5 Minuten knackbar?",
-            "- Wo lohnen sich PMKID-Captures oder " "Handshake-Only-Angriffe?",
-            "- Welche Ziele sind fuer Evil-Twin oder Karma geeignet?",
-            "- Wo sind Enterprise-Netzwerke mit schwacher " "EAP-Konfiguration?",
-            "- Welche Clients leaken SSIDs via Probe-Requests?",
-            "",
-            "SPRACHE:",
-            "Deutsch. Fachbegriffe (WPA2, CCMP, SAE, PMF, PMKID, "
-            "EAP, WPS) bleiben englisch.",
-            "",
-            "BEWERTUNGSLOGIK (Prioritaet hoch -> niedrig):",
-            "1. OPEN, WEP                -> SEHR GEFAEHRLICH",
-            "2. WPA/TKIP, WPS aktiv      -> GEFAEHRLICH",
-            "3. WPA2/CCMP ohne PMF       -> MITTEL",
-            "4. WPA2/CCMP + PMF          -> SICHER",
-            "5. WPA3/SAE oder OWE        -> SEHR SICHER",
-            "Enterprise 802.1X ohne Zertifikat-Validierung: " "GEFAEHRLICH.",
-            "",
-            f"=== ZIEL-NETZWERKE ({shown_n} von {total_n}, " "kritischste zuerst) ===",
+            f"=== ZIEL-NETZWERKE ({shown_n} von {total_n}, "
+            "kritischste zuerst) ===",
             "Format pro Zeile:",
             "  Nr. | SSID | BSSID | Kanal(Band) | Signal | Krypto | "
             "WPS | Tags | Clients | Score | Angriffsvektor",
@@ -2091,44 +3518,7 @@ class OllamaAnalysisThread(QThread):
                 "Fuer Wardriving-Kontext sind diese repraesentativ.)"
             )
 
-        output_format = (
-            "\n"
-            "=== AUSGABE (EXAKT EINHALTEN, KEIN VORWORT, KEIN DENKEN) ===\n"
-            "\n"
-            "WICHTIG:\n"
-            "- Beginne direkt mit '## 1.'.\n"
-            "- Kein 'Okay', kein 'Hier ist', keine Einleitung.\n"
-            "- Keine Wiederholung der Netzwerkliste.\n"
-            "- Keine Erlaeuterungen zwischen den Abschnitten.\n"
-            "\n"
-            "## 1. Schwachstellen (Top 5)\n"
-            "Nur Netzwerke mit Score < 60, absteigend nach "
-            "Kritikalitaet.\n"
-            "Falls keine: 'Keine kritischen Netzwerke gefunden.'\n"
-            "Pro Zeile:\n"
-            "  - <SSID> (<Krypto>, WPS:<Status>): <Problem> "
-            "-> <konkreter Angriff mit Tool>\n"
-            "\n"
-            "## 2. Angriffsplan (priorisiert)\n"
-            "3 bis 5 konkrete Schritte, jeweils mit Tool-Namen.\n"
-            "Tools: airmon-ng, airodump-ng, aireplay-ng, "
-            "hcxdumptool, hashcat, reaver, wash, mdk4, hostapd, "
-            "dnsmasq, bettercap.\n"
-            "Pro Zeile:\n"
-            "  <Nr>. <Ziel (SSID/BSSID)>: <Befehl oder Tool-Aufruf> "
-            "-> <Erwartetes Ergebnis>\n"
-            "\n"
-            "## 3. Wardriving-Hinweise\n"
-            "- <Was waere bei mobiler Erfassung am effektivsten>\n"
-            "- <Welche Gebiete/BSSIDs lohnen GPS-Tracking>\n"
-            "\n"
-            "## 4. Gesamtrisiko\n"
-            "Genau eine Zeile:\n"
-            "<Sehr gefaehrlich|Gefaehrlich|Mittel|Sicher|Sehr sicher> "
-            "- <1 Satz Begruendung mit Anzahl der kritischen Netzwerke>\n"
-            "\n"
-            "=== ENDE FORMAT ==="
-        )
+        output_format = _tmpl["output"]
 
         return header + networks_block + cutoff_note + output_format
 
@@ -2440,7 +3830,15 @@ class AppKonstanten:
     APP_LIZENZ = "GPL v3"
     APP_URL = "https://github.com/security-team/wlan-ultimate"
 
-    KONFIG_DIR = Path.home() / ".wlan_ultimate"
+    # v37-R34 P30: SUDO_USER-aware Home
+    _su = os.environ.get("SUDO_USER", "").strip()
+    if _su and hasattr(os, "geteuid") and os.geteuid() == 0:
+        _cand = Path(f"/home/{_su}")
+        _home = _cand if _cand.is_dir() else Path.home()
+    else:
+        _home = Path.home()
+    USER_HOME = _home
+    KONFIG_DIR = USER_HOME / ".wlan_ultimate"
     LOG_DIR = KONFIG_DIR / "logs"
     DATENBANK = KONFIG_DIR / "wlan_ultimate.sqlite"
     KONFIG_DATEI = KONFIG_DIR / "config.yaml"
@@ -14977,7 +16375,22 @@ class KonfigurationsManager:
             },
             "ai": {
                 "ollama_host": "http://192.168.6.99:11434",
-                "ollama_model": "llama3.2",
+                "ollama_model": (
+                    "R4C3R/qwen2.5-coder-7b-instruct-heretic:q4_k_m"
+                ),
+                "ollama_model_router": {
+                    "code_audit": "qwen2.5:14b",
+                    "bypass": "coder-wifi-v3:latest",
+                    "pentest": "coder-wifi-v3:latest",
+                    "report": "qwen2.5:14b",
+                    "summary": "qwen2.5:14b",
+                    "wardriving": "coder-wifi-v3:latest",
+                    "custom": "coder-wifi-v3:latest",
+                },
+                "ollama_num_ctx": 16384,
+                "ollama_max_tokens": 2048,
+                "ollama_temperature": 0.2,
+                "ollama_timeout": 120,
                 "auto_analyze": False,
                 "timeout": 60,
             },
@@ -15199,8 +16612,16 @@ class DatenbankManager:
         if db_path is None:
             try:
                 db_path = AppKonstanten.DATENBANK
-            except ImportError:
-                db_path = Path.home() / ".wlan_ultimate" / "wlan_ultimate.sqlite"
+            except (ImportError, NameError, AttributeError):
+                # v37-R34 P31: SUDO_USER-aware Fallback
+                _su2 = os.environ.get("SUDO_USER", "").strip()
+                if (_su2 and hasattr(os, "geteuid")
+                        and os.geteuid() == 0):
+                    _cand2 = Path(f"/home/{_su2}")
+                    _h2 = _cand2 if _cand2.is_dir() else Path.home()
+                else:
+                    _h2 = Path.home()
+                db_path = _h2 / ".wlan_ultimate" / "wlan_ultimate.sqlite"
         self.db_path = db_path
         self.connection = None
         self._lock = threading.RLock()
@@ -24398,6 +25819,7 @@ class IntelligentHandshakeCapture(QThread):
         deauth_count: int = 15,
         rounds: int = 5,
         timeout_per_round: int = 20,
+        mode: str = "deauth",
         output_dir=None,
         parent=None,
     ):
@@ -24410,6 +25832,8 @@ class IntelligentHandshakeCapture(QThread):
         self.deauth_count = deauth_count
         self.rounds = rounds
         self.timeout_per_round = timeout_per_round
+        # v37-R34 P15a: PMKID/Deauth-Modus aus GUI uebernehmen
+        self.mode = mode
         self.output_dir = output_dir or AppKonstanten.CAPTURE_DIR
         self._abort = threading.Event()
         self._capture_file = None
@@ -24426,6 +25850,85 @@ class IntelligentHandshakeCapture(QThread):
         except (RuntimeError, ValueError):
             pass
 
+    # ── v37-R34 P15a: PMKID via hcxdumptool 7.x ──────────────
+    def _run_pmkid(self, prefix):
+        """PMKID-Capture mit hcxdumptool 7.x (clientless)."""
+        try:
+            if shutil.which("hcxdumptool") is None:
+                self._log("hcxdumptool nicht gefunden - PMKID uebersprungen", "WARN")
+                return
+            pmkid_out = prefix.with_suffix(".pcapng")
+            self._log("PMKID-Capture -> " + pmkid_out.name)
+            # hcxdumptool 7.x: -o Output, -c Kanal, --filterlist_ap,
+            # --rds=1 (Echtzeitanzeige), -t Timeout
+            cmd = [
+                "hcxdumptool",
+                "-i", self.iface,
+                "-w", str(pmkid_out),
+                "-c", str(self.channel),
+                "-t", str(self.timeout_per_round),
+                "--filterlist_ap=" + self.bssid.replace(":", ""),
+                "--rds=1",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            start = time.time()
+            while time.time() - start < self.timeout_per_round:
+                if self._abort.is_set():
+                    break
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.5)
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            if pmkid_out.exists() and pmkid_out.stat().st_size > 0:
+                self._log("PMKID-Capture: " + pmkid_out.name, "OK")
+                if not self._capture_file:
+                    self._capture_file = pmkid_out
+                self._convert_to_22000(pmkid_out)
+            else:
+                self._log("PMKID-Capture fehlgeschlagen. Diagnose:", "ERR")
+                try:
+                    _adv = WPSHardwareAdvisor()
+                    _rep = _adv.analyze(self.iface)
+                    for _b in _rep.get("blockers", []):
+                        self._log("  !! " + _b, "ERR")
+                    for _r in _rep.get("recommendations", [])[:3]:
+                        self._log("  -> " + _r, "INFO")
+                    if _rep.get("is_vm"):
+                        self._log(
+                            "  ~ VM erkannt: hcxdumptool laeuft in VMs "
+                            "nicht zuverlaessig. Bare-Metal oder "
+                            "Raspberry Pi verwenden.",
+                            "WARN",
+                        )
+                except (NameError, AttributeError, OSError):
+                    pass
+        except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+            self._log("PMKID-Fehler: " + str(exc), "WARN")
+
+    def _convert_to_22000(self, cap_file):
+        """Konvertiert Capture zu .22000 (hashcat)."""
+        try:
+            pipeline = CrackPipeline()
+            converted, msg = pipeline.convert_pcap(cap_file, "22000")
+            if converted:
+                self._log("Konvertiert: " + converted.name, "OK")
+            else:
+                self._log("Konvertierung: " + str(msg), "WARN")
+        except (AttributeError, RuntimeError, OSError) as exc:
+            self._log("Konvertierung: " + str(exc), "WARN")
+
     def run(self):
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -24433,6 +25936,26 @@ class IntelligentHandshakeCapture(QThread):
             prefix = self.output_dir / (f"hs_{self.bssid.replace(':', '')}_{ts}")
 
             self._log(f"Ziel: {self.bssid}, Kanal {self.channel}", "OK")
+
+            # v37-R34 P15a: PMKID-Modus -> direkt hcxdumptool, kein airodump
+            if self.mode in ("pmkid", "deauth+pmkid"):
+                self._log("Modus: PMKID via hcxdumptool", "INFO")
+                self._emit_progress(20)
+                self._run_pmkid(prefix)
+                if self.mode == "pmkid":
+                    self._emit_progress(100)
+                    if self._capture_file:
+                        self._log(
+                            "PMKID-Capture: " + self._capture_file.name, "OK"
+                        )
+                        self.finished_ok.emit(str(self._capture_file))
+                    else:
+                        self.failed.emit(
+                            "PMKID-Capture fehlgeschlagen (kein PMKID "
+                            "empfangen). Ziel evtl. WPA3 oder patched."
+                        )
+                    return
+
             if self.pmf_required:
                 self._log("⚠️  PMF (802.11w) ist REQUIRED — Deauth zwecklos.", "WARN")
                 self._log(
@@ -31942,12 +33465,14 @@ class AutoMaintenance:
                 pass
             return total
 
-        store_db = Path.home() / ".wlan_ultimate" / "store.db"
+        # v37-R34 P31: konsistent aus AppKonstanten
+        store_db = AppKonstanten.KONFIG_DIR / "store.db"
         return {
-            "logs_mb": _dir_size(Path.home() / ".wlan_ultimate" / "logs") / 1e6,
+            "logs_mb": _dir_size(AppKonstanten.LOG_DIR) / 1e6,
             "captures_mb": _dir_size(AppKonstanten.CAPTURE_DIR) / 1e6,
-            "reports_mb": _dir_size(Path.home() / ".wlan_ultimate" / "reports") / 1e6,
-            "store_mb": (store_db.stat().st_size / 1e6 if store_db.is_file() else 0),
+            "reports_mb": _dir_size(AppKonstanten.REPORT_DIR) / 1e6,
+            "store_mb": (store_db.stat().st_size / 1e6
+                         if store_db.is_file() else 0),
         }
 
 
@@ -38490,15 +40015,323 @@ class SelfTestTab(QWidget):
             pass
         return None
 
+    # ════════════════════════════════════════════════════════════
+    # v37-R34 P28: Erweiterte Checks (Tool-CLI, Tabs, Ruff, Signale)
+    # ════════════════════════════════════════════════════════════
+    def _check_tool_cli(self) -> tuple[int, list]:
+        """A) Tool-CLI-Smoke - prueft Argument-Syntax der Tools."""
+        issues: list = []
+        _tools_to_check = [
+            ("hcxdumptool", ("-w", "-i", "-c")),
+            ("wash", ("-i",)),
+            ("reaver", ("-i", "-b")),
+            ("bully", ("-i", "-b")),
+            ("hashcat", ("-m",)),
+            ("hcxpcapngtool", ("-o",)),
+        ]
+        for _tool, _args in _tools_to_check:
+            try:
+                if shutil.which(_tool) is None:
+                    continue
+                rc, out, _ = CommandRunner.run(
+                    [_tool, "--help"],
+                    subsystem="diagnostics",
+                    tag="selftest-cli",
+                    soft_fail=True,
+                    timeout=5,
+                )
+                _help = (out or "").lower()
+                for _a in _args:
+                    if _a not in _help and _tool == "hcxdumptool":
+                        if _a == "-w" and "-o " in _help:
+                            issues.append(
+                                _tool + ": alte Syntax ('-o' statt '-w')"
+                            )
+                            break
+            except (NameError, OSError, AttributeError):
+                continue
+        return (0 if not issues else -5 * len(issues), issues)
+
+    def _check_tabs_smoke(self) -> tuple[int, list]:
+        """B) GUI-Tab-Smoke - prueft Methoden-Existenz OHNE Aufruf.
+
+        v37-R34 P29: NICHT mehr aufrufen! Die create_*_tab-Methoden
+        haben Seiteneffekte (self.tab_widget.addTab), was bei jedem
+        SelfTest-Lauf Tabs dupliziert. Wir pruefen nur, dass die
+        Methoden existieren und callable sind.
+        """
+        issues: list = []
+        try:
+            gui = self._find_gui()
+            if gui is None:
+                return (-5, ["GUI nicht gefunden"])
+            for _name in sorted(dir(gui)):
+                if _name.startswith("create_") and _name.endswith("_tab"):
+                    _fn = getattr(gui, _name, None)
+                    if _fn is None:
+                        issues.append(_name + ": fehlt")
+                    elif not callable(_fn):
+                        issues.append(_name + ": nicht callable")
+        except (NameError, AttributeError):
+            pass
+        return (0 if not issues else -5 * len(issues), issues)
+
+    def _check_ruff(self) -> tuple[int, list]:
+        """C) Ruff-Integration - externer ruff check."""
+        issues: list = []
+        try:
+            if shutil.which("ruff") is None:
+                return (0, [])
+            rc, out, _ = CommandRunner.run(
+                ["ruff", "check", "w.py"],
+                subsystem="diagnostics",
+                tag="selftest-ruff",
+                soft_fail=True,
+                timeout=20,
+            )
+            for _line in (out or "").splitlines():
+                if _line.startswith(("F821", "F822", "F823", "F401",
+                                      "E501")):
+                    issues.append(_line[:100])
+                    if len(issues) >= 5:
+                        break
+        except (NameError, FileNotFoundError, OSError):
+            pass
+        return (0 if not issues else -5 * len(issues), issues)
+
+    def _check_signal_signatures(self) -> tuple[int, list]:
+        """D) Signal-Signatur-Check (AST-basiert, vgl. P24-Bug)."""
+        issues: list = []
+        try:
+            import ast as _ast_mod
+            _script = Path(sys.argv[0]) if sys.argv else None
+            if _script is None or not _script.is_file():
+                return (0, [])
+            _tree = _ast_mod.parse(_script.read_text(encoding="utf-8"))
+            # Bekannte Qt-Signale mit int-Argument
+            _int_signals = {
+                "currentIndexChanged", "valueChanged",
+                "stateChanged", "clicked", "textChanged",
+                "currentRowChanged", "currentColumnChanged",
+            }
+            for _node in _ast_mod.walk(_tree):
+                if not isinstance(_node, _ast_mod.Call):
+                    continue
+                if not isinstance(_node.func, _ast_mod.Attribute):
+                    continue
+                if _node.func.attr != "connect":
+                    continue
+                # Signal-Name pruefen
+                _sig_obj = _node.func.value
+                if not isinstance(_sig_obj, _ast_mod.Attribute):
+                    continue
+                _sig_name = _sig_obj.attr
+                if _sig_name not in _int_signals:
+                    continue
+                # Ziel pruefen
+                if not _node.args:
+                    continue
+                _tgt = _node.args[0]
+                if (isinstance(_tgt, _ast_mod.Attribute)
+                        and isinstance(_tgt.value, _ast_mod.Name)
+                        and _tgt.value.id == "self"):
+                    _mname = _tgt.attr
+                    issues.append(
+                        "connect(" + _mname + ") an " + _sig_name
+                        + ": pruefe Signatur (int-Arg)"
+                    )
+        except (NameError, OSError, SyntaxError, ImportError,
+                AttributeError):
+            pass
+        return (0 if not issues else -2 * len(issues), issues)
+
+    def _check_path_consistency(self) -> tuple[int, list]:
+        """E) v37-R34 P31: prueft Pfad-Konsistenz zwischen Modulen."""
+        issues: list = []
+        try:
+            _ak = AppKonstanten.KONFIG_DIR
+            # CentralStore
+            try:
+                _store = get_store()
+                _sp = Path(str(getattr(_store, "path", "")))
+                if _sp and _sp.parent != _ak:
+                    issues.append(
+                        "CentralStore != KONFIG_DIR: "
+                        + str(_sp.parent) + " vs " + str(_ak)
+                    )
+            except (NameError, AttributeError, OSError):
+                pass
+            # DatenbankManager
+            try:
+                _dbm = DatenbankManager()
+                _dp = Path(str(getattr(_dbm, "db_path", "")))
+                if _dp and _dp.parent != _ak:
+                    issues.append(
+                        "DatenbankManager != KONFIG_DIR: "
+                        + str(_dp.parent) + " vs " + str(_ak)
+                    )
+            except (NameError, AttributeError, OSError, TypeError):
+                pass
+            # SUDO_USER-Falle
+            _su3 = os.environ.get("SUDO_USER", "").strip()
+            if (_su3 and hasattr(os, "geteuid") and os.geteuid() == 0):
+                if str(_ak).startswith("/root/"):
+                    issues.append(
+                        "KONFIG_DIR zeigt unter sudo nach /root/ - "
+                        "SUDO_USER-aware Pfad erwartet"
+                    )
+        except (NameError, AttributeError, OSError):
+            pass
+        return (0 if not issues else -10 * len(issues), issues)
+
+    def _check_legacy_db(self) -> tuple[int, list]:
+        """F) v37-R34 P32: prueft Legacy- vs. CentralStore-DB."""
+        issues: list = []
+        try:
+            import sqlite3 as _sq
+            _cfg = AppKonstanten.KONFIG_DIR
+            _legacy = _cfg / "wlan_ultimate.sqlite"
+            _central = _cfg / "store.db"
+
+            _l_nets = 0
+            _c_nets = 0
+            _c_hs = 0
+
+            if _legacy.is_file():
+                try:
+                    _c1 = _sq.connect(str(_legacy), timeout=2.0)
+                    _cur = _c1.execute(
+                        "SELECT COUNT(*) FROM netzwerke"
+                    )
+                    _l_nets = _cur.fetchone()[0]
+                    _c1.close()
+                except (_sq.DatabaseError, _sq.OperationalError, OSError):
+                    pass
+
+            if _central.is_file():
+                try:
+                    _c2 = _sq.connect(str(_central), timeout=2.0)
+                    try:
+                        _cur = _c2.execute(
+                            "SELECT COUNT(*) FROM networks"
+                        )
+                        _c_nets = _cur.fetchone()[0]
+                    except (_sq.DatabaseError, _sq.OperationalError):
+                        pass
+                    try:
+                        _cur = _c2.execute(
+                            "SELECT COUNT(*) FROM handshake_library"
+                        )
+                        _c_hs = _cur.fetchone()[0]
+                    except (_sq.DatabaseError, _sq.OperationalError):
+                        pass
+                    _c2.close()
+                except (_sq.DatabaseError, _sq.OperationalError, OSError):
+                    pass
+
+            # v37-R34 P33: Zwei-DB-Architektur ist OK, wenn beide
+            # DBs gesunde Daten haben (Legacy = Netzwerk-Details,
+            # CentralStore = Historie/Timeline).
+            _legacy_ok = _l_nets > 0
+            _central_ok = _c_nets > 0 or _c_hs > 0
+            if _legacy_ok and _central_ok:
+                # Normalfall: keine Meldung, kein Punktabzug
+                pass
+            elif _legacy_ok and not _central_ok:
+                issues.append(
+                    "Legacy-DB hat " + str(_l_nets) + " Netzwerke, "
+                    "aber CentralStore ist leer - Scan-Speicherung "
+                    "pruefen (siehe --db-info)."
+                )
+            elif not _legacy_ok and _central_ok:
+                issues.append(
+                    "CentralStore hat Daten, aber Legacy-DB ist leer - "
+                    "Netzwerke-Tab zeigt nichts."
+                )
+
+            # Verwaiste /root-DB
+            _root_db = Path("/root/.wlan_ultimate/wlan_ultimate.sqlite")
+            if _root_db.is_file() and _root_db != _legacy:
+                try:
+                    _c3 = _sq.connect(str(_root_db), timeout=2.0)
+                    _cur = _c3.execute(
+                        "SELECT COUNT(*) FROM netzwerke"
+                    )
+                    _r_nets = _cur.fetchone()[0]
+                    _c3.close()
+                    if _r_nets > 0:
+                        issues.append(
+                            "Verwaiste /root-DB mit " + str(_r_nets)
+                            + " Netzwerken (sudo-Altlast)."
+                        )
+                except (_sq.DatabaseError, _sq.OperationalError,
+                        OSError, PermissionError):
+                    pass
+        except (NameError, AttributeError, OSError):
+            pass
+        return (0 if not issues else -5 * len(issues), issues)
+
+    def _run_extended_checks(self) -> tuple[int, list]:
+        """v37-R34 P28: fuehrt die vier erweiterten Checks aus."""
+        _delta = 0
+        _issues: list = []
+        for _name, _fn in (
+            ("Tool-CLI-Smoke", self._check_tool_cli),
+            ("GUI-Tab-Smoke", self._check_tabs_smoke),
+            ("Ruff-Check", self._check_ruff),
+            ("Signal-Signaturen", self._check_signal_signatures),
+            ("Pfad-Konsistenz", self._check_path_consistency),
+            ("Legacy-DB", self._check_legacy_db),
+        ):
+            try:
+                _d, _sub = _fn()
+                _delta += _d
+                _issues.extend(_sub)
+                _it = QTreeWidgetItem()
+                _it.setText(0, _name)
+                if _sub:
+                    _it.setText(1, "!! " + str(len(_sub)) + " Problem(e)")
+                    _it.setForeground(1, QBrush(QColor(231, 76, 60)))
+                    for _i in _sub[:5]:
+                        _c = QTreeWidgetItem()
+                        _c.setText(0, "  " + str(_i)[:100])
+                        _c.setForeground(0, QBrush(QColor(231, 76, 60)))
+                        _it.addChild(_c)
+                else:
+                    _it.setText(1, "OK")
+                    _it.setForeground(1, QBrush(QColor(39, 174, 96)))
+                try:
+                    self.tree_integrity.addTopLevelItem(_it)
+                except (RuntimeError, AttributeError):
+                    pass
+            except (AttributeError, RuntimeError, TypeError) as _exc:
+                _issues.append(_name + ": " + str(_exc)[:80])
+        return (_delta, _issues)
+
     def _run_full(self):
         self.status_label.setText("Führe vollständigen Test durch …")
         QApplication.processEvents()
 
-        # 1. Integrität
+        # 0) v37-R34 P28: Extended Checks zuerst
         gui = self._find_gui()
         self.tree_integrity.clear()
         total_score = 100
-        issues = []
+        issues: list = []
+
+        try:
+            _ext_delta, _ext_issues = self._run_extended_checks()
+            total_score += _ext_delta
+            issues.extend(_ext_issues)
+        except (AttributeError, RuntimeError, TypeError):
+            pass
+
+        # 1. Integrität
+        if gui is None:
+            self.tree_integrity.addTopLevelItem(
+                QTreeWidgetItem(["GUI", "❌ nicht gefunden"])
+            )
+            self.status_label.setText("❌ GUI nicht gefunden")
+            return
 
         if gui is None:
             self.tree_integrity.addTopLevelItem(
@@ -38508,14 +40341,20 @@ class SelfTestTab(QWidget):
             return
 
         # 1a) Tab-Methoden
+        # v37-R34 P26: refs/defs/missing vor try initialisieren,
+        # sonst UnboundLocalError bei except-Pfad (Zeile ~38626).
+        refs: set = set()
+        defs: set = set()
+        missing: list = []
         try:
-            refs = set(
-                re.findall(
-                    r"self\.(create_\w+_tab)\b",
-                    Path(sys.argv[0]).read_text(encoding="utf-8"),
+            _script = Path(sys.argv[0]) if sys.argv else None
+            if _script and _script.is_file():
+                refs = set(
+                    re.findall(
+                        r"self\.(create_\w+_tab)\b",
+                        _script.read_text(encoding="utf-8"),
+                    )
                 )
-            )
-            defs = set()
             for name in dir(gui):
                 if name.startswith("create_") and name.endswith("_tab"):
                     defs.add(name)
@@ -38851,7 +40690,7 @@ class SelfTestTab(QWidget):
         path, _filt = QFileDialog.getSaveFileName(
             self,
             "HTML-Report speichern",
-            str(Path.home() / default_name),
+            str(AppKonstanten.KONFIG_DIR.parent / default_name),
             "HTML (*.html);;Alle Dateien (*)",
             options=QFileDialog.Option.DontUseNativeDialog,
         )
@@ -38893,7 +40732,7 @@ class SelfTestTab(QWidget):
         path, _filt = QFileDialog.getSaveFileName(
             self,
             "Diagnose-Bundle speichern",
-            str(Path.home() / default_name),
+            str(AppKonstanten.KONFIG_DIR.parent / default_name),
             "Text (*.txt);;Alle Dateien (*)",
             options=QFileDialog.Option.DontUseNativeDialog,
         )
@@ -41596,6 +43435,9 @@ class ScanEngine:
             "version": "",
             "locked": False,
             "wps_state": "",
+            # v37-R34 P14: wir sind hier nur, wenn WPS IE gefunden
+            # wurde (OUI 00:50:f2, Type 4). Also immer present.
+            "wps_present": True,
             "config_methods": [],
             "device_name": "",
             "manufacturer": "",
@@ -41615,7 +43457,12 @@ class ScanEngine:
                 ad = data[idx + 4 : idx + 4 + al]
 
                 if at == 0x104A and al >= 1:
-                    result["version"] = f"1.{ad[0] & 0x0F}"
+                    # v37-R34 P14: major.minor korrekt extrahieren
+                    # (vorher: hardcoded '1.' -> WPS 2.0 wurde als 1.0
+                    # angezeigt)
+                    _v_major = (ad[0] >> 4) & 0x0F
+                    _v_minor = ad[0] & 0x0F
+                    result["version"] = f"{_v_major}.{_v_minor}"
                 elif at == 0x1044 and al >= 1:
                     result["wps_state"] = (
                         "configured" if ad[0] == 0x02 else "unconfigured"
@@ -44050,7 +45897,15 @@ class AttackController:
         output_file = (
             Path(tempfile.gettempdir()) / f"pmkid_{bssid.replace(':', '')}.pcapng"
         )
-        cmd = ["-i", iface, "-o", str(output_file), "--enable_status=1"]
+        # v37-R34 P15d: hcxdumptool 7.x (--rds, -c, -t, Filter)
+        cmd = [
+            "-i", iface,
+            "-w", str(output_file),
+            "-c", str(channel),
+            "-t", str(timeout),
+            "--filterlist_ap=" + bssid.replace(":", ""),
+            "--rds=1",
+        ]
         session_id = f"pmkid_{bssid}_{int(time.time())}"
         self._run_tool_with_session(session_id, "hcxdumptool", cmd)
         time.sleep(timeout)
@@ -55172,6 +57027,477 @@ class SupportBundle:
         zf.writestr("cmd_history.json", json.dumps(hist, indent=2, ensure_ascii=False))
 
 
+# v37-R34 P18c: Hardware-Matrix (hcxdumptool-Kompatibilitaet)
+WPS_HARDWARE_MATRIX = {
+    "excellent": [
+        "Raspberry Pi 5 + Nexmon (Kali 2025.1+) - integriertes WLAN, "
+        "kein USB-Adapter noetig - BESTE WAHL. Installation: "
+        "sudo apt install -y brcmfmac-nexmon-dkms firmware-nexmon",
+        "MediaTek MT7612U  (ALFA AWUS036ACM) - Kernel 6.1 (stabil) "
+        "oder >= 6.10 (gepatcht)",
+        "MediaTek MT7610U  (ALFA AWUS036ACHM, ASUS AC51)",
+    ],
+    "good": [
+        "Ralink RT3070     (ALFA AWUS036NH, TL-WN7200ND) - alt aber stabil",
+        "Ralink RT5370     (viele Billig-Adapter) - Kernel <= 6.1",
+        "Atheros AR9271    (ALFA AWUS036NHA) - 2,4 GHz, sehr zuverlaessig",
+    ],
+    "conditional": [
+        "Ralink RT5572 (Panda PAU09) - Treiber entfernt ab Kernel 6.1.58, "
+        "nur mit Kernel <= 6.1.42 nutzbar",
+        "MediaTek MT7612U Kernel 6.3-6.6 - 5GHz-Deauth-Bug, 2,4 GHz OK",
+        "Realtek RTL8812AU mit rtw88 (Kernel 6.14+) - active monitor "
+        "mode broken, nur passive Aufzeichnung",
+    ],
+    "avoid": [
+        "Realtek RTL8812AU (ALFA AWUS036ACH) mit DKMS rtl8812au - "
+        "NETLINK, kein ioctl() -> hcxdumptool scheitert",
+        "Realtek RTL8187   (ALFA AWUS036H)  - NETLINK, alt, "
+        "Treiberprobleme",
+        "Realtek RTL8811AU - NETLINK",
+        "Realtek RTL8814AU - NETLINK",
+        "MediaTek MT7921AU (ALFA AWUS036AXML) - Monitor Mode broken "
+        "seit Kernel 6.18",
+        "MediaTek MT7922   - nicht USB, sondern PCIe, nicht kompatibel",
+        "Intel PRO/Wireless - Treiberprobleme, NETLINK",
+    ],
+    "kaufempfehlungen": [
+        "BESTE WAHL (Bare-Metal): Raspberry Pi 5 (8 GB) + Kali ARM "
+        "2025.1+ - Board ca. 185 EUR (4 GB ab ca. 100 EUR). "
+        "Nexmon-Support: Kali 2025.1+ bringt brcmfmac-nexmon-dkms "
+        "und firmware-nexmon mit. Installation: sudo apt install -y "
+        "brcmfmac-nexmon-dkms firmware-nexmon && sudo reboot. "
+        "Integriertes WLAN (Infineon/CYW43455) kann dann Monitor Mode "
+        "und Frame Injection ohne USB-Adapter.",
+        "USB-Adapter (Kernel 6.1): ALFA AWUS036ACM (MT7612U) - "
+        "ca. 40 EUR. KERNEL-BEDINGUNG: 6.1 (stabil) oder >= 6.10. "
+        "ACHTUNG: Kernel 6.3/6.5/6.6 haben 5GHz-Deauth-Bug! "
+        "Kernel 6.12 ebenfalls Deauth-Probleme.",
+        "USB-Adapter (Kernel 6.14+): ALFA AWUS036ACH (RTL8812AU) - "
+        "ab Kernel 6.14 im rtw88-Treiber (Plug-and-Play), aber "
+        "NUR passive Monitor-Mode, KEIN Active Monitor. "
+        "hcxdumptool warnt weiterhin vor Realtek.",
+        "Budget-Option: ALFA AWUS036NHA (AR9271) - ca. 25 EUR, "
+        "nur 2,4 GHz, extrem stabil, Kernel-nativ (ath9k_htc)",
+        "NICHT KAUFEN: ALFA AWUS036AXML (MT7921AU) - Monitor Mode "
+        "seit Kernel 6.18 broken. Panda PAU09 (RT5572) - Treiber "
+        "ab Kernel 6.1.58 entfernt.",
+    ],
+    "raspberry_pi": {
+        "modelle": [
+            "Raspberry Pi 5 (4 GB / 8 GB / 16 GB) - BESTE WAHL",
+            "Raspberry Pi 4 (4 GB / 8 GB) - Nexmon seit Kali 2025.1",
+            "Raspberry Pi 3B (64-bit/32-bit) - Nexmon",
+            "Raspberry Pi Zero 2 W (43436s variant) - Nexmon",
+            "Raspberry Pi Zero W - Nexmon",
+        ],
+        "wlan_chip": "Infineon/CYW43455 (Broadcom) - integriert",
+        "monitor_mode": "Nexmon-DKMS patcht Firmware + brcmfmac-Treiber",
+        "nexmon_installation": (
+            "sudo apt update && sudo apt full-upgrade -y && "
+            "sudo apt install -y brcmfmac-nexmon-dkms firmware-nexmon && "
+            "sudo reboot"
+        ),
+        "stromversorgung": (
+            "27W USB-C Power Delivery (5V/5A) empfohlen. "
+            "Ohne 5A: USB-Ports auf 150mA limitiert, "
+            "WLAN-Adapter koennen brownout verursachen."
+        ),
+        "kuehlung": (
+            "Aluminium-Passiv-Gehaeuse (Geekworm P573, Argon NEO 5, "
+            "52Pi) oder aktive Luefter. Ohne Kuehlung throttelt der "
+            "Pi 5 unter Volllast."
+        ),
+        "preise_2026": (
+            "4 GB: ab ca. 100 EUR, 8 GB: ab ca. 185 EUR, "
+            "16 GB: ab ca. 328 EUR. Starter-Kits ab ca. 212 EUR. "
+            "DRAM-Preise steigen, Tendenz weiter steigend."
+        ),
+        "hcxdumptool_hinweis": (
+            "hcxdumptool ist fuer Raspberry Pi (headless) optimiert. "
+            "Auf RPi 5 mit Nexmon: Monitor Mode + Injection ueber "
+            "integriertes WLAN moeglich. Kein USB-Adapter noetig."
+        ),
+    },
+    "vm_warnung": (
+        "hcxdumptool laeuft NICHT zuverlaessig in virtuellen Maschinen. "
+        "USB-Passthrough ist nicht exklusiv genug fuer AF_PACKET/ioctl. "
+        "Verwende Bare-Metal (Raspberry Pi 5) oder ein Live-USB-System."
+    ),
+}
+
+
+class WPSHardwareAdvisor:
+    """v37-R34 P18c: WLAN-Adapter-Kompatibilitaet fuer hcxdumptool."""
+
+    _KNOWN_CHIPSETS = {
+        # ── MediaTek (Kernel-nativ, ioctl) ─────────────────
+        "0e8d:7612": ("MediaTek MT7612U", "excellent",
+                       "Kernel-nativ mt76x2u - Kernel 6.1 (stabil) "
+                       "oder >= 6.10 (gepatcht) empfohlen"),
+        "0e8d:7610": ("MediaTek MT7610U", "excellent",
+                       "Kernel-nativ mt76x0u, ioctl"),
+        "148f:761a": ("MediaTek MT7610U", "excellent",
+                       "Kernel-nativ mt76x0u, ioctl"),
+        "148f:7601": ("MediaTek MT7601U", "good",
+                       "Nur 2,4 GHz, Kernel-nativ"),
+        "0b05:17d1": ("MediaTek MT7610U (ASUS AC51)", "excellent",
+                       "Kernel-nativ, Dual-Band"),
+        "7392:7710": ("MediaTek MT7610U (Edimax)", "excellent",
+                       "Kernel-nativ, Dual-Band"),
+        # MediaTek MT7921AU - Monitor Mode broken seit 6.18
+        "0e8d:7961": ("MediaTek MT7921AU (ALFA AWUS036AXML)", "avoid",
+                       "Monitor Mode broken seit Kernel 6.18 (morrownr)"),
+        # ── Ralink (Kernel-nativ, aber Kernel-abhaengig) ───
+        "148f:3070": ("Ralink RT3070", "good",
+                       "Kernel-nativ rt2800usb, alt aber stabil"),
+        "148f:5370": ("Ralink RT5370", "good",
+                       "Kernel-nativ, 2,4 GHz, Kernel <= 6.1"),
+        "148f:5572": ("Ralink RT5572 (Panda PAU09)", "conditional",
+                       "Treiber entfernt ab Kernel 6.1.58! Nur mit "
+                       "Kernel <= 6.1.42 nutzbar"),
+        "148f:3572": ("Ralink RT3572", "conditional",
+                       "Wie RT5572, Kernel <= 6.1.42 erforderlich"),
+        # ── Atheros (sehr stabil, nur 2,4 GHz) ─────────────
+        "0cf3:9271": ("Atheros AR9271", "good",
+                       "Kernel-nativ ath9k_htc, 2,4 GHz, extrem stabil"),
+        # ── Realtek (NETLINK, nicht empfohlen) ─────────────
+        "0bda:8812": ("Realtek RTL8812AU", "avoid",
+                       "DKMS rtl8812au: NETLINK, kein ioctl() -> "
+                       "hcxdumptool scheitert. rtw88 (Kernel 6.14+): "
+                       "active monitor broken"),
+        "0bda:8811": ("Realtek RTL8811AU", "avoid", "NETLINK"),
+        "0bda:8814": ("Realtek RTL8814AU", "avoid", "NETLINK"),
+        "0bda:8187": ("Realtek RTL8187", "avoid",
+                       "NETLINK, alt, Treiberprobleme"),
+        "0bda:8179": ("Realtek RTL8188EU", "avoid", "NETLINK"),
+        "0bda:817f": ("Realtek RTL8188FU", "avoid", "NETLINK"),
+    }
+
+    _KNOWN_DRIVERS = {
+        "mt76x2u":     ("excellent", "MediaTek MT7612U Kernel-Treiber - "
+                                     "Kernel 6.1 oder >= 6.10"),
+        "mt76x0u":     ("excellent", "MediaTek MT7610U Kernel-Treiber"),
+        "mt7601u":     ("good",      "MediaTek MT7601U Kernel-Treiber"),
+        "mt7921u":     ("avoid",     "MediaTek MT7921AU - Monitor Mode "
+                                     "broken seit Kernel 6.18"),
+        "rt2800usb":   ("conditional", "Ralink RT2800 - Treiber entfernt "
+                                       "ab Kernel 6.1.58"),
+        "ath9k_htc":   ("good",      "Atheros AR9271 - sehr stabil, "
+                                     "2,4 GHz"),
+        "rtl88xxau":   ("avoid",     "Realtek DKMS, NETLINK"),
+        "rtl8812au":   ("avoid",     "Realtek, NETLINK"),
+        "rtw_8812au":  ("conditional", "Realtek rtw88 Kernel 6.14+ - "
+                                       "active monitor broken"),
+        "rtw88_8812au": ("conditional", "Realtek rtw88 - active monitor "
+                                        "broken"),
+        "rtl8187":     ("avoid",     "Realtek alt, NETLINK"),
+        "iwlwifi":     ("avoid",     "Intel, NETLINK"),
+        "brcmfmac":    ("conditional",
+                        "Broadcom RPi - nur mit nexmon-DKMS "
+                        "(Kali 2025.3+)"),
+        "88xxau":      ("avoid",     "Realtek DKMS-Treiber"),
+    }
+
+    def __init__(self, logger=None):
+        self.logger = logger
+
+    def analyze(self, iface):
+        result = {
+            "iface": iface, "usb_id": "", "chipset": "unbekannt",
+            "driver": "", "rating": "unknown", "note": "",
+            "is_vm": False, "vm_type": "",
+            "kernel": platform.release(), "kernel_ok": False,
+            "recommendations": [], "warnings": [], "blockers": [],
+        }
+
+        try:
+            rc, out, _ = CommandRunner.run(
+                ["systemd-detect-virt"], subsystem="driver",
+                tag="hw-advisor", soft_fail=True, timeout=3,
+            )
+            _virt = (out or "").strip().lower()
+            if _virt and _virt != "none":
+                result["is_vm"] = True
+                result["vm_type"] = _virt
+                result["warnings"].append(
+                    "VM erkannt (" + _virt + "). hcxdumptool ist fuer "
+                    "virtuelle Maschinen NICHT empfohlen."
+                )
+        except (NameError, AttributeError, OSError):
+            pass
+
+        try:
+            rc, out, _ = CommandRunner.run(
+                ["ethtool", "-i", iface], subsystem="driver",
+                tag="hw-advisor", soft_fail=True, timeout=3,
+            )
+            for line in (out or "").splitlines():
+                if line.startswith("driver:"):
+                    result["driver"] = line.split(":", 1)[1].strip()
+                    break
+        except (NameError, AttributeError, OSError):
+            pass
+
+        try:
+            rc, out, _ = CommandRunner.run(
+                ["lsusb"], subsystem="driver",
+                tag="hw-advisor", soft_fail=True, timeout=3,
+            )
+            for line in (out or "").splitlines():
+                _low = line.lower()
+                if ("realtek" in _low or "mediatek" in _low
+                        or "ralink" in _low or "atheros" in _low
+                        or "alfa" in _low):
+                    for _p in line.split():
+                        if ":" in _p and len(_p) == 9:
+                            result["usb_id"] = _p.lower()
+                            break
+                    if result["usb_id"]:
+                        break
+        except (NameError, AttributeError, OSError):
+            pass
+
+        # v37-R34 P20c: Treiber-basiertes USB-ID-Mapping (autoritativ)
+        _driver_to_usb = {
+            "rtl88xxau": "0bda:8812", "rtl8812au": "0bda:8812",
+            "rtw_8812au": "0bda:8812", "rtw88_8812au": "0bda:8812",
+            "rtl8187": "0bda:8187", "rtl8811au": "0bda:8811",
+            "rtl8814au": "0bda:8814", "rtl8188eu": "0bda:8179",
+            "mt76x2u": "0e8d:7612", "mt76x0u": "148f:761a",
+            "mt7601u": "148f:7601", "mt7921u": "0e8d:7961",
+            "rt2800usb": "148f:3070", "ath9k_htc": "0cf3:9271",
+            "brcmfmac": "rpi:integrated",
+        }
+        _dl = result["driver"].lower()
+        for _k, _v in _driver_to_usb.items():
+            if _k in _dl:
+                result["usb_id"] = _v
+                break
+
+        _rating = "unknown"
+        _note = ""
+        if result["usb_id"] and result["usb_id"] in self._KNOWN_CHIPSETS:
+            _cs, _rating, _note = self._KNOWN_CHIPSETS[result["usb_id"]]
+            result["chipset"] = _cs
+        elif result["driver"]:
+            _dl = result["driver"].lower()
+            for _k, (_r, _n) in self._KNOWN_DRIVERS.items():
+                if _k in _dl:
+                    _rating = _r
+                    _note = _n
+                    break
+            if result["chipset"] == "unbekannt":
+                result["chipset"] = result["driver"]
+
+        result["rating"] = _rating
+        result["note"] = _note
+
+        try:
+            _parts = result["kernel"].split(".")
+            _maj = int(_parts[0]) if _parts[0].isdigit() else 0
+            _min = (int(_parts[1])
+                    if len(_parts) > 1 and _parts[1].isdigit() else 0)
+            result["kernel_ok"] = (_maj >= 6) or (_maj == 5 and _min >= 10)
+        except (ValueError, IndexError):
+            pass
+
+        if _rating == "avoid":
+            result["blockers"].append(
+                "Chipset " + result["chipset"] + " ist fuer hcxdumptool "
+                "NICHT geeignet (" + _note + ")."
+            )
+            result["recommendations"].append(
+                "Empfohlen: ALFA AWUS036ACM (MT7612U, Kernel 6.1 "
+                "oder >= 6.10) - NICHT Kernel 6.3-6.6 (5GHz-Bug!)"
+            )
+            result["recommendations"].append(
+                "Budget: ALFA AWUS036NHA (AR9271, nur 2,4 GHz, "
+                "extrem stabil, Kernel-nativ)"
+            )
+            result["recommendations"].append(
+                "Bare-Metal: Raspberry Pi 5 + Kali ARM 2025.1+ "
+                "- Nexmon-Support fuer RPi 5 vorhanden, aber "
+                "Stand vor Kauf pruefen (Doku vs. Blog)"
+            )
+        elif _rating == "conditional":
+            result["warnings"].append(
+                "Chipset " + result["chipset"] + ": " + _note
+            )
+        elif _rating in ("excellent", "good"):
+            result["recommendations"].append(
+                "Chipset " + result["chipset"] + ": " + _note
+            )
+
+        if not result["kernel_ok"]:
+            result["warnings"].append(
+                "Kernel " + result["kernel"] + " ist aelter als empfohlen "
+                "(hcxdumptool empfiehlt >= 6.4)."
+            )
+
+        # v37-R34 P19: Kernel-spezifische Warnungen
+        try:
+            _kp = result["kernel"].split(".")
+            _maj = int(_kp[0]) if _kp[0].isdigit() else 0
+            _min = (int(_kp[1])
+                    if len(_kp) > 1 and _kp[1].isdigit() else 0)
+            _patch = 0
+            if len(_kp) > 2:
+                _p = _kp[2].split("-")[0]
+                _patch = int(_p) if _p.isdigit() else 0
+
+            # MT7612U 5GHz-Bug in 6.3-6.6
+            if (_maj == 6 and 3 <= _min <= 6
+                    and "mt7612" in result["chipset"].lower()):
+                result["warnings"].append(
+                    "MT7612U auf Kernel " + result["kernel"] + ": "
+                    "5GHz-Deauth-Bug in Kernel 6.3-6.6. "
+                    "2,4 GHz funktioniert, 5 GHz eingeschraenkt. "
+                    "Kernel 6.1 oder >= 6.10 empfohlen."
+                )
+            # RT5572-Treiber entfernt
+            if (_maj == 6 and _min == 1 and _patch >= 58
+                    and "rt5572" in result["chipset"].lower()):
+                result["blockers"].append(
+                    "RT5572 auf Kernel " + result["kernel"] + ": "
+                    "rt2800usb-Treiber wurde ab 6.1.58 entfernt. "
+                    "Dieser Adapter funktioniert NICHT mehr auf "
+                    "modernen Kernels."
+                )
+            # MT7921AU Monitor-Bug seit 6.18
+            if (_maj == 6 and _min >= 18
+                    and "mt7921" in result["chipset"].lower()):
+                result["blockers"].append(
+                    "MT7921AU auf Kernel " + result["kernel"] + ": "
+                    "Monitor Mode broken seit 6.18 (morrownr). "
+                    "Adapter ist NICHT fuer hcxdumptool geeignet."
+                )
+        except (ValueError, IndexError):
+            pass
+
+        # v37-R34 P19: Nexmon-Check auf Raspberry Pi
+        try:
+            if Path("/proc/device-tree/model").exists():
+                _model = Path(
+                    "/proc/device-tree/model"
+                ).read_text(errors="ignore").strip("\x00").strip()
+                if "Raspberry Pi 5" in _model or "Raspberry Pi 4" in _model:
+                    result["is_raspberry"] = True
+                    _nexmon = Path(
+                        "/sys/module/brcmfmac_nexmon/version"
+                    ).exists()
+                    if _nexmon:
+                        result["recommendations"].insert(0,
+                            "Nexmon-DKMS aktiv! Integriertes Broadcom-WLAN "
+                            "kann Monitor+Injection ohne USB-Adapter."
+                        )
+                    else:
+                        result["recommendations"].insert(0,
+                            "Raspberry Pi erkannt (" + _model + "). "
+                            "Nexmon-DKMS nicht aktiv. Installation: "
+                            "sudo apt update && sudo apt full-upgrade "
+                            "&& sudo apt install -y brcmfmac-nexmon-dkms "
+                            "firmware-nexmon && sudo reboot. "
+                            "Hinweis: Kali-Doku (2026-06-30) sagt, "
+                            "dass Nexmon fuer RPi 5 noch nicht im "
+                            "Standard-Image ist - manuell nachinstallieren."
+                        )
+        except (OSError, AttributeError):
+            pass
+
+        return result
+
+    def render_report(self, iface):
+        r = self.analyze(iface)
+        L = []
+        L.append("=" * 66)
+        L.append("  WPS/PMKID HARDWARE-KOMPATIBILITAETS-REPORT")
+        L.append("=" * 66)
+        L.append("")
+        L.append("Interface:      " + r["iface"])
+        L.append("Chipset:        " + r["chipset"])
+        L.append("Treiber:        " + (r["driver"] or "unbekannt"))
+        L.append("USB-ID:         " + (r["usb_id"] or "nicht erkannt"))
+        L.append("Kernel:         " + r["kernel"]
+                 + (" (OK)" if r["kernel_ok"] else " (alt)"))
+        L.append("")
+        L.append("Umgebung:       "
+                 + ("VM (" + r["vm_type"] + ")"
+                    if r["is_vm"] else "Bare-Metal"))
+        L.append("")
+        _ic = {"excellent": "[++]", "good": "[+] ",
+               "conditional": "[~] ", "avoid": "[!!]", "unknown": "[?] "}
+        L.append("Bewertung:      " + _ic.get(r["rating"], "[?]")
+                 + " " + r["rating"].upper())
+        if r["note"]:
+            L.append("Details:        " + r["note"])
+        L.append("")
+        if r["blockers"]:
+            L.append("-" * 66)
+            L.append("BLOCKER:")
+            for b in r["blockers"]:
+                L.append("  !! " + b)
+            L.append("")
+        if r["warnings"]:
+            L.append("-" * 66)
+            L.append("WARNUNGEN:")
+            for w in r["warnings"]:
+                L.append("  ~  " + w)
+            L.append("")
+        if r["recommendations"]:
+            L.append("-" * 66)
+            L.append("EMPFEHLUNGEN:")
+            for rec in r["recommendations"]:
+                L.append("  -> " + rec)
+            L.append("")
+
+        # v37-R34 P19: Statische Kaufempfehlungen aus Matrix
+        if WPS_HARDWARE_MATRIX.get("kaufempfehlungen"):
+            L.append("-" * 66)
+            L.append("KAUFEMPFEHLUNGEN (Stand 2025/2026):")
+            for _k in WPS_HARDWARE_MATRIX["kaufempfehlungen"]:
+                L.append("  $  " + _k)
+            L.append("")
+
+        # v37-R34 P19/P20b: VM-Warnung
+        if r.get("is_vm") and WPS_HARDWARE_MATRIX.get("vm_warnung"):
+            L.append("-" * 66)
+            L.append("VM-HINWEIS:")
+            L.append("  ! " + WPS_HARDWARE_MATRIX["vm_warnung"])
+            L.append("")
+
+        # v37-R34 P21: Raspberry Pi + Nexmon + VNC
+        if r.get("is_raspberry"):
+            _rpi = WPS_HARDWARE_MATRIX.get("raspberry_pi", {})
+            L.append("-" * 66)
+            L.append("RASPBERRY PI + NEXMON:")
+            L.append("  WLAN-Chip: " + _rpi.get("wlan_chip", "?"))
+            L.append("  Monitor:   " + _rpi.get("monitor_mode", "?"))
+            L.append("  Install:   " + _rpi.get("nexmon_installation", "?"))
+            L.append("  Strom:     " + _rpi.get("stromversorgung", "?"))
+            L.append("  Kuehlung:  " + _rpi.get("kuehlung", "?"))
+            L.append("")
+            L.append("  Preise (2026):")
+            for _p in _rpi.get("preise_2026", "").split(". "):
+                if _p.strip():
+                    L.append("    $ " + _p.strip())
+            L.append("")
+            L.append("  VNC Remote-Zugriff:")
+            L.append("    sudo apt install tightvncserver")
+            L.append("    vncserver :1   # verbinden: IP:5901")
+        L.append("=" * 66)
+        L.append("  CLI-TEST ohne GUI:")
+        L.append("    sudo ip link set " + r["iface"] + " down")
+        L.append("    sudo iw dev " + r["iface"] + " set type managed")
+        L.append("    sudo ip link set " + r["iface"] + " up")
+        L.append("    sudo systemctl stop NetworkManager wpa_supplicant")
+        L.append("    sudo hcxdumptool -i " + r["iface"]
+                 + " -w /tmp/test.pcapng -c 11 -t 20 --rds=1")
+        L.append("    (Erwartet: kein 'failed to arm interface')")
+        L.append("=" * 66)
+        return chr(10).join(L)
+
+
 @dataclass
 class AdapterStatus:
     """Ergebnis der Adapter-Vorprüfung (Alfa ACH-C optimiert)."""
@@ -55431,7 +57757,10 @@ class PreflightCheck:
             s.monitor_test_ok = cls._test_monitor_mode(iface)
             if s.monitor_test_ok:
                 mon = cls._find_monitor_iface(iface) or iface
-                s.channel_36_ok = cls._test_channel(mon, 36)
+                # v37-R34 P14b: Kanal 36 nur auf 5-GHz-faehigen
+                # Adaptern testen. RTL8187 kann nur 2,4 GHz -> rc=234.
+                if s.supports_5ghz:
+                    s.channel_36_ok = cls._test_channel(mon, 36)
                 if s.supports_dfs:
                     s.channel_100_ok = cls._test_channel(mon, 100)
                 s.injection_test_ok = cls._test_injection(mon)
@@ -55566,10 +57895,13 @@ class PreflightCheck:
 
     @staticmethod
     def _test_channel(iface: str, channel: int) -> bool:
+        # v37-R34 P14b: soft_fail=True -> rc != 0 wird nicht als
+        # ERROR geloggt (Kanal kann legitim gesperrt sein).
         rc, _, _ = CommandRunner.run(
             ["iw", "dev", iface, "set", "channel", str(channel)],
             subsystem="driver",
             tag="preflight",
+            soft_fail=True,
             timeout=3,
         )
         return rc == 0
@@ -58679,15 +61011,17 @@ class KaliToolChain:
             out_dir = AppKonstanten.CAPTURE_DIR
             out_dir.mkdir(parents=True, exist_ok=True)
             out_file = out_dir / ("pmkid_" + target_bssid.replace(":", "") + ".pcapng")
+            # v37-R34 P15c: hcxdumptool 7.x - --enable_status weg,
+            # --filtermode weg (Filter laeuft ueber --filterlist_ap),
+            # MAC-Adresse ohne Doppelpunkte.
             cmd = [
                 "hcxdumptool",
                 "-i",
                 self.iface_name,
-                "-o",
+                "-w",
                 str(out_file),
-                "--enable_status=1",
-                "--filtermode=2",
-                "--filterlist_ap=" + target_bssid,
+                "--filterlist_ap=" + target_bssid.replace(":", ""),
+                "--rds=1",
             ]
             self.logger.info("hcxdumptool laeuft " + str(timeout) + "s")
             CommandRunner.run(
@@ -60088,15 +62422,18 @@ class HandshakeCaptureThread(QThread):
                 return
             pmkid_out = cap_prefix.with_suffix(".pcapng")
             self._log(f"PMKID-Capture → {pmkid_out.name}")
+            # v37-R34 P15c: hcxdumptool 7.x - --rds statt --enable_status,
+            # -c ohne 'a'-Suffix (das war 6.x). Modus 7.x aktiviert den
+            # Monitor-Modus selbst.
             cmd = [
                 "hcxdumptool",
                 "-i",
                 self.iface,
-                "-o",
+                "-w",
                 str(pmkid_out),
-                "--enable_status=1",
                 "-c",
-                f"{self.channel}a",
+                str(self.channel),
+                "--rds=1",
             ]
             proc = subprocess.Popen(
                 cmd,
@@ -62192,15 +64529,16 @@ class EvilTwinController(QObject):
 
         def _loop():
             try:
+                # v37-R34 P15d: hcxdumptool 7.x (--rds, -c ohne 'a')
                 cmd = [
                     "hcxdumptool",
                     "-i",
                     iface,
-                    "-o",
+                    "-w",
                     str(self._handshake_cap),
-                    "--enable_status=1",
                     "-c",
-                    str(self.config.target_channel) + "a",
+                    str(self.config.target_channel),
+                    "--rds=1",
                 ]
                 self._handshake_proc = subprocess.Popen(
                     cmd,
@@ -65633,6 +67971,198 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             layout.addWidget(err)
         self.tab_widget.addTab(tab, "🩺 Diagnose")
 
+    def _run_ai_code_audit(self):
+        """v37-R34 P40b: SelfTest-Report an Ollama code_audit."""
+        report_text = self._collect_selftest_report_text()
+        if not report_text.strip():
+            QMessageBox.warning(
+                self,
+                "Kein Report",
+                "Kein SelfTest-Report verfügbar. "
+                "Bitte erst SelfTest ausführen.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("🤖 KI-Code-Audit")
+        dialog.resize(900, 650)
+        dlg_layout = QVBoxLayout(dialog)
+
+        info = QLabel(
+            "Audit läuft ... (Modus code_audit, Streaming aktiv)"
+        )
+        dlg_layout.addWidget(info)
+
+        result_edit = QTextEdit()
+        result_edit.setReadOnly(True)
+        dlg_layout.addWidget(result_edit)
+
+        _btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Close
+        )
+        _btns.rejected.connect(dialog.reject)
+        dlg_layout.addWidget(_btns)
+
+        try:
+            thread = OllamaAnalysisThread(
+                networks=[],
+                llm_host=self.konfig_manager.get(
+                    "ai.ollama_host", DEFAULT_OLLAMA_HOST
+                ),
+                model=self.konfig_manager.get(
+                    "ai.ollama_model", DEFAULT_OLLAMA_MODEL
+                ),
+                mode="code_audit",
+                report_text=report_text,
+                timeout=self.konfig_manager.get(
+                    "ai.ollama_timeout", DEFAULT_OLLAMA_TIMEOUT
+                ),
+                temperature=self.konfig_manager.get(
+                    "ai.ollama_temperature",
+                    DEFAULT_OLLAMA_TEMPERATURE,
+                ),
+                max_tokens=self.konfig_manager.get(
+                    "ai.ollama_max_tokens",
+                    DEFAULT_OLLAMA_MAX_TOKENS,
+                ),
+                num_ctx=self.konfig_manager.get(
+                    "ai.ollama_num_ctx", DEFAULT_OLLAMA_NUM_CTX
+                ),
+                streaming=True,
+                cache_enabled=False,
+            )
+
+            def _append_token(chunk: str) -> None:
+                try:
+                    cur = result_edit.textCursor()
+                    cur.movePosition(
+                        QTextCursor.MoveOperation.End
+                    )
+                    result_edit.setTextCursor(cur)
+                    result_edit.insertPlainText(chunk)
+                except (AttributeError, RuntimeError):
+                    pass
+
+            def _done(text: str) -> None:
+                try:
+                    info.setText("Audit abgeschlossen.")
+                    result_edit.setPlainText(text)
+                except (AttributeError, RuntimeError):
+                    pass
+
+            def _err(msg: str) -> None:
+                try:
+                    info.setText(f"Fehler: {msg}")
+                except (AttributeError, RuntimeError):
+                    pass
+
+            thread.token_received.connect(_append_token)
+            thread.finished.connect(_done)
+            thread.error.connect(_err)
+            dialog._ai_thread = thread
+            thread.start()
+        except (AttributeError, RuntimeError, ValueError) as exc:
+            info.setText(f"Start fehlgeschlagen: {exc}")
+
+        dialog.exec()
+
+    def _serialize_selftest_report(self, rep) -> str:
+        """v37-R34 P40c: SelfTestReport zu strukturiertem Text serialisieren."""
+        parts: list[str] = ["[SelfTestReport]"]
+        try:
+            parts.append(f"Aggregate: {rep.overall().value}")
+            parts.append(f"Score:     {rep.score()}/100")
+            parts.append(f"Summary:   {rep.summary_line()}")
+            sc = rep.severity_counts()
+            parts.append(
+                f"Counts:    OK={sc.get('OK', 0)} "
+                f"WARN={sc.get('WARN', 0)} "
+                f"FAIL={sc.get('FAIL', 0)} "
+                f"SKIP={sc.get('SKIP', 0)}"
+            )
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            parts.append(f"(Kopfdaten nicht lesbar: {exc})")
+
+        try:
+            cats = (
+                getattr(rep, "categories", None)
+                or getattr(rep, "category_results", None)
+                or getattr(rep, "results", None)
+            )
+            if cats:
+                for cat in cats:
+                    try:
+                        cname = getattr(cat, "name", "?")
+                        cagg = ""
+                        if hasattr(cat, "aggregate"):
+                            cagg = f" [{cat.aggregate().value}]"
+                        parts.append(f"\n## {cname}{cagg}")
+                        for r in getattr(cat, "results", []):
+                            sev = getattr(
+                                getattr(r, "severity", None),
+                                "value",
+                                "?",
+                            )
+                            rname = getattr(r, "name", "?")
+                            rdet = getattr(r, "detail", "")
+                            rval = getattr(r, "value", "")
+                            line = f"  [{sev}] {rname}"
+                            if rdet:
+                                line += f": {rdet}"
+                            if rval:
+                                line += f" ({rval})"
+                            parts.append(line)
+                    except (AttributeError, TypeError):
+                        continue
+        except (AttributeError, TypeError):
+            parts.append("(Kategorien nicht lesbar)")
+
+        return "\n".join(parts)
+
+    def _collect_selftest_report_text(self) -> str:
+        """v37-R34 P40b: SelfTest-Report-Text sammeln."""
+        parts: list[str] = []
+        widget = getattr(self, "_self_test_widget", None)
+        if widget is not None:
+            _rep = getattr(widget, "_last_report", None)
+            if _rep is not None:
+                try:
+                    parts.append(
+                        self._serialize_selftest_report(_rep)
+                    )
+                except (AttributeError, TypeError) as _exc:
+                    parts.append(f"[SelfTestReport-Fehler: {_exc}]")
+            else:
+                parts.append(
+                    "[SelfTestTab: kein _last_report — "
+                    "bitte erst Vollständigen Test klicken]"
+                )
+
+        try:
+            tool_res = ExternalToolChecker.check()
+            parts.append("[ExternalToolChecker]")
+            for name, info in sorted(tool_res.items()):
+                status = "OK" if info.get("ok") else "FAIL"
+                parts.append(
+                    f"  [{status}] {name}: "
+                    f"{info.get('desc', '')}"
+                )
+        except (NameError, AttributeError, RuntimeError) as exc:
+            parts.append(f"[ExternalToolChecker fehlt: {exc}]")
+
+        try:
+            km = self.konfig_manager
+            parts.append(
+                "[Ollama-Config]\n"
+                f"  host={km.get('ai.ollama_host', '?')}\n"
+                f"  model={km.get('ai.ollama_model', '?')}\n"
+                f"  num_ctx={km.get('ai.ollama_num_ctx', '?')}"
+            )
+        except (AttributeError, RuntimeError):
+            pass
+
+        return "\n".join(parts)
+
     def create_self_test_tab(self):
         """v10.3: SelfTest-Tab."""
         tab = QWidget()
@@ -65645,6 +68175,19 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             err = QLabel(f"SelfTestTab nicht verfügbar: {exc}")
             err.setStyleSheet("color:#e74c3c;padding:8px;")
             layout.addWidget(err)
+
+        # v37-R34 P40b: KI-Audit-Button
+        _ai_row = QHBoxLayout()
+        self.btn_self_test_ai = QPushButton(
+            "🤖 KI-Code-Audit (SelfTest-Report analysieren)"
+        )
+        self.btn_self_test_ai.clicked.connect(
+            self._run_ai_code_audit
+        )
+        _ai_row.addWidget(self.btn_self_test_ai)
+        _ai_row.addStretch()
+        layout.addLayout(_ai_row)
+
         self.tab_widget.addTab(tab, "🧪 SelfTest")
 
     def create_fokus_tab(self):
@@ -70477,6 +73020,25 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         g_hist = QGroupBox("📜 Erfasste Handshakes")
         hist_lay = QVBoxLayout(g_hist)
 
+        # v37-R34 P27: Filter-Combo ueber Sektion H
+        _hs_filter_row = QHBoxLayout()
+        _hs_filter_row.addWidget(QLabel("Filter:"))
+        self.hs_hist_filter = QComboBox()
+        self.hs_hist_filter.addItems([
+            "Alle", "Nur geknackt", "Nur offen", "Nur fehlgeschlagen",
+        ])
+        self.hs_hist_filter.currentIndexChanged.connect(
+            lambda _idx: self._hs_refresh_table()
+        )
+        _hs_filter_row.addWidget(self.hs_hist_filter)
+        _hs_filter_row.addStretch()
+        self.hs_hist_count = QLabel("Zeige 0 von 0")
+        self.hs_hist_count.setStyleSheet(
+            "color:#7f8c8d;font-family:monospace;padding:4px;"
+        )
+        _hs_filter_row.addWidget(self.hs_hist_count)
+        hist_lay.addLayout(_hs_filter_row)
+
         self.handshake_table = QTableWidget(0, 5)
         self.handshake_table.setHorizontalHeaderLabels(
             [
@@ -70491,6 +73053,16 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             QHeaderView.ResizeMode.Stretch
         )
         self.handshake_table.setMinimumHeight(150)
+        # v37-R34 P22c: Kontextmenue + Doppelklick
+        self.handshake_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.handshake_table.customContextMenuRequested.connect(
+            self._hs_hist_context_menu
+        )
+        self.handshake_table.itemDoubleClicked.connect(
+            self._hs_hist_double_click
+        )
         hist_lay.addWidget(self.handshake_table)
 
         hist_btn_row = QHBoxLayout()
@@ -70503,6 +73075,14 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             lambda: self.handshake_table.setRowCount(0)
         )
         hist_btn_row.addWidget(self.hs_btn_clear_hist)
+
+        # v37-R34 P22c: Crosslink zur Bibliothek
+        self.hs_btn_open_lib = QPushButton("📚 Bibliothek oeffnen")
+        self.hs_btn_open_lib.setToolTip(
+            "Wechselt zum Handshake-Lib-Tab (Detail-Ansicht)"
+        )
+        self.hs_btn_open_lib.clicked.connect(self._hs_open_library_tab)
+        hist_btn_row.addWidget(self.hs_btn_open_lib)
         hist_btn_row.addStretch()
         hist_lay.addLayout(hist_btn_row)
 
@@ -70675,15 +73255,12 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
     def _hs_current_mode(self) -> str:
         """Gibt aktuell gewaehlten Capture-Modus zurueck.
 
-        v37-R20d: Fallback-Chain:
-          1. Persistenter Wert (immer sicher)
-          2. Buttons abfragen (falls persistent leer)
+        v37-R34 P16: Prioritaet umgekehrt — Radio-Buttons ZUERST lesen.
+        Was der User im UI sieht, ist der Modus, der laeuft.
+        Der persistente Wert dient nur als Fallback, falls die
+        Radio-Group nicht existiert.
         """
-        # 1. Persistenter Wert zuerst
-        val = getattr(self, "_hs_mode_value", None)
-        if val in self._hs_mode_keys:
-            return val
-        # 2. Buttons abfragen (mit RuntimeError-Schutz)
+        # 1. Radio-Buttons zuerst (User-Intention gewinnt)
         try:
             for key, rb in self.hs_mode_radios.items():
                 try:
@@ -70694,6 +73271,10 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                     continue
         except (RuntimeError, AttributeError):
             pass
+        # 2. Persistenter Wert als Fallback
+        val = getattr(self, "_hs_mode_value", None)
+        if val in self._hs_mode_keys:
+            return val
         # 3. Default
         self._hs_mode_value = "deauth"
         return "deauth"
@@ -70747,6 +73328,63 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             return
 
         mode = self._hs_current_mode()
+
+        # v37-R34 P27: PMKID-Preflight (VM + Chipset)
+        if mode in ("pmkid", "deauth+pmkid"):
+            _pf_blockers = []
+            _pf_hints = []
+            try:
+                _adv = WPSHardwareAdvisor()
+                _rep = _adv.analyze(iface)
+                if _rep.get("is_vm"):
+                    _pf_blockers.append(
+                        "VM erkannt (" + str(_rep.get("vm_type", "?"))
+                        + "): hcxdumptool laeuft in VMs nicht zuverlaessig."
+                    )
+                if _rep.get("rating") == "avoid":
+                    _pf_blockers.append(
+                        "Chipset " + str(_rep.get("chipset", "?"))
+                        + ": " + str(_rep.get("note", "nicht empfohlen"))
+                    )
+                for _b in _rep.get("blockers", []):
+                    if _b not in _pf_blockers:
+                        _pf_blockers.append(_b)
+                for _h in _rep.get("recommendations", [])[:2]:
+                    _pf_hints.append(_h)
+            except (NameError, AttributeError, OSError):
+                pass
+
+            if _pf_blockers:
+                _txt = "\n".join("- " + _b for _b in _pf_blockers)
+                _hint_txt = ""
+                if _pf_hints:
+                    _hint_txt = "\n\nEmpfehlung:\n" + "\n".join(
+                        "-> " + _h for _h in _pf_hints
+                    )
+                _ans = QMessageBox.warning(
+                    self,
+                    "PMKID-Vorwarnung",
+                    "PMKID-Capture mit hcxdumptool:\n\n"
+                    + _txt + _hint_txt
+                    + "\n\nDiagnose: python3 w.py --wps-hardware-guide"
+                    + "\n\nTrotzdem PMKID versuchen?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if _ans != QMessageBox.StandardButton.Yes:
+                    self._hs_log(
+                        "PMKID abgebrochen (Vorwarnung). Details: "
+                        "python3 w.py --wps-hardware-guide",
+                        "WARN",
+                    )
+                    return
+                self._hs_log(
+                    "PMKID trotz Warnung gestartet. Bei 'failed to arm "
+                    "interface': python3 w.py --wps-hardware-guide",
+                    "WARN",
+                )
+
         if mode in ("deauth", "deauth+pmkid"):
             reply = QMessageBox.question(
                 self,
@@ -70780,6 +73418,8 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             deauth_count=int(self.hs_deauth_spin.value()),
             rounds=5,
             timeout_per_round=20,
+            # v37-R34 P15b: PMKID/Deauth-Modus aus GUI uebernehmen
+            mode=str(mode),
             output_dir=AppKonstanten.CAPTURE_DIR,
         )
         self.hs_capture_thread.log_line.connect(self._hs_on_capture_log)
@@ -70921,36 +73561,215 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             self._hs_log(f"Ordner öffnen: {exc}", "ERR")
 
     def _hs_refresh_table(self) -> None:
-        """Aktualisiert Handshake-Tabelle aus DB."""
+        """v37-R34 P22b: Aktualisiert Tabelle aus HandshakeLibrary.
+
+        Quelle: SQLite-Tabelle handshake_library (nicht mehr der
+        Legacy-db_manager, der oft leer war).
+        """
         try:
             self.handshake_table.setRowCount(0)
-            db = getattr(self, "db_manager", None)
-            if db is None:
-                return
-            getter = getattr(db, "hole_handshakes", None)
-            if getter is None:
-                return
-            rows = getter() or []
-            for h in rows[:200]:
+        except (RuntimeError, AttributeError):
+            return
+
+        _rows = []
+        try:
+            _lib = HandshakeLibrary()
+            _rows = _lib.list_all() or []
+        except (NameError, AttributeError, OSError):
+            _rows = []
+
+        # v37-R34 P27: Filter anwenden
+        _filter_idx = 0
+        try:
+            if hasattr(self, "hs_hist_filter"):
+                _filter_idx = self.hs_hist_filter.currentIndex()
+        except (RuntimeError, AttributeError):
+            _filter_idx = 0
+
+        _total = len(_rows)
+        if _filter_idx == 1:
+            _rows = [r for r in _rows
+                     if str(r.get("status", "")) == "cracked"]
+        elif _filter_idx == 2:
+            _rows = [r for r in _rows
+                     if str(r.get("status", "")) == "captured"]
+        elif _filter_idx == 3:
+            _rows = [r for r in _rows
+                     if str(r.get("status", "")) == "failed"]
+
+        try:
+            if hasattr(self, "hs_hist_count"):
+                self.hs_hist_count.setText(
+                    "Zeige " + str(len(_rows)) + " von " + str(_total)
+                )
+        except (RuntimeError, AttributeError):
+            pass
+
+        for h in _rows[:200]:
+            try:
                 r = self.handshake_table.rowCount()
                 self.handshake_table.insertRow(r)
-                self.handshake_table.setItem(
-                    r, 0, QTableWidgetItem(str(h.get("ssid", "?")))
+
+                _ssid = str(h.get("ssid") or "?")
+                _bssid = str(h.get("bssid") or "?")
+                _ts = h.get("last_used") or h.get("first_seen") or 0
+                try:
+                    _time_s = (
+                        datetime.fromtimestamp(float(_ts)).strftime(
+                            "%Y-%m-%d %H:%M"
+                        ) if _ts else "—"
+                    )
+                except (ValueError, TypeError, OSError):
+                    _time_s = "—"
+
+                _status_raw = str(h.get("status") or "?")
+                _status_map = {
+                    "captured": "✅ erfasst",
+                    "cracked": "🔓 geknackt",
+                    "failed": "❌ fehlgeschlagen",
+                }
+                _status = _status_map.get(_status_raw, _status_raw)
+                _pwd = str(h.get("password") or "—")
+
+                # v37-R34 P22f: farbige Status-Markierung
+                self.handshake_table.setItem(r, 0, QTableWidgetItem(_ssid))
+                self.handshake_table.setItem(r, 1, QTableWidgetItem(_bssid))
+                self.handshake_table.setItem(r, 2, QTableWidgetItem(_time_s))
+
+                _status_item = QTableWidgetItem(_status)
+                if _status_raw == "cracked":
+                    _status_item.setForeground(QBrush(QColor(39, 174, 96)))
+                elif _status_raw == "failed":
+                    _status_item.setForeground(QBrush(QColor(231, 76, 60)))
+                elif _status_raw == "captured":
+                    _status_item.setForeground(QBrush(QColor(243, 156, 18)))
+                self.handshake_table.setItem(r, 3, _status_item)
+
+                _pwd_item = QTableWidgetItem(_pwd)
+                if _status_raw == "cracked" and _pwd not in ("—", "-", ""):
+                    _f = _pwd_item.font()
+                    _f.setBold(True)
+                    _pwd_item.setFont(_f)
+                    _pwd_item.setForeground(QBrush(QColor(39, 174, 96)))
+                self.handshake_table.setItem(r, 4, _pwd_item)
+            except (RuntimeError, AttributeError, TypeError):
+                continue
+
+        if not _rows:
+            self._hs_log(
+                "Bibliothek leer oder nicht verfuegbar.", "INFO"
+            )
+
+    # ── v37-R34 P22c: Bibliothek-Crosslink + Kontextmenue ─────────
+    def _hs_open_library_tab(self) -> None:
+        """Wechselt zum Handshake-Lib-Tab, falls vorhanden."""
+        try:
+            for i in range(self.tab_widget.count()):
+                _t = self.tab_widget.tabText(i)
+                if ("Handshake-Lib" in _t) or ("Bibliothek" in _t):
+                    self.tab_widget.setCurrentIndex(i)
+                    return
+            self._hs_log(
+                "Handshake-Lib-Tab nicht gefunden.", "WARN"
+            )
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _hs_hist_double_click(self, item) -> None:
+        """Doppelklick in Sektion H -> Bibliothek oeffnen."""
+        if item is None:
+            return
+        self._hs_open_library_tab()
+
+    def _hs_hist_context_menu(self, pos) -> None:
+        """Kontextmenue fuer Sektion-H-Tabelle."""
+        try:
+            if not hasattr(self, "handshake_table"):
+                return
+            row = self.handshake_table.rowAt(pos.y())
+            if row < 0:
+                return
+            _ssid_it = self.handshake_table.item(row, 0)
+            _bssid_it = self.handshake_table.item(row, 1)
+            _pwd_it = self.handshake_table.item(row, 4)
+            _ssid = _ssid_it.text().strip() if _ssid_it else ""
+            _bssid = _bssid_it.text().strip() if _bssid_it else ""
+            _pwd = _pwd_it.text().strip() if _pwd_it else ""
+
+            menu = QMenu(self)
+            act_copy_pwd = menu.addAction("🔓 Passwort kopieren")
+            act_copy_bssid = menu.addAction("📋 BSSID kopieren")
+            menu.addSeparator()
+            act_lib = menu.addAction("📚 In Bibliothek oeffnen")
+            act_target = menu.addAction("🎯 Als Handshake-Ziel uebernehmen")
+            menu.addSeparator()
+            act_del = menu.addAction("🗑 Aus Bibliothek entfernen")
+
+            act_copy_pwd.setEnabled(
+                bool(_pwd and _pwd not in ("—", "-", ""))
+            )
+
+            chosen = menu.exec(
+                self.handshake_table.viewport().mapToGlobal(pos)
+            )
+            if chosen is None:
+                return
+
+            if (chosen is act_copy_pwd
+                    and _pwd and _pwd not in ("—", "-", "")):
+                try:
+                    from PyQt6.QtWidgets import QApplication as _QApp
+                    _QApp.clipboard().setText(_pwd)
+                    self._hs_log("Passwort kopiert.", "OK")
+                except (ImportError, AttributeError, RuntimeError):
+                    pass
+            elif chosen is act_copy_bssid and _bssid:
+                try:
+                    from PyQt6.QtWidgets import QApplication as _QApp
+                    _QApp.clipboard().setText(_bssid)
+                    self._hs_log("BSSID kopiert: " + _bssid, "OK")
+                except (ImportError, AttributeError, RuntimeError):
+                    pass
+            elif chosen is act_lib:
+                self._hs_open_library_tab()
+            elif chosen is act_target and _bssid:
+                try:
+                    if hasattr(self, "hs_bssid_edit"):
+                        self.hs_bssid_edit.setText(_bssid)
+                    if hasattr(self, "hs_ssid_edit") and _ssid:
+                        self.hs_ssid_edit.setText(_ssid)
+                    self._hs_log(
+                        "Ziel uebernommen: " + _bssid, "OK"
+                    )
+                except (AttributeError, RuntimeError):
+                    pass
+            elif chosen is act_del and _bssid:
+                _ans = QMessageBox.question(
+                    self, "Eintrag loeschen",
+                    "Eintrag fuer " + _bssid + " aus der Bibliothek entfernen?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
                 )
-                self.handshake_table.setItem(
-                    r, 1, QTableWidgetItem(str(h.get("bssid", "?")))
-                )
-                self.handshake_table.setItem(
-                    r, 2, QTableWidgetItem(str(h.get("zeit", "")))
-                )
-                self.handshake_table.setItem(
-                    r, 3, QTableWidgetItem(str(h.get("status", "")))
-                )
-                self.handshake_table.setItem(
-                    r, 4, QTableWidgetItem(str(h.get("password", "—")))
-                )
-        except (AttributeError, RuntimeError, OSError) as exc:
-            self._hs_log(f"Historie laden: {exc}", "WARN")
+                if _ans == QMessageBox.StandardButton.Yes:
+                    try:
+                        _cap_file = None
+                        # v37-R34 P22c: cap_file aus HandshakeLibrary
+                        _lib = HandshakeLibrary()
+                        for _r in _lib.list_all():
+                            if str(_r.get("bssid", "")).lower() == _bssid.lower():
+                                _cap_file = _r.get("cap_file")
+                                break
+                        if _cap_file:
+                            _lib.delete(str(_cap_file))
+                            self._hs_log(
+                                "Geloescht: " + str(_cap_file), "OK"
+                            )
+                            self._hs_refresh_table()
+                    except (NameError, AttributeError, OSError) as _e:
+                        self._hs_log("Loeschen: " + str(_e), "WARN")
+        except (AttributeError, RuntimeError, TypeError):
+            pass
 
     def _hs_on_capture_log(self, msg: str, level: str) -> None:
         self._hs_log(msg, level)
@@ -70998,6 +73817,19 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         except (RuntimeError, AttributeError):
             pass
 
+        # v37-R34 P22a: persistent in HandshakeLibrary (SQLite)
+        try:
+            _bssid = self.hs_bssid_edit.text().strip()
+            _ssid = self.hs_ssid_edit.text().strip() or "?"
+            if _bssid and path:
+                _lib = HandshakeLibrary()
+                _lib.add_capture(_bssid, _ssid, str(path), eapol_count=4)
+                self._hs_log(
+                    "In Bibliothek gespeichert: " + Path(path).name, "OK"
+                )
+        except (NameError, AttributeError, OSError) as _e:
+            self._hs_log("Bibliothek-Speichern: " + str(_e), "WARN")
+
     def _hs_on_capture_failed(self, err: str) -> None:
         self.hs_btn_start.setEnabled(True)
         self.hs_btn_stop.setEnabled(False)
@@ -71014,6 +73846,24 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         QMessageBox.information(
             self, "Crack erfolgreich", f"Passwort gefunden:\n\n{pwd}"
         )
+        # v37-R34 P22b: Passwort persistent in HandshakeLibrary
+        try:
+            _cap = None
+            _thr = getattr(self, "hs_crack_thread", None)
+            if _thr is not None:
+                _cap = getattr(_thr, "hash_file", None)
+            if _cap:
+                _lib = HandshakeLibrary()
+                _lib.mark_cracked(str(_cap), str(pwd))
+                self._hs_log(
+                    "Crack in Bibliothek: " + Path(str(_cap)).name, "OK"
+                )
+        except (NameError, AttributeError, OSError) as _e:
+            self._hs_log("Bibliothek-Crack: " + str(_e), "WARN")
+        try:
+            self._hs_refresh_table()
+        except (RuntimeError, AttributeError):
+            pass
 
     def _hs_on_crack_failed(self, err: str) -> None:
         self.hs_btn_crack.setEnabled(True)
@@ -71484,6 +74334,83 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
     # ==================================================================
     # Tab: KI
     # ==================================================================
+    def _wrap_custom_prompt_focus_out(self, original):
+        """v37-R34 P41b: Focus-Out-Hook fuer Custom-Prompt-Save."""
+        def _handler(event):
+            try:
+                original(event)
+            finally:
+                self._on_ai_custom_prompt_changed()
+        return _handler
+
+    def _save_ollama_setting(self, key: str, value: Any) -> None:
+        """v37-R34 P41b: Ollama-Setting persistieren mit Feedback."""
+        try:
+            self.konfig_manager.set(
+                f"ai.{key}", value, save=True
+            )
+            try:
+                self.status_label.setText(
+                    f"💾 ai.{key} = {value}"
+                )
+            except (AttributeError, RuntimeError):
+                pass
+        except (OSError, ValueError, RuntimeError) as exc:
+            try:
+                self.status_label.setText(
+                    f"⚠ Speichern fehlgeschlagen: {exc}"
+                )
+            except (AttributeError, RuntimeError):
+                pass
+
+    def _on_ai_host_editing_finished(self) -> None:
+        """v37-R34 P41b: Host speichern bei Fokusverlust."""
+        try:
+            val = self.ai_host_edit.text().strip()
+            if val:
+                self._save_ollama_setting("ollama_host", val)
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _on_ai_model_changed(self, text: str) -> None:
+        """v37-R34 P41b/P51: Modell-Auswahl speichern."""
+        if not text:
+            return
+        if text.startswith(("Klick", "Keine", "Lade", "🤖")):
+            return
+        self._save_ollama_setting("ollama_model", text)
+
+    def _on_ai_cache_toggled(self, checked: bool) -> None:
+        """v37-R34 P41b: Cache-Toggle speichern."""
+        self._save_ollama_setting("ollama_cache_enabled", bool(checked))
+
+    def _on_ai_stream_toggled(self, checked: bool) -> None:
+        """v37-R34 P41b: Streaming-Toggle speichern."""
+        self._save_ollama_setting("ollama_streaming", bool(checked))
+
+    def _on_ai_custom_prompt_changed(self) -> None:
+        """v37-R34 P41b: Custom-Prompt speichern."""
+        try:
+            self.konfig_manager.set(
+                "ai.ollama_custom_prompt",
+                self.ai_custom_edit.toPlainText(),
+                save=True,
+            )
+        except (AttributeError, RuntimeError, OSError):
+            pass
+
+    def _on_ai_mode_changed(self, mode: str) -> None:
+        """v37-R34 P39a: Custom-Editor nur bei Modus custom."""
+        try:
+            self.ai_custom_group.setVisible(mode == "custom")
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            if mode:
+                self._save_ollama_setting("ollama_mode", mode)
+        except (AttributeError, RuntimeError):
+            pass
+
     def create_ai_analysis_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -71492,12 +74419,18 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         settings_layout = QFormLayout()
         self.ai_host_edit = QLineEdit()
         self.ai_host_edit.setText(
-            self.konfig_manager.get("ai.ollama_host", "http://192.168.6.99:11434")
+            self.konfig_manager.get("ai.ollama_host", DEFAULT_OLLAMA_HOST)
+        )
+        self.ai_host_edit.editingFinished.connect(
+            self._on_ai_host_editing_finished
         )
         settings_layout.addRow("Server:", self.ai_host_edit)
 
         self.ai_model_combo = QComboBox()
         self.ai_model_combo.addItem("Klick 'Modelle neu laden'")
+        self.ai_model_combo.currentTextChanged.connect(
+            self._on_ai_model_changed
+        )
         settings_layout.addRow("Modell:", self.ai_model_combo)
 
         # v8.1: Ollama-Test
@@ -71508,8 +74441,80 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         self.btn_refresh_models = QPushButton("🔄 Neu laden")
         self.btn_refresh_models.clicked.connect(self.load_ollama_models)
         settings_layout.addRow(self.btn_refresh_models)
+
+        # v37-R34 P39a: Analyse-Modus
+        self.ai_mode_combo = QComboBox()
+        for _m in OLLAMA_TEMPLATES:
+            self.ai_mode_combo.addItem(_m)
+        _saved_mode = self.konfig_manager.get(
+            "ai.ollama_mode", DEFAULT_OLLAMA_MODE
+        )
+        _idx = self.ai_mode_combo.findText(_saved_mode)
+        if _idx >= 0:
+            self.ai_mode_combo.setCurrentIndex(_idx)
+        self.ai_mode_combo.currentTextChanged.connect(
+            self._on_ai_mode_changed
+        )
+        settings_layout.addRow("Modus:", self.ai_mode_combo)
+
+        # v37-R34 P39a: Cache + Streaming Toggles
+        self.ai_cache_check = QCheckBox(
+            "Cache verwenden (TTL 15 Min)"
+        )
+        self.ai_cache_check.setChecked(
+            bool(
+                self.konfig_manager.get(
+                    "ai.ollama_cache_enabled", True
+                )
+            )
+        )
+        self.ai_cache_check.toggled.connect(
+            self._on_ai_cache_toggled
+        )
+        settings_layout.addRow(self.ai_cache_check)
+
+        self.ai_stream_check = QCheckBox("Streaming (Live-Ausgabe)")
+        self.ai_stream_check.setChecked(
+            bool(
+                self.konfig_manager.get(
+                    "ai.ollama_streaming", True
+                )
+            )
+        )
+        self.ai_stream_check.toggled.connect(
+            self._on_ai_stream_toggled
+        )
+        settings_layout.addRow(self.ai_stream_check)
+
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
+
+        # v37-R34 P39a: Custom-Prompt-Editor (nur Modus 'custom')
+        self.ai_custom_group = QGroupBox(
+            "Custom-Prompt (nur Modus custom)"
+        )
+        _cp_layout = QVBoxLayout(self.ai_custom_group)
+        self.ai_custom_edit = QPlainTextEdit()
+        self.ai_custom_edit.setPlaceholderText(
+            "Eigener Prompt. Wird nur bei Modus custom verwendet."
+        )
+        self.ai_custom_edit.setPlainText(
+            str(
+                self.konfig_manager.get(
+                    "ai.ollama_custom_prompt", ""
+                )
+            )
+        )
+        self.ai_custom_edit.setMaximumHeight(140)
+        self.ai_custom_edit.focusOutEvent = (
+            self._wrap_custom_prompt_focus_out(
+                self.ai_custom_edit.focusOutEvent
+            )
+        )
+        _cp_layout.addWidget(self.ai_custom_edit)
+        self.ai_custom_group.setVisible(False)
+        layout.addWidget(self.ai_custom_group)
+        self._on_ai_mode_changed(_saved_mode)
 
         self.btn_ai_analyze = QPushButton("🔍 Analysieren")
         self.btn_ai_analyze.clicked.connect(self.run_ai_analysis)
@@ -72668,6 +75673,16 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 data.setdefault("hidden", False)
                 data.setdefault("hersteller", "")
                 data.setdefault("standard", "802.11n")
+                # v37-R34 P14b: englische Scan-Keys auf deutsche
+                # Dataclass-Feldnamen mappen, sonst greift Default.
+                if "wps_active" in data and "wps_aktiv" not in data:
+                    data["wps_aktiv"] = bool(data["wps_active"])
+                if "wps" in data and "wps_aktiv" not in data:
+                    data["wps_aktiv"] = bool(data["wps"])
+                if "wps_locked" in data and "wps_lock" not in data:
+                    data["wps_lock"] = bool(data["wps_locked"])
+                if "wps_present" in data and "wps_aktiv" not in data:
+                    data["wps_aktiv"] = bool(data["wps_present"])
                 _valid = {f.name for f in fields(WLANNetzwerk)}
                 data = {k: v for k, v in data.items() if k in _valid}
                 netz = WLANNetzwerk(**data)
@@ -73962,15 +76977,16 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             cap_dir = AppKonstanten.CAPTURE_DIR
             cap_dir.mkdir(parents=True, exist_ok=True)
             out = cap_dir / ("pmkid_" + target.bssid.replace(":", "") + ".pcapng")
+            # v37-R34 P15d: hcxdumptool 7.x (--rds, Filter ohne ':')
             cmd = [
                 "hcxdumptool",
                 "-i",
                 base_iface,
-                "-o",
+                "-w",
                 str(out),
-                "--enable_status=1",
-                "--filtermode=2",
-                "--filterlist_ap=" + target.bssid,
+                "-t", "60",
+                "--filterlist_ap=" + target.bssid.replace(":", ""),
+                "--rds=1",
             ]
             _, _, _ = CommandRunner.run(
                 cmd,
@@ -74167,7 +77183,7 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
     # KI
     # ==================================================================
     def load_ollama_models(self):
-        host = self.ai_host_edit.text().strip() or "http://192.168.6.99:11434"
+        host = self.ai_host_edit.text().strip() or DEFAULT_OLLAMA_HOST
         self.ai_model_combo.clear()
         self.ai_model_combo.addItem("Lade ...")
         self.btn_refresh_models.setEnabled(False)
@@ -74184,11 +77200,16 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
 
     def _update_model_combo(self, models: list):
         self.btn_refresh_models.setEnabled(True)
-        self.ai_model_combo.clear()
-        if models:
-            self.ai_model_combo.addItems(models)
-        else:
-            self.ai_model_combo.addItem("Keine Modelle")
+        self.ai_model_combo.blockSignals(True)
+        try:
+            self.ai_model_combo.clear()
+            self.ai_model_combo.addItem("🤖 Auto (Router)")
+            if models:
+                self.ai_model_combo.addItems(models)
+            else:
+                self.ai_model_combo.addItem("Keine Modelle")
+        finally:
+            self.ai_model_combo.blockSignals(False)
 
     def _run_handshake_crack(self):
         """v8.3: Handshake-Crack-Pipeline."""
@@ -74301,19 +77322,34 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             QMessageBox.warning(self, "Keine Daten", "Erst einen Scan durchfuehren.")
             return
         try:
-            host = self.ai_host_edit.text().strip() or "http://192.168.6.99:11434"
+            host = self.ai_host_edit.text().strip() or DEFAULT_OLLAMA_HOST
         except (AttributeError, RuntimeError):
-            host = "http://192.168.6.99:11434"
-        model = "llama3.2"
+            host = DEFAULT_OLLAMA_HOST
+        model: str | None = None
         try:
-            model = self.ai_model_combo.currentText().strip() or "llama3.2"
-            if model.startswith(("Klick", "Keine", "Lade")):
-                QMessageBox.warning(
-                    self,
-                    "Kein Modell",
-                    "Bitte erst Modelle laden (Button 'Neu laden').",
-                )
-                return
+            _raw_model = self.ai_model_combo.currentText().strip()
+            if _raw_model and not _raw_model.startswith(
+                ("Klick", "Keine", "Lade", "🤖")
+            ):
+                model = _raw_model
+        except (AttributeError, RuntimeError):
+            pass
+
+        # v37-R34 P39a: Modus + Optionen aus Widgets
+        mode = DEFAULT_OLLAMA_MODE
+        custom_prompt = ""
+        streaming = True
+        cache_enabled = True
+        try:
+            mode = (
+                self.ai_mode_combo.currentText().strip()
+                or DEFAULT_OLLAMA_MODE
+            )
+            if mode not in OLLAMA_TEMPLATES:
+                mode = DEFAULT_OLLAMA_MODE
+            custom_prompt = self.ai_custom_edit.toPlainText()
+            streaming = self.ai_stream_check.isChecked()
+            cache_enabled = self.ai_cache_check.isChecked()
         except (AttributeError, RuntimeError):
             pass
 
@@ -74322,7 +77358,7 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 "Analysiere "
                 + str(len(self.aktuelle_netzwerke))
                 + " Netzwerke mit Modell '"
-                + model
+                + (model or "Auto (Router)")
                 + "' auf "
                 + host
                 + " ..."
@@ -74332,13 +77368,32 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 networks=self.aktuelle_netzwerke,
                 llm_host=host,
                 model=model,
-                timeout=120,
-                temperature=0.3,
-                max_tokens=1024,
+                timeout=self.konfig_manager.get(
+                    "ai.ollama_timeout", DEFAULT_OLLAMA_TIMEOUT
+                ),
+                temperature=self.konfig_manager.get(
+                    "ai.ollama_temperature",
+                    DEFAULT_OLLAMA_TEMPERATURE,
+                ),
+                max_tokens=self.konfig_manager.get(
+                    "ai.ollama_max_tokens",
+                    DEFAULT_OLLAMA_MAX_TOKENS,
+                ),
+                num_ctx=self.konfig_manager.get(
+                    "ai.ollama_num_ctx", DEFAULT_OLLAMA_NUM_CTX
+                ),
+                mode=mode,
+                custom_prompt=custom_prompt,
+                streaming=streaming,
+                cache_enabled=cache_enabled,
+                cache_ttl=self.konfig_manager.get(
+                    "ai.ollama_cache_ttl", OLLAMA_CACHE_TTL_DEFAULT
+                ),
             )
             self.ai_thread.finished.connect(self._on_ai_finished)
             self.ai_thread.error.connect(self._on_ai_error)
             self.ai_thread.progress.connect(self._on_ai_progress)
+            self.ai_thread.token_received.connect(self._on_ai_token)
             self.ai_thread.start()
         except (AttributeError, RuntimeError, ValueError) as e:
             self.ai_result_text.setPlainText("Fehler: " + str(e))
@@ -74346,6 +77401,20 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 self.btn_ai_analyze.setEnabled(True)
             except (AttributeError, RuntimeError):
                 pass
+
+    def _on_ai_token(self, chunk: str):
+        """v37-R34 P37: Live-Stream-Chunk an Textfeld anhaengen."""
+        try:
+            if not chunk:
+                return
+            cursor = self.ai_result_text.textCursor()
+            cursor.movePosition(
+                QTextCursor.MoveOperation.End
+            )
+            self.ai_result_text.setTextCursor(cursor)
+            self.ai_result_text.insertPlainText(chunk)
+        except (AttributeError, RuntimeError):
+            pass
 
     def _on_ai_finished(self, text: str):
         try:
@@ -77683,6 +80752,18 @@ def main() -> int:
         help="P9.4: Antennen-Empfehlung fuer Adapter (mit --hw-antenna)",
     )
     parser.add_argument(
+        "--ollama-config",
+        metavar="ACTION",
+        nargs="?",
+        const="show",
+        default="",
+        help=(
+            "v37-R34 P34b/P51: Ollama-Config. "
+            "show | set,num_ctx=32768 | test,host:11434 | "
+            "router_show | router_set,MODE=MODEL | router_clear"
+        ),
+    )
+    parser.add_argument(
         "--hw-compare", metavar="IDS", help="v37-R16: Vergleich mehrerer Adapter"
     )
     parser.add_argument(
@@ -78036,6 +81117,14 @@ def main() -> int:
     parser.add_argument(
         "--scan-live-log", metavar="FILE",
         help="v38: Optionales Logfile (TSV: ts,bssid,signal,ssid,ch,enc)",
+    )
+    parser.add_argument(
+        "--wps-hardware-guide", action="store_true",
+        help="WPS/PMKID Hardware-Kompatibilitaets-Report ausgeben",
+    )
+    parser.add_argument(
+        "--db-info", action="store_true",
+        help="Zeigt alle Datenbanken mit Pfad und Row-Counts",
     )
     parser.add_argument(
         "--watchlist-list", action="store_true",
@@ -78460,6 +81549,8 @@ def main() -> int:
             ),
         ),
         ("watchlist_list", lambda a: _watchlist_list_cli()),
+        ("wps_hardware_guide", lambda a: _wps_hardware_guide_cli()),
+        ("db_info", lambda a: _db_info_cli()),
         (
             "watchlist_add",
             lambda a: _watchlist_add_cli(
@@ -78535,6 +81626,12 @@ def main() -> int:
             "fritz_hosts",
             lambda a: _fritz_hosts_cli(
                 host=a.fritz_host, user=a.fritz_user, password=a.fritz_pass
+            ),
+        ),
+        (
+            "ollama_config",
+            lambda a: _ollama_config_cli(
+                getattr(a, "ollama_config", "") or "show"
             ),
         ),
     ]
@@ -80674,6 +83771,160 @@ class USBPerfTuner:
         for k, target in cls.SYSCTLS.items():
             lines.append(f"  {k:<32} = {cur.get(k,'?'):<10} (Ziel: {target})")
         return "\n".join(lines)
+
+
+def _wps_hardware_guide_cli(iface: str = "") -> int:
+    """v37-R34 P18c: --wps-hardware-guide - Hardware-Report."""
+    if not iface:
+        try:
+            _ifs = []
+            rc, out, _ = CommandRunner.run(
+                ["iw", "dev"], subsystem="driver",
+                tag="hw-guide", soft_fail=True, timeout=5,
+            )
+            for line in (out or "").splitlines():
+                if line.strip().startswith("Interface "):
+                    _ifs.append(line.strip().split(" ", 1)[1])
+            if not _ifs:
+                print("Keine WLAN-Interfaces gefunden.")
+                return 1
+            iface = _ifs[0]
+        except (NameError, AttributeError, OSError) as exc:
+            print("Interface-Erkennung fehlgeschlagen: " + str(exc))
+            return 1
+    try:
+        _adv = WPSHardwareAdvisor()
+        print(_adv.render_report(iface))
+    except (NameError, AttributeError, OSError) as exc:
+        print("Analyse fehlgeschlagen: " + str(exc))
+        return 1
+    return 0
+
+
+def _db_info_cli() -> int:
+    """v37-R34 P32: --db-info - Diagnose aller Datenbanken."""
+    import sqlite3 as _sq
+
+    def _user_home():
+        _su = os.environ.get("SUDO_USER", "").strip()
+        if _su and hasattr(os, "geteuid") and os.geteuid() == 0:
+            _cand = Path(f"/home/{_su}")
+            if _cand.is_dir():
+                return _cand
+        return Path.home()
+
+    _home = _user_home()
+    _dirs = [
+        ("user", _home / ".wlan_ultimate"),
+        ("root", Path("/root/.wlan_ultimate")),
+    ]
+
+    print("=" * 68)
+    print("  DATENBANK-DIAGNOSE")
+    print("=" * 68)
+    print("User-Home:  " + str(_home))
+    print("KONFIG_DIR: " + str(_home / ".wlan_ultimate"))
+    print()
+
+    # v37-R34 P33: (Dateiname, Label, Rolle, Tabellen)
+    _checks = [
+        ("store.db", "CentralStore", "Timeline / Historie",
+         ["networks", "clients", "handshake_library", "events"]),
+        ("wlan_ultimate.sqlite", "Legacy DBM", "Netzwerk-Details",
+         ["netzwerke", "clients", "handshakes"]),
+    ]
+
+    for _ctx, _d in _dirs:
+        print("-" * 68)
+        print("[" + _ctx + "] " + str(_d))
+        print("-" * 68)
+        # v37-R34 P32b: PermissionError bei /root/ abfangen
+        _accessible = True
+        try:
+            if not _d.exists():
+                print("  (nicht vorhanden)")
+                _accessible = False
+        except (PermissionError, OSError):
+            _accessible = False
+        if not _accessible:
+            if _ctx == "root":
+                print("  (nicht lesbar ohne sudo - mit 'sudo python3 w.py"
+                      " --db-info' erneut versuchen)")
+            print()
+            continue
+
+        _found_any = False
+        for _fname, _label, _role, _tables in _checks:
+            _f = _d / _fname
+            try:
+                if not _f.is_file():
+                    continue
+            except (PermissionError, OSError):
+                continue
+            _found_any = True
+            try:
+                _sz = _f.stat().st_size
+                print("  " + _fname + " (" + _label + ")  "
+                      + f"{_sz/1024:.1f}" + " KB")
+                print("    Rolle: " + _role)
+            except OSError:
+                continue
+            _n_cols = 0
+            try:
+                _conn = _sq.connect(str(_f), timeout=2.0)
+                _cur = _conn.execute("SELECT name FROM sqlite_master "
+                                     "WHERE type='table'")
+                _all_tables = [r[0] for r in _cur.fetchall()]
+                # Spalten-Zaehler aus erster vorhandener Tabelle
+                for _tbl in _tables:
+                    if _tbl in _all_tables:
+                        _cur = _conn.execute(
+                            "PRAGMA table_info(" + _tbl + ")"
+                        )
+                        _n_cols = len(_cur.fetchall())
+                        break
+                _conn.close()
+            except (_sq.DatabaseError, _sq.OperationalError, OSError):
+                pass
+            if _n_cols:
+                print("    Spalten (erste Tabelle): " + str(_n_cols))
+            for _tbl in _tables:
+                try:
+                    _conn = _sq.connect(str(_f), timeout=2.0)
+                    _cur = _conn.execute(
+                        "SELECT COUNT(*) FROM " + _tbl
+                    )
+                    _n = _cur.fetchone()[0]
+                    _conn.close()
+                    print("    " + _tbl + ": " + str(_n))
+                except (_sq.DatabaseError, _sq.OperationalError, OSError):
+                    pass
+        if not _found_any:
+            print("  (keine DB-Dateien gefunden)")
+        print()
+
+    print("=" * 68)
+    print("ARCHITEKTUR-HINWEIS")
+    print("=" * 68)
+    print("Diese Suite nutzt ZWEI Datenbanken mit unterschiedlichen")
+    print("Aufgaben - kein Bug, sondern Design:")
+    print("")
+    print("  Legacy (wlan_ultimate.sqlite)  -> Netzwerk-Details")
+    print("    - 41 Spalten: WPS-Modell, Frequenz, Hersteller, Tags,")
+    print("      Bewertung, Standort")
+    print("    - Quelle fuer Netzwerke-Tab (lade_daten)")
+    print("")
+    print("  CentralStore (store.db)        -> Timeline / Historie")
+    print("    - Clients mit RSSI-History, Probe-Requests")
+    print("    - Handshakes (handshake_library)")
+    print("    - Events (wps_scan, wps_attack_*)")
+    print("    - Traffic-Flows, FritzBox-Geraete, Ports")
+    print("")
+    print("Beide DBs werden parallel beschrieben (Scan-Ergebnis wird")
+    print("in beide geschrieben). Kein Datenverlust, keine Migration")
+    print("erforderlich. Aktive Pflege: siehe SelfTest 'Legacy-DB'.")
+    print("=" * 68)
+    return 0
 
 
 def _watchlist_list_cli() -> int:
@@ -88273,6 +91524,145 @@ def _hw_advisor_cli(compare_id: str = "") -> int:
     audit = HardwareAdvisor.audit()
     print(HardwareAdvisor.format_audit(audit))
     return 0
+
+
+def _ollama_config_cli(action: str = "show") -> int:
+    """v37-R34 P34b/c: --ollama-config [show|set KEY=VALUE|test [HOST]].
+
+    Trenner: Leerzeichen (gequotet) ODER Komma.
+      --ollama-config "set num_ctx=32768"
+      --ollama-config set,num_ctx=32768
+    """
+    _key_map: dict[str, tuple[str, type]] = {
+        "host": ("ai.ollama_host", str),
+        "model": ("ai.ollama_model", str),
+        "num_ctx": ("ai.ollama_num_ctx", int),
+        "max_tokens": ("ai.ollama_max_tokens", int),
+        "temperature": ("ai.ollama_temperature", float),
+        "timeout": ("ai.ollama_timeout", int),
+    }
+
+    try:
+        km = KonfigurationsManager()
+    except (OSError, ValueError, RuntimeError, TypeError) as exc:
+        print(f"KonfigurationsManager nicht verfuegbar: {exc}", file=sys.stderr)
+        return 1
+
+    raw = (action or "show").strip().replace(",", " ")
+    parts = raw.split(None, 1)
+    cmd = parts[0] if parts else "show"
+
+    if cmd in ("", "show"):
+        print("=" * 60)
+        print("  Ollama-Konfiguration (ai.*)")
+        print("=" * 60)
+        for key, (cfg_path, _cast) in _key_map.items():
+            val = km.get(cfg_path, "(nicht gesetzt)")
+            print(f"  {key:12s} = {val}")
+        return 0
+
+    if cmd == "set":
+        if len(parts) < 2 or "=" not in parts[1]:
+            print("Syntax: --ollama-config set KEY=VALUE", file=sys.stderr)
+            print(f"Keys: {', '.join(_key_map)}", file=sys.stderr)
+            return 1
+        raw_key, raw_val = parts[1].split("=", 1)
+        raw_key = raw_key.strip().removeprefix("ollama_")
+        if raw_key not in _key_map:
+            print(f"Unbekannter Key: {raw_key}", file=sys.stderr)
+            print(f"Erlaubt: {', '.join(_key_map)}", file=sys.stderr)
+            return 1
+        cfg_path, cast = _key_map[raw_key]
+        try:
+            val = cast(raw_val.strip())
+        except (ValueError, TypeError) as exc:
+            print(
+                f"Wert '{raw_val}' ungueltig fuer {raw_key}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        km.set(cfg_path, val, save=True)
+        print(f"Gesetzt: {cfg_path} = {val!r}")
+        return 0
+
+    if cmd == "test":
+        if len(parts) > 1:
+            host = parts[1].strip()
+        else:
+            host = km.get("ai.ollama_host", DEFAULT_OLLAMA_HOST)
+        print(f"Teste Ollama: {host}")
+        try:
+            client = OllamaClient(host=host, timeout=10)
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Client-Fehler: {exc}", file=sys.stderr)
+            return 1
+        if not client.is_available():
+            print("Status: NICHT erreichbar", file=sys.stderr)
+            return 1
+        print("Status: OK")
+        try:
+            models = client.get_models()
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Modell-Abfrage fehlgeschlagen: {exc}", file=sys.stderr)
+            return 1
+        print(f"Modelle ({len(models)}):")
+        for m in models[:20]:
+            print(f"  - {m}")
+        return 0
+
+    if cmd == "router_show":
+        router = km.get(
+            "ai.ollama_model_router", DEFAULT_OLLAMA_MODEL_ROUTER
+        )
+        if not isinstance(router, dict):
+            print("(Router ist kein dict)", file=sys.stderr)
+            return 1
+        print("=" * 60)
+        print("  Ollama-Modell-Router (ai.ollama_model_router)")
+        print("=" * 60)
+        for m, mdl in sorted(router.items()):
+            print(f"  {m:14s} -> {mdl}")
+        return 0
+
+    if cmd == "router_set":
+        if len(parts) < 2 or "=" not in parts[1]:
+            print(
+                "Syntax: --ollama-config router_set,MODE=MODEL",
+                file=sys.stderr,
+            )
+            return 1
+        mode_key, mode_model = parts[1].split("=", 1)
+        mode_key = mode_key.strip()
+        mode_model = mode_model.strip()
+        if not mode_key or not mode_model:
+            print("MODE und MODEL erforderlich", file=sys.stderr)
+            return 1
+        _r = km.get(
+            "ai.ollama_model_router", DEFAULT_OLLAMA_MODEL_ROUTER
+        )
+        if not isinstance(_r, dict):
+            _r = {}
+        _r = dict(_r)
+        _r[mode_key] = mode_model
+        km.set("ai.ollama_model_router", _r, save=True)
+        print(f"Router[{mode_key}] = {mode_model}")
+        return 0
+
+    if cmd == "router_clear":
+        km.set(
+            "ai.ollama_model_router",
+            dict(DEFAULT_OLLAMA_MODEL_ROUTER),
+            save=True,
+        )
+        print("Router auf Default zurueckgesetzt")
+        return 0
+
+    print(f"Unbekannte Aktion: {cmd}", file=sys.stderr)
+    print(
+        "Verwendung: --ollama-config [show|set KEY=VALUE|test [HOST]]",
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _hw_catalog_cli(filter_str: str = "") -> int:
