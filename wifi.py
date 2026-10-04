@@ -2249,6 +2249,58 @@ OLLAMA_TEMPLATES["pentest"]["header"] += OLLAMA_BYPASS_INSTRUCTIONS
 OLLAMA_TEMPLATES["pentest"]["output"] += OLLAMA_PENTEST_BYPASS_OUTPUT
 
 
+# v37-R34 P53: patch_gen — KI schreibt strukturierte Patch-Vorschlaege
+OLLAMA_TEMPLATES["patch_gen"] = {
+    "header": (
+        "ROLLE: Patch-Generator fuer wlan-ultimate (w.py).\n"
+        "\n"
+        "AUFGABE: Du erhaeltst den Bericht einer code_audit-Analyse. "
+        "Der Bericht listet aktive Findings. Fuer JEDES aktive Finding "
+        "gibst du einen konkreten Patch-Vorschlag als JSON zurueck.\n"
+        "\n"
+        "WICHTIG:\n"
+        "- Kein Prosa-Text. Nur JSON.\n"
+        "- Keine Erklaerungen ausserhalb des JSON.\n"
+        "- Keine Modularisierung, kein DebugManager-Ersatz.\n"
+        "- Anker muss ein EINMALIGER String in w.py sein.\n"
+    ),
+    "output": (
+        "\n=== AUSGABE-FORMAT (EXAKT, NUR JSON) ===\n"
+        "\n"
+        "{\n"
+        '  "patches": [\n'
+        "    {\n"
+        '      "finding": "NAME des Findings",\n'
+        '      "anchor": "einmaliger code-string (max 200 Zeichen)",\n'
+        '      "replacement": "was den Anker ersetzt",\n'
+        '      "rationale": "kurz: warum das den Zustand verbessert",\n'
+        '      "risk": "low|medium|high"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "\n"
+        "REGELN (PFLICHT):\n"
+        "- Pro aktivem Finding GENAU EIN Patch-Objekt.\n"
+        "- Wenn ein Finding ein Umgebungs-/Config-Thema ist "
+        "(Nicht-root, Speicher, TX-Power, fehlende Tools): "
+        "schlage einen GUARD-CHECK oder WARNING-PATCH vor, "
+        "NICHT leer lassen. Beispiel: zusaetzliche Warnung im "
+        "Report, expliziter Check im Code, Auto-Log-Eintrag.\n"
+        "- Anker NICHT aus der Liste 'BENUTZTE ANKER'.\n"
+        "- Anker MUSS ein TATSAECHLICHER CODE-STRING aus w.py "
+        "sein, den man 1:1 per Text-Suche findet.\n"
+        "  Beispiele: 'def run(self):', 'self.model = model',\n"
+        "  'class AnchorRegistry:', 'OLLAMA_TEMPLATES = {'.\n"
+        "  VERBOTEN: Zeilennummern (w.py:299), Dateipfade, "
+        "file:line-Format.\n"
+        "- Replacement darf nicht leer sein.\n"
+        "- Bei Unsicherheit: risk='high', aber trotzdem Vorschlag.\n"
+        "- NIEMALS patches=[] zurueckgeben, wenn der Report "
+        "aktive Findings enthaelt.\n"
+    ),
+}
+
+
 OLLAMA_PROJECT_CONVENTIONS = (
     "PROJEKT-KONVENTIONEN (STRIKT, NICHT IGNORIEREN):\n"
     "\n"
@@ -2293,6 +2345,464 @@ OLLAMA_PROJECT_CONVENTIONS = (
 )
 
 
+
+
+class OllamaMemory:
+    """v37-R34 P52: Persistente Session-Memory fuer KI-Analysen.
+
+    Speichert Analyse-Historie in ~/.wlan_ultimate/cache/ollama/memory.json.
+    Erkennt bereits analysierte Reports (per Hash) und warnt vor
+    Dupletten-Vorschlaegen.
+    """
+
+    VERSION = 1
+    MAX_ENTRIES = 100
+    HEAD_CHARS = 200
+
+    @staticmethod
+    def _path() -> Path:
+        cache_dir = AppKonstanten.CACHE_DIR / "ollama"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir / "memory.json"
+
+    @classmethod
+    def _empty(cls) -> dict:
+        return {"version": cls.VERSION, "entries": []}
+
+    @classmethod
+    def load(cls) -> list:
+        """Liest Memory-Eintraege; bei Fehler leere Liste."""
+        try:
+            path = cls._path()
+            if not path.exists():
+                return []
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return []
+            entries = data.get("entries", [])
+            if not isinstance(entries, list):
+                return []
+            return [e for e in entries if isinstance(e, dict)]
+        except (OSError, ValueError, TypeError, KeyError):
+            return []
+
+    @classmethod
+    def save(cls, entries: list) -> None:
+        """Schreibt Memory; FIFO-Truncate auf MAX_ENTRIES."""
+        try:
+            if len(entries) > cls.MAX_ENTRIES:
+                entries = entries[-cls.MAX_ENTRIES:]
+            path = cls._path()
+            data = {"version": cls.VERSION, "entries": entries}
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except (OSError, ValueError, TypeError):
+            pass
+
+    @staticmethod
+    def hash_report(text: str) -> str:
+        """SHA256 des Report-Texts (normalisiert)."""
+        if not text:
+            return ""
+        norm = " ".join(text.split())
+        return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
+
+    @classmethod
+    def record(cls, report_hash: str, mode: str, model: str,
+               result: str, applied: bool = True) -> None:
+        """Speichert eine Analyse in der Memory."""
+        if not report_hash:
+            return
+        entries = cls.load()
+        entries = [
+            e for e in entries
+            if not (e.get("report_hash") == report_hash
+                    and e.get("mode") == mode)
+        ]
+        result = result or ""
+        entry = {
+            "ts": time.time(),
+            "report_hash": report_hash,
+            "mode": mode,
+            "model": model,
+            "result_len": len(result),
+            "result_head": result[: cls.HEAD_CHARS],
+            "findings_count": result.count("\n- ") + result.count("\n## "),
+            "applied": bool(applied),
+        }
+        entries.append(entry)
+        cls.save(entries)
+
+    @classmethod
+    def lookup(cls, report_hash: str):
+        """Findet den letzten Eintrag zu einem Report-Hash."""
+        if not report_hash:
+            return None
+        for e in reversed(cls.load()):
+            if e.get("report_hash") == report_hash:
+                return e
+        return None
+
+    @classmethod
+    def format_recent(cls, limit: int = 10) -> str:
+        """Markdown-Block der letzten N Eintraege."""
+        entries = cls.load()
+        lines = ["## memory (letzte Analysen)"]
+        if not entries:
+            lines.append("(keine Eintraege)")
+            return "\n".join(lines)
+        for e in entries[-limit:]:
+            ts = e.get("ts", 0)
+            try:
+                from datetime import datetime as _dt
+                when = _dt.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+            except (ValueError, TypeError, OSError):
+                when = "?"
+            lines.append(
+                f"  [{when}] {e.get('mode', '?')} "
+                f"(model={e.get('model', '?')}, "
+                f"hash={e.get('report_hash', '?')}, "
+                f"applied={e.get('applied', '?')})"
+            )
+            head = (e.get("result_head") or "").strip().replace("\n", " ")
+            if head:
+                lines.append(f"      -> {head[:120]}")
+        return "\n".join(lines)
+
+    @classmethod
+    def clear(cls) -> None:
+        """Loescht alle Memory-Eintraege."""
+        cls.save([])
+
+
+
+
+def _lrv_classify_line(content: str) -> str:
+    """v37-R34 P58: Klassifiziert eine Code-Zeile.
+
+    Rueckgabe: 'definition' | 'usage/other' | 'control' | 'import'
+             | 'decorator' | 'comment/empty'.
+    """
+    s = content.strip()
+    if not s or s.startswith("#"):
+        return "comment/empty"
+    if s.startswith(("class ", "def ", "async def ")):
+        return "definition"
+    # X: TYPE = ... (Modul- oder Klassen-Level)
+    if re.match(r"^[A-Za-z_]\w*\s*:\s*\w.*=", s):
+        # v37-R34 P58d: Kwargs sind keine Definitionen
+        if content.rstrip().endswith((",", ")", "]")):
+            return "usage/other"
+        return "definition"
+    # X = ... (Modul-Level)
+    if re.match(r"^[A-Za-z_]\w*\s*=\s*", s):
+        # v37-R34 P58d: Kwargs sind keine Definitionen
+        if content.rstrip().endswith((",", ")", "]")):
+            return "usage/other"
+        return "definition"
+    # Eingerueckt: self.X: TYPE = ... / X: TYPE = ...
+    if re.match(r"^\s+[A-Za-z_]\w*\s*:\s*\w.*=", content):
+        return "definition"
+    # Eingerueckt: self.X = ... / cls.X = ... (haeufigste Form!)
+    if re.match(r"^\s+(self|cls)\.[A-Za-z_]\w*\s*(:[^=]+)?=\s*", content):
+        # v37-R34 P58d: Kwargs sind keine Definitionen
+        if content.rstrip().endswith((",", ")", "]")):
+            return "usage/other"
+        return "definition"
+    # Eingerueckt: X = ... (lokale Variablen)
+    if re.match(r"^\s+[A-Za-z_]\w*\s*=\s*", content):
+        # v37-R34 P58c: Kwargs (NAME=...,) sind keine Definitionen
+        if content.rstrip().endswith((",", ")", "]")):
+            return "usage/other"
+        return "definition"
+    if re.match(r"^\s*(return|yield|raise|pass|continue|break)\b", s):
+        return "control"
+    if re.match(r"^\s*(import|from)\s+", s):
+        return "import"
+    if re.match(r"^\s*@\w+", s):
+        return "decorator"
+    return "usage/other"
+
+
+def _lrv_verify_report(report: str, wfile: Path = Path("w.py")) -> tuple:
+    """v37-R34 P58: Line-Reference Verification.
+
+    Extrahiert Zeilenverweise ('Zeile N', 'Z. N', 'line N') aus dem
+    KI-Report, liest die tatsaechliche Zeile aus w.py und haengt einen
+    Verifikations-Anhang an.
+
+    Rueckgabe: (verifizierter_report: str, stats: dict)
+    """
+    stats = {"total": 0, "verified": 0, "missing": 0, "definitions": 0}
+    if not report:
+        return report, stats
+
+    patterns = (
+        r"[Zz]eile\s+(\d+)",
+        r"[Zz]eilen\s+(\d+)",
+        r"\bZ\.\s*(\d+)",
+        r"\bline\s+(\d+)",
+        r"[Zz]eilennummern?\s*:?\s*(\d+)",
+    )
+    nums: list = []
+    seen: set = set()
+    for pat in patterns:
+        for m in re.finditer(pat, report):
+            try:
+                n = int(m.group(1))
+            except (ValueError, IndexError):
+                continue
+            if n > 0 and n not in seen:
+                seen.add(n)
+                nums.append(n)
+
+    # v37-R34 P58b: Bare-Number-Listen nach "Zeilen:"/"Zeile:"-Labels
+    # erkennen (KI-Format: "- 299\n- 383\n- 2956").
+    list_ctx = re.compile(
+        r"(?:Zeilen?|Lines?|Relevante\s+Zeilen)\**\s*:\**\s*\n"
+        r"((?:\s*[-*]\s*\d+\s*\n?)+)",
+        re.IGNORECASE,
+    )
+    for block in list_ctx.finditer(report):
+        for num_m in re.finditer(r"\d+", block.group(1)):
+            try:
+                n = int(num_m.group(0))
+            except ValueError:
+                continue
+            if n > 0 and n not in seen:
+                seen.add(n)
+                nums.append(n)
+
+    # v37-R34 P59a: Komma-separierte Liste direkt nach "Zeilen:" bis EOL
+    # (KI-Format: "**Zeilen:** 299, 3001, 3004, 3010").
+    inline_ctx = re.compile(
+        r"(?:Zeilen?|Lines?|Zeilennummern?)\**\s*:\**\s*"
+        r"((?:\d+\s*,\s*)*\d+)",
+        re.IGNORECASE,
+    )
+    for block in inline_ctx.finditer(report):
+        for num_m in re.finditer(r"\d+", block.group(1)):
+            try:
+                n = int(num_m.group(0))
+            except ValueError:
+                continue
+            if n > 0 and n not in seen:
+                seen.add(n)
+                nums.append(n)
+
+    stats["total"] = len(nums)
+    if not nums:
+        # v37-R34 P58b: Signal, wenn KI Zeilenverweise behauptet,
+        # aber Format nicht maschinenlesbar ist.
+        if re.search(r"Zeilen?|Lines?", report, re.IGNORECASE):
+            annex = (
+                "\n---\n"
+                "## Anhang: Zeilen-Verifikation (LRV, P58b)\n"
+                "\n"
+                "**HINWEIS:** Der Report enthaelt Zeilenverweise, aber "
+                "keine maschinenlesbaren ('Zeile N' oder Liste nach "
+                "'Zeilen:'). LRV konnte nichts pruefen.\n"
+                "Format wuenschenswert: 'Zeile 299' direkt im Text.\n"
+            )
+            return report + annex, stats
+        return report, stats
+
+    try:
+        src_lines = wfile.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return report, stats
+
+    max_line = len(src_lines)
+    annex: list = [
+        "",
+        "---",
+        "## Anhang: Zeilen-Verifikation (LRV, P58)",
+        "",
+    ]
+    for n in sorted(nums):
+        if 1 <= n <= max_line:
+            content = src_lines[n - 1].rstrip()
+            kind = _lrv_classify_line(content)
+            annex.append(f"- Zeile {n} [{kind}]: `{content[:120]}`")
+            stats["verified"] += 1
+            if kind == "definition":
+                stats["definitions"] += 1
+        else:
+            annex.append(
+                f"- Zeile {n}: (ausserhalb w.py, max {max_line})"
+            )
+            stats["missing"] += 1
+    annex.append("")
+    return report + "\n".join(annex), stats
+
+
+
+
+def _enforce_consistency(report: str) -> tuple:
+    """v37-R34 P59b: Entfernt Findings aus Sektion 3, die auch in Sektion 4 stehen.
+
+    Erkennt:
+      ## 3. Warnungen AKTIV ...
+      ## 4. Bereits behoben ...
+
+    Innerhalb der Sektionen werden Finding-Header nach den Mustern
+    '### NAME', '**NAME**' oder '- **NAME**' erkannt. Taucht derselbe
+    Name in beiden Sektionen auf, wird er in Sektion 3 durch einen
+    Hinweis ersetzt. Rueckgabe: (neuer_report, n_moves).
+    """
+    if not report or "## 3." not in report or "## 4." not in report:
+        return report, 0
+
+    sec3_pat = re.compile(
+        r"(##\s*3\.[^\n]*\n)(.*?)(?=##\s*4\.|$)",
+        re.DOTALL,
+    )
+    sec4_pat = re.compile(
+        r"(##\s*4\.[^\n]*\n)(.*?)(?=##\s*5\.|$)",
+        re.DOTALL,
+    )
+    m3 = sec3_pat.search(report)
+    m4 = sec4_pat.search(report)
+    if not m3 or not m4:
+        return report, 0
+
+    sec3_body = m3.group(2)
+    sec4_body = m4.group(2)
+
+    def _extract_names(body: str) -> set:
+        names: set = set()
+        # ### NAME
+        for m in re.finditer(r"^###\s+([A-Za-z_][\w.]*)", body, re.MULTILINE):
+            names.add(m.group(1))
+        # **NAME** oder **NAME:**
+        for m in re.finditer(r"\*\*([A-Za-z_][\w.]*)\*\*", body):
+            names.add(m.group(1))
+        # - `NAME` (Backtick)
+        for m in re.finditer(r"`([A-Za-z_][\w.]*)`", body):
+            names.add(m.group(1))
+        return names
+
+    names3 = _extract_names(sec3_body)
+    names4 = _extract_names(sec4_body)
+    overlap = names3 & names4
+    # Modul-Standardbegriffe ausfiltern
+    overlap.discard("FAIL")
+    overlap.discard("WARN")
+    overlap.discard("INFO")
+    if not overlap:
+        return report, 0
+
+    new3_body = sec3_body
+    moved = 0
+    for name in sorted(overlap):
+        # Finde den Finding-Block in Sektion 3: ### NAME ... bis naechster ###
+        # oder bis Ende
+        block_pat = re.compile(
+            rf"^###\s+{re.escape(name)}\s*\n"
+            rf"(?:.*?)(?=^###\s|\Z)",
+            re.MULTILINE | re.DOTALL,
+        )
+        if block_pat.search(new3_body):
+            new3_body = block_pat.sub(
+                f"### {name}\n"
+                f"*(nach Sektion 4 verschoben — "
+                f"Konsistenz-Regel P59b)*\n\n",
+                new3_body,
+                count=1,
+            )
+            moved += 1
+            continue
+        # Alternative 1: Bullet-Zeile "- **NAME**" entfernen
+        bullet_pat = re.compile(
+            rf"^\s*-\s*\*\*{re.escape(name)}\*\*[^\n]*\n",
+            re.MULTILINE,
+        )
+        if bullet_pat.search(new3_body):
+            new3_body = bullet_pat.sub(
+                f"- **{name}**: (nach Sektion 4 verschoben)\n",
+                new3_body,
+                count=1,
+            )
+            moved += 1
+            continue
+        # Alternative 2: Bullet "- `NAME`" (Backtick) entfernen
+        tick_pat = re.compile(
+            rf"^\s*-\s*`{re.escape(name)}`[^\n]*\n",
+            re.MULTILINE,
+        )
+        if tick_pat.search(new3_body):
+            new3_body = tick_pat.sub(
+                f"- `{name}`: (nach Sektion 4 verschoben)\n",
+                new3_body,
+                count=1,
+            )
+            moved += 1
+
+    if moved == 0:
+        return report, 0
+
+    new_report = (
+        report[:m3.start()]
+        + m3.group(1)
+        + new3_body
+        + report[m3.end():]
+    )
+    return new_report, moved
+
+
+
+
+def _check_completeness(report: str) -> tuple:
+    """v37-R34 P60c: Warnt, wenn KI 'nichts gefunden' behauptet,
+    aber LRV-Anhang Definitions-Zeilen zeigt, die im Report nicht
+    zitiert werden.
+
+    Rueckgabe: (neuer_report, warnung_text oder "")
+    """
+    if not report:
+        return report, ""
+    marker = "## Anhang: Zeilen-Verifikation (LRV"
+    idx = report.find(marker)
+    if idx < 0:
+        return report, ""
+    body = report[:idx]
+    annex = report[idx:]
+
+    claims = re.compile(
+        r"keine\s+Definition|nicht\s+gefunden|fehlt\b|"
+        r"ohne\s+Definition|nicht\s+definiert|keine\s+explizite",
+        re.IGNORECASE,
+    )
+    if not claims.search(body):
+        return report, ""
+
+    def_lines = re.findall(
+        r"- Zeile (\d+) \[definition\]: `([^`]{0,100})`",
+        annex,
+    )
+    if not def_lines:
+        return report, ""
+
+    warn = (
+        "\n---\n"
+        "## COMPLETENESS-WARNUNG (P60c)\n"
+        "\n"
+        "Der Report behauptet, etwas fehle. Der LRV-Anhang zeigt "
+        "jedoch Definitions-Zeilen, die im Report NICHT zitiert "
+        "werden:\n"
+        "\n"
+    )
+    for n, c in def_lines[:5]:
+        warn += f"- Zeile {n} [definition]: `{c}`\n"
+    warn += (
+        "\n"
+        "Bitte manuell pruefen, ob die KI diese Zeilen uebersehen hat.\n"
+    )
+    return report + warn, warn
+
+
 class AIContextBridge:
     """v37-R34 P42b: SSOT-Inspektor fuer KI-Audits.
 
@@ -2315,6 +2825,7 @@ class AIContextBridge:
                 "tools",
                 "db",
                 "logs",
+                "memory",
                 "wfile",
             ]
         parts: list[str] = ["=== SCRIPT-CONTEXT-SNAPSHOT ==="]
@@ -2511,6 +3022,17 @@ class AIContextBridge:
         except (OSError, ValueError) as exc:
             lines.append(f"(Log-Fehler: {exc})")
         return "\n".join(lines)
+
+    @staticmethod
+    def _section_memory() -> str:
+        """v37-R34 P52: Aktuelle Session-Memory."""
+        try:
+            mem = globals().get("OllamaMemory")
+            if mem is None:
+                return "## memory\n(OllamaMemory nicht verfuegbar)"
+            return mem.format_recent(limit=10)
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            return f"## memory\n(fehlerhaft: {exc})"
 
     @staticmethod
     def _section_wfile() -> str:
@@ -2745,6 +3267,299 @@ OLLAMA_QUERY_HINT = (
 )
 
 
+# --- v37-R34 P54: Anchor-Registry --------------------------
+class AnchorRegistry:
+    """Verhindert Anker-Kollisionen bei KI-Patches (P54)."""
+
+    _SIMILAR_EDGE = 40
+    _SIMILAR_DIST = 3
+
+    def __init__(self, path: Any = None) -> None:
+        if path is None:
+            cache_dir = Path.home() / ".wlan_ultimate" / "cache" / "ollama"
+            path = cache_dir / "anchors.json"
+        self.path = Path(path)
+        self._data: dict[str, dict[str, Any]] = {}
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                with self.path.open("r", encoding="utf-8") as fh:
+                    self._data = json.load(fh)
+        except (OSError, ValueError):
+            self._data = {}
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(self._data, fh, ensure_ascii=False, indent=2)
+            tmp.replace(self.path)
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _hash(anchor: str) -> str:
+        h = hashlib.sha256(anchor.encode("utf-8")).hexdigest()[:16]
+        return "sha256:" + h
+
+    @staticmethod
+    def _lev(a: str, b: str) -> int:
+        if a == b:
+            return 0
+        if not a:
+            return len(b)
+        if not b:
+            return len(a)
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a, 1):
+            cur = [i]
+            for j, cb in enumerate(b, 1):
+                cost = 0 if ca == cb else 1
+                cur.append(min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost))
+            prev = cur
+        return prev[-1]
+
+    def check(self, anchor: str) -> tuple:
+        h = self._hash(anchor)
+        if h in self._data:
+            return "USED", self._data[h]
+        e = self._SIMILAR_EDGE
+        pre = anchor[:e]
+        suf = anchor[-e:] if len(anchor) > e else anchor
+        for entry in self._data.values():
+            other = entry.get("anchor", "")
+            o_pre = other[:e]
+            o_suf = other[-e:] if len(other) > e else other
+            if (
+                self._lev(pre, o_pre) <= self._SIMILAR_DIST
+                and self._lev(suf, o_suf) <= self._SIMILAR_DIST
+            ):
+                return "SIMILAR", entry
+        return "FRESH", None
+
+    def register(self, anchor: str, patch: str) -> None:
+        self._data[self._hash(anchor)] = {
+            "anchor": anchor,
+            "patch": patch,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "status": "USED",
+        }
+        self._save()
+
+    def clear(self) -> int:
+        n = len(self._data)
+        self._data = {}
+        self._save()
+        return n
+
+    def all_entries(self) -> list:
+        return sorted(self._data.values(), key=lambda x: x.get("ts", ""))
+
+
+_ANCHOR_REGISTRY: Any = None
+
+
+def get_anchor_registry() -> AnchorRegistry:
+    """v37-R34 P54: Lazy-Singleton der Anchor-Registry."""
+    global _ANCHOR_REGISTRY
+    if _ANCHOR_REGISTRY is None:
+        _ANCHOR_REGISTRY = AnchorRegistry()
+    return _ANCHOR_REGISTRY
+
+
+
+
+
+
+def _p53_clean_json(text: str) -> str:
+    """v37-R34 P53d: Entfernt JSON-Kommentare und trailing commas."""
+    if not text:
+        return text
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    out_lines: list = []
+    for line in text.split("\n"):
+        idx = line.find("//")
+        if idx >= 0:
+            before = line[:idx]
+            if before.count(chr(34)) % 2 == 0:
+                line = before.rstrip()
+        out_lines.append(line)
+    text = "\n".join(out_lines)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    return text
+
+
+def _extract_patches_from_response(text: str) -> list:
+    """v37-R34 P53/P53d: Robustes JSON-Extrahieren aus KI-Antwort."""
+    if not text:
+        return []
+    cleaned = _p53_clean_json(text)
+    for candidate in (cleaned.strip(), text.strip()):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and isinstance(
+                data.get("patches"), list
+            ):
+                return [p for p in data["patches"] if isinstance(p, dict)]
+        except (ValueError, TypeError):
+            continue
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
+    if m:
+        try:
+            data = json.loads(_p53_clean_json(m.group(1)))
+            if isinstance(data, dict) and isinstance(
+                data.get("patches"), list
+            ):
+                return [p for p in data["patches"] if isinstance(p, dict)]
+        except (ValueError, TypeError):
+            pass
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            data = json.loads(
+                _p53_clean_json(cleaned[start:end + 1])
+            )
+            if isinstance(data, dict) and isinstance(
+                data.get("patches"), list
+            ):
+                return [p for p in data["patches"] if isinstance(p, dict)]
+        except (ValueError, TypeError):
+            pass
+    return []
+
+
+def _check_patch_anchors(patches: list) -> list:
+    """v37-R34 P53/P53e: Ergaenzt jedes Patch-Objekt um 'anchor_status'.
+
+    P53e: Prueft zusaetzlich, ob der Anker-String tatsaechlich in
+    w.py vorkommt. Wenn nicht -> Status INVALID.
+    """
+    out: list = []
+    try:
+        reg_getter = globals().get("get_anchor_registry")
+        reg = reg_getter() if reg_getter else None
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        reg = None
+
+    # v37-R34 P53e: w.py-Inhalt einmal laden
+    wpy_content = ""
+    try:
+        wpy_content = Path("w.py").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        wpy_content = ""
+
+    for p in patches:
+        if not isinstance(p, dict):
+            continue
+        anchor = str(p.get("anchor", "") or "")
+        status = "UNKNOWN"
+        entry = None
+
+        # P53e: Vorkommen in w.py pruefen
+        in_wfile = bool(
+            wpy_content and anchor and anchor in wpy_content
+        )
+
+        if anchor and not in_wfile:
+            status = "INVALID"
+        elif reg is not None and anchor:
+            try:
+                status, entry = reg.check(anchor)
+            except (OSError, ValueError, RuntimeError, AttributeError):
+                pass
+
+        q = dict(p)
+        q["anchor_status"] = status
+        q["anchor_in_wfile"] = in_wfile
+        if entry is not None:
+            q["anchor_used_by"] = entry.get("patch", "?")
+        out.append(q)
+    return out
+
+
+def _save_patch_draft(patches: list, model: str, report_hash: str = "") -> str:
+    """v37-R34 P53: Speichert Patch-Drafts in cache/ollama/drafts/."""
+    try:
+        cache_dir = AppKonstanten.CACHE_DIR / "ollama" / "drafts"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        payload = {
+            "ts": time.time(),
+            "ts_str": ts,
+            "model": model,
+            "report_hash": report_hash,
+            "patch_count": len(patches),
+            "patches": patches,
+        }
+        blob = json.dumps(payload, ensure_ascii=False, indent=2)
+        h = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+        path = cache_dir / f"{ts}_{h}.json"
+        path.write_text(blob, encoding="utf-8")
+        return str(path)
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
+def _handle_patch_gen_response(
+    response: str, model: str, report_text: str = ""
+) -> dict:
+    """v37-R34 P53: Extrahiert, prueft Anker und speichert Draft."""
+    patches = _extract_patches_from_response(response)
+    if not patches:
+        return {"status": "no_patches", "patches": []}
+    patches = _check_patch_anchors(patches)
+    rh = ""
+    try:
+        mem = globals().get("OllamaMemory")
+        if mem is not None and report_text:
+            rh = mem.hash_report(report_text)
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        pass
+    path = _save_patch_draft(patches, model, rh)
+    fresh = sum(1 for p in patches if p.get("anchor_status") == "FRESH")
+    used = sum(1 for p in patches if p.get("anchor_status") == "USED")
+    similar = sum(1 for p in patches if p.get("anchor_status") == "SIMILAR")
+    return {
+        "status": "ok",
+        "patches": patches,
+        "path": path,
+        "fresh": fresh,
+        "used": used,
+        "similar": similar,
+    }
+
+
+
+
+def _p53_save_last_audit(text: str) -> None:
+    """v37-R34 P53c: Volle code_audit-Result zwischenspeichern."""
+    if not text:
+        return
+    try:
+        cache_dir = AppKonstanten.CACHE_DIR / "ollama"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / "last_code_audit.md"
+        path.write_text(text, encoding="utf-8")
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _p53_load_last_audit() -> str:
+    """v37-R34 P53c: Letzte volle code_audit-Result laden."""
+    try:
+        cache_dir = AppKonstanten.CACHE_DIR / "ollama"
+        path = cache_dir / "last_code_audit.md"
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError, TypeError):
+        return ""
+
+
 class OllamaAnalysisThread(QThread):
     """Asynchroner QThread für die KI-Analyse von WLAN-Netzwerken.
 
@@ -2798,6 +3613,9 @@ class OllamaAnalysisThread(QThread):
         self.max_query_rounds = max_query_rounds
         self._last_dump_path: Path | None = None
         self._logger = logging.getLogger(f"{__name__}.OllamaAnalysisThread")
+        # v37-R34 P56: INFO-Level unabhaengig vom globalen
+        # WARNING-Default. Records propagieren zum Root-Handler.
+        self._logger.setLevel(logging.INFO)
 
     def run(self) -> None:
         """Führt die Analyse im Hintergrund-Thread aus."""
@@ -2860,6 +3678,58 @@ class OllamaAnalysisThread(QThread):
             if self.cache_enabled:
                 self._cache_write(prompt, cleaned)
             self._log_history(prompt, cleaned, cached_hit=False)
+            # v37-R34 P52: Session-Memory persistieren
+            try:
+                _mem = globals().get("OllamaMemory")
+                if _mem is not None:
+                    _rh = _mem.hash_report(
+                        self.report_text or prompt
+                    )
+                    _mem.record(
+                        report_hash=_rh,
+                        mode=self.mode,
+                        model=self.model,
+                        result=cleaned,
+                        applied=True,
+                    )
+            except (OSError, ValueError, RuntimeError, AttributeError):
+                pass
+
+            # v37-R34 P53c: Volle code_audit-Result persistieren,
+            # damit patch_gen sie lesen kann.
+            if self.mode == "code_audit":
+                try:
+                    _p53_save_last_audit(cleaned)
+                except (OSError, ValueError, RuntimeError,
+                        AttributeError):
+                    pass
+
+            # v37-R34 P53: patch_gen — Draft speichern
+            if self.mode == "patch_gen":
+                try:
+                    _p53 = _handle_patch_gen_response(
+                        cleaned, self.model, self.report_text
+                    )
+                    if _p53.get("status") == "ok":
+                        self._logger.info(
+                            "P53 Draft: %s (%d patches, "
+                            "%d FRESH, %d USED, %d SIMILAR)",
+                            _p53.get("path"),
+                            len(_p53.get("patches", [])),
+                            _p53.get("fresh", 0),
+                            _p53.get("used", 0),
+                            _p53.get("similar", 0),
+                        )
+                    else:
+                        self._logger.warning(
+                            "P53: keine Patches extrahiert"
+                        )
+                except (OSError, ValueError, RuntimeError,
+                        AttributeError) as _exc:
+                    self._logger.warning(
+                        "P53 Hook fehlgeschlagen: %s", _exc
+                    )
+
             self.finished.emit(cleaned)
             self.progress.emit(100)
 
@@ -2961,30 +3831,52 @@ class OllamaAnalysisThread(QThread):
             + facts_block
             + "\n"
             "\n"
-            "AUFGABE: Finale Analyse. Regeln:\n"
-            "1. Bei grep(NAME) MIT Treffern: Bug ist BEHOBEN, "
-            "gehoert NUR in Sektion 4.\n"
-            "2. Bei grep(NAME) OHNE Treffer: Bug ist AKTIV, "
-            "gehoert NUR in Sektion 3.\n"
-            "3. Ein Finding darf NIEMALS in beiden Sektionen 3 "
-            "UND 4 stehen.\n"
-            "4. Log-Eintraege die vor der letzten w.py-Aenderung "
-            "liegen sind historisch. Pruefe mit grep, ob der Bug "
-            "noch im Code existiert. Wenn nein: BEHOBEN.\n"
-            "5. DEFINITION-vs-VERWENDUNG: Wenn der Report sagt "
-            "'Attribut NAME fehlt', pruefe die grep-Treffer:\n"
-            "   - Zeile mit 'NAME:' oder 'NAME =' oder 'NAME:' am "
-            "Zeilenende = DEFINITION vorhanden.\n"
-            "   - Zeile mit 'self.NAME' oder 'cls.NAME' oder "
-            "'objekt.NAME' = nur VERWENDUNG.\n"
-            "   Wenn eine Definition-Zeile existiert, ist das "
-            "Attribut NICHT fehlend = BEREITS BEHOBEN.\n"
-            "6. VERWENDUNGS-FALLE: Wenn NAME in 7 Zeilen vorkommt "
-            "und EINE davon 'NAME:' als Zuweisung zeigt, ist NAME "
-            "definiert. Verwendungen ohne Definition sind der Bug.\n"
-            "5. KEINE Modularisierung, KEIN DebugManager-Ersatz, "
-            "KEIN direktes subprocess.\n"
-            "6. Konkrete Zeilennummern aus Query-Ergebnissen nennen.\n"
+            "AUFGABE: Finale Analyse. Regeln — in dieser "
+            "Reihenfolge anwenden:\n"
+            "\n"
+            "SCHRITT 1 — Klassifikation pro Finding:\n"
+            "1a. grep(NAME) OHNE Treffer -> AKTIV -> Sektion 3.\n"
+            "1b. grep(NAME) MIT Treffern, mindestens 1 davon ist "
+            "eine DEFINITION ('class NAME', 'def NAME', 'NAME:' "
+            "am Zeilenende, 'NAME = ' am Zeilenanfang) -> BEHOBEN "
+            "-> Sektion 4.\n"
+            "1c. grep(NAME) MIT Treffern, aber NUR Verwendungen "
+            "('self.NAME', 'obj.NAME', 'NAME(' als Aufruf) -> "
+            "AKTIV -> Sektion 3.\n"
+            "\n"
+            "SCHRITT 2 — Konsistenz (PFLICHT, keine Ausnahme):\n"
+            "2. Ein Finding darf NIEMALS in beiden Sektionen 3 "
+            "UND 4 stehen. Waehle genau EINE Sektion.\n"
+            "3. Bei Unsicherheit: Default = Sektion 4. "
+            "Begruendung: w.py ist SSOT, Bugs sind i.d.R. bereits "
+            "gefixt. Lieber ein falsch-negativer Eintrag als ein "
+            "doppelter Eintrag.\n"
+            "\n"
+            "SCHRITT 3 — Historische Logs:\n"
+            "4. Log-Eintraege vor der letzten w.py-Aenderung sind "
+            "historisch. Pruefe IMMER mit grep, ob der Bug noch "
+            "im Code ist.\n"
+            "\n"
+            "SCHRITT 4 — Ausgabe:\n"
+            "5. Konkrete Zeilennummern NUR aus den Query-"
+            "Ergebnissen nennen. Keine Erfindungen.\n"
+            "6. Bei Unklarheit 'unklar' schreiben, NICHT raten.\n"
+            "\n"
+            "KONVENTIONEN (nicht verhandelbar):\n"
+            "- KEINE Modularisierung, KEIN DebugManager-Ersatz\n"
+            "- KEIN direktes subprocess (CommandRunner nutzen)\n"
+            "\n"
+            "UMGEBUNGS-ABHAENGIGKEITEN (keine Code-Bugs):\n"
+            "- Wenn NAME ein externes Tool / CLI-Kommando ist "
+            "(kommt in shutil.which(NAME), subprocess-Listen, "
+            "CommandRunner-Listen oder als String-Literal vor), "
+            "dann gilt die Definition-Regel NICHT. Tool-Verwendungen "
+            "sind KEINE Bugs.\n"
+            "- Typische externe Tools: mtr, hcitool, whois, tshark, "
+            "hashcat, nmap, iw, aircrack-ng, airodump-ng, "
+            "aireplay-ng, mdk4, hcxdumptool, bettercap.\n"
+            "- Wenn ein Finding nur 'Tool X nicht installiert' "
+            "aussagt: NICHT in den Report. Ignorieren.\n"
             "\n"
             "Format:\n"
             "## 1. Befund-Zusammenfassung\n"
@@ -2998,6 +3890,44 @@ class OllamaAnalysisThread(QThread):
         if not pass2_result:
             self._logger.warning("P46 Pass2: keine Antwort")
             return result
+
+        # v37-R34 P58: Line-Reference Verification
+        try:
+            pass2_result, _lrv_stats = _lrv_verify_report(pass2_result)
+            self._logger.info(
+                "P58 LRV: %d Zeilenverweise "
+                "(%d verifiziert, %d fehlend, %d Definitions-Zeilen)",
+                _lrv_stats.get("total", 0),
+                _lrv_stats.get("verified", 0),
+                _lrv_stats.get("missing", 0),
+                _lrv_stats.get("definitions", 0),
+            )
+        except (OSError, ValueError, RuntimeError, AttributeError) as _exc:
+            self._logger.warning("P58 LRV fehlgeschlagen: %s", _exc)
+
+        # v37-R34 P59b: Konsistenz-Enforcer
+        try:
+            pass2_result, _moved = _enforce_consistency(pass2_result)
+            if _moved:
+                self._logger.info(
+                    "P59b Konsistenz: %d Finding(s) aus Sektion 3 "
+                    "nach Sektion 4 verschoben.",
+                    _moved,
+                )
+        except (OSError, ValueError, RuntimeError, AttributeError) as _exc:
+            self._logger.warning("P59b Konsistenz fehlgeschlagen: %s", _exc)
+
+        # v37-R34 P60c: Completeness-Check
+        try:
+            pass2_result, _compl_warn = _check_completeness(pass2_result)
+            if _compl_warn:
+                self._logger.warning(
+                    "P60c Completeness-Warnung angehaengt "
+                    "(%d Zeichen)", len(_compl_warn),
+                )
+        except (OSError, ValueError, RuntimeError, AttributeError) as _exc:
+            self._logger.warning("P60c Completeness fehlgeschlagen: %s", _exc)
+
         return pass2_result
 
     def _run_query_loop(self, prompt: str, result: str) -> str:
@@ -3278,6 +4208,33 @@ class OllamaAnalysisThread(QThread):
             snapshot = AIContextBridge.snapshot()
         except (OSError, ValueError, RuntimeError) as _exc:
             snapshot = f"(AIContextBridge-Fehler: {_exc})"
+
+        # v37-R34 P52: Session-Memory-Lookup fuer diesen Report
+        _mem_warn = ""
+        try:
+            _rh = OllamaMemory.hash_report(body)
+            _prev = OllamaMemory.lookup(_rh)
+            if _prev is not None:
+                from datetime import datetime as _dtm
+                try:
+                    _when = _dtm.fromtimestamp(
+                        float(_prev.get('ts', 0))
+                    ).strftime('%Y-%m-%d %H:%M')
+                except (ValueError, TypeError, OSError):
+                    _when = '?'
+                _head = str(_prev.get('result_head', ''))[:200]
+                _mem_warn = (
+                    "\n\n=== MEMORY-HIT (Report wurde bereits "
+                    "analysiert) ===\n"
+                    f"Am: {_when}\n"
+                    f"Modell: {_prev.get('model', '?')}\n"
+                    f"Letztes Ergebnis (Anfang):\n{_head}\n"
+                    "WICHTIG: Bei gleichem Code-Zustand keine Fixes "
+                    "wiederholen. Nur NEUE Erkenntnisse nennen.\n"
+                    "=== ENDE MEMORY-HIT ==="
+                )
+        except (OSError, ValueError, RuntimeError):
+            _mem_warn = ""
         return (
             tmpl["header"]
             + "\n\n"
@@ -3291,12 +4248,81 @@ class OllamaAnalysisThread(QThread):
             + snapshot
             + "\n\n"
             + tmpl["output"]
+            + _mem_warn
+        )
+
+    def _build_patch_gen_prompt(self) -> str:
+        """v37-R34 P53: Prompt fuer patch_gen-Modus."""
+        body = (self.report_text or "").strip()
+        # v37-R34 P53c: fallback auf letzte vollstaendige code_audit-Result
+        if not body:
+            try:
+                body = _p53_load_last_audit().strip()
+            except (OSError, ValueError, RuntimeError, AttributeError):
+                pass
+        # letzter Fallback: Memory-Head (kurz)
+        if not body:
+            try:
+                mem = globals().get("OllamaMemory")
+                if mem is not None:
+                    for e in reversed(mem.load()):
+                        if e.get("mode") == "code_audit":
+                            body = str(e.get("result_head") or "")
+                            break
+            except (OSError, ValueError, RuntimeError, AttributeError):
+                pass
+        if not body:
+            return (
+                "ROLLE: Patch-Generator.\n"
+                "KEIN code_audit-Report vorhanden. Bitte erst "
+                "code_audit laufen lassen.\n"
+            )
+
+        anchors_text = "(noch keine Eintraege - alle Anker frei)"
+        try:
+            reg_getter = globals().get("get_anchor_registry")
+            if reg_getter is not None:
+                entries = reg_getter().all_entries()
+                if entries:
+                    lines = []
+                    for e in entries[-30:]:
+                        lines.append(
+                            f"- {e.get('anchor', '?')[:80]} "
+                            f"(patch {e.get('patch', '?')})"
+                        )
+                    anchors_text = "\n".join(lines)
+        except (OSError, ValueError, RuntimeError, AttributeError):
+            pass
+
+        try:
+            snapshot = AIContextBridge.snapshot()
+        except (OSError, ValueError, RuntimeError) as _exc:
+            snapshot = f"(AIContextBridge-Fehler: {_exc})"
+
+        tmpl = OLLAMA_TEMPLATES.get("patch_gen", {})
+        header = tmpl.get("header", "")
+        output = tmpl.get("output", "")
+
+        return (
+            header
+            + "\n\n=== CODE-AUDIT-REPORT ===\n"
+            + body
+            + "\n=== ENDE REPORT ===\n"
+            + "\n\n=== BENUTZTE ANKER (VERMEIDE DIESE) ===\n"
+            + anchors_text
+            + "\n=== ENDE ===\n"
+            + "\n\n"
+            + snapshot
+            + "\n\n"
+            + output
         )
 
     def _build_prompt(self, network_dicts: list[dict[str, Any]]) -> str:
         """Erstellt einen angriffsfokussierten Prompt für Ollama."""
         if self.mode == "code_audit":
             return self._build_code_audit_prompt()
+        if self.mode == "patch_gen":
+            return self._build_patch_gen_prompt()
         if not network_dicts:
             return (
                 "ROLLE: Du bist Offensive-Security-Analyst.\n"
@@ -54581,6 +55607,502 @@ def setup_logging(debug_level: int, log_file: str | None = None):
             logging.getLogger(name).setLevel(logging.WARNING)
 
 
+
+
+
+
+class PlatformCompat:
+    """v37-R34 P61: Plattform-Kompatibilitaets-Check.
+
+    Erkennt Kernel, Distro, Adapter, Treiber, Baender und gibt eine
+    konkrete Empfehlung, ob die aktuelle Plattform fuer WLAN-Pentest
+    geeignet ist. Nur lesende Operationen.
+    """
+
+    # Bekannte Treiber-Familien und Kompatibilitaets-Hinweise
+    DRIVER_NOTES = {
+        "88XXau": {
+            "family": "RTL8812AU (Alfa AWUS036ACH, ACH-C)",
+            "kernels": "DKMS, laeuft 5.x und 6.0-6.6, ab 6.7 instabil",
+            "alt": "Adapter mit rtw88 (in-kernel ab 6.10) oder "
+                   "Kernel < 6.6 nutzen",
+        },
+        "rtl8187": {
+            "family": "RTL8187 (Alfa AWUS036H, 2005)",
+            "kernels": "In-Kernel seit 2.6.24, laeuft auf jedem Linux",
+            "alt": "kein Handlungsbedarf",
+        },
+        "rtl8xxxu": {
+            "family": "Realtek 802.11n USB (generisch)",
+            "kernels": "In-Kernel, aeltere Geraete",
+            "alt": "kein Handlungsbedarf",
+        },
+        "rt2800usb": {
+            "family": "Ralink RT2800 USB",
+            "kernels": "In-Kernel",
+            "alt": "kein Handlungsbedarf",
+        },
+        "rtw88_8822bu": {
+            "family": "RTL8822BU (modern, USB 3)",
+            "kernels": "In-Kernel ab 5.13",
+            "alt": "kein Handlungsbedarf",
+        },
+        "rtw88_8822cu": {
+            "family": "RTL8822CU (modern)",
+            "kernels": "In-Kernel ab 5.13",
+            "alt": "kein Handlungsbedarf",
+        },
+        "mt7921u": {
+            "family": "MediaTek MT7921 USB (WiFi 6)",
+            "kernels": "In-Kernel ab 5.16, 6 GHz ab 6.1",
+            "alt": "kein Handlungsbedarf",
+        },
+    }
+
+    # Kernel-Schwellen
+    KERNEL_88XXAU_MAX = (6, 6)
+    KERNEL_88XXAU_RECOMMENDED_MAX = (6, 3)
+
+    @staticmethod
+    def _kernel_tuple() -> tuple:
+        """(major, minor) aus os.uname().release."""
+        try:
+            rel = os.uname().release
+        except (OSError, AttributeError):
+            return (0, 0)
+        m = re.match(r"(\d+)\.(\d+)", rel)
+        if not m:
+            return (0, 0)
+        try:
+            return (int(m.group(1)), int(m.group(2)))
+        except (ValueError, TypeError):
+            return (0, 0)
+
+    @staticmethod
+    def _distro_info() -> dict:
+        """{id, version, pretty} aus /etc/os-release."""
+        out = {"id": "?", "version": "?", "pretty": "?"}
+        try:
+            for line in Path("/etc/os-release").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                if "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                v = v.strip().strip('"')
+                if k == "ID":
+                    out["id"] = v
+                elif k == "VERSION_ID":
+                    out["version"] = v
+                elif k == "PRETTY_NAME":
+                    out["pretty"] = v
+        except (OSError, ValueError):
+            pass
+        return out
+
+    @classmethod
+    def _driver_probe(cls, name: str) -> dict:
+        """Drei Kandidaten durchprobieren (case-sensitive, case-insensitiv)."""
+        cands = [name, name.lower(), name.upper()]
+        for c in cands:
+            if shutil.which("modinfo") is None:
+                break
+            try:
+                r = subprocess.run(
+                    ["modinfo", c], capture_output=True, text=True,
+                    timeout=3, check=False,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if r.returncode == 0 and r.stdout:
+                version = ""
+                for line in r.stdout.splitlines():
+                    if line.startswith("version:"):
+                        version = line.split(":", 1)[1].strip()
+                        break
+                return {"found": True, "candidate": c,
+                        "version": version or "vorhanden"}
+        # lsmod-Fallback (case-insensitiv)
+        try:
+            r = subprocess.run(
+                ["lsmod"], capture_output=True, text=True, timeout=3,
+                check=False,
+            )
+            if r.returncode == 0:
+                low = name.lower()
+                for line in (r.stdout or "").splitlines():
+                    parts = line.split()
+                    if parts and parts[0].lower() == low:
+                        return {"found": True, "candidate": parts[0],
+                                "version": "geladen (lsmod)"}
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return {"found": False, "candidate": "", "version": ""}
+
+    @classmethod
+    def _adapters(cls) -> list:
+        """Adapter via HardwareScanner (defensiv)."""
+        try:
+            hs = globals().get("HardwareScanner")
+            if hs is None:
+                return []
+            return hs().scan_wlan() or []
+        except (OSError, AttributeError, RuntimeError, ValueError):
+            return []
+
+    @classmethod
+    def check(cls) -> dict:
+        """Volldiagnose."""
+        kt = cls._kernel_tuple()
+        distro = cls._distro_info()
+        adapters = cls._adapters()
+
+        drivers_probe = {}
+        for name in cls.DRIVER_NOTES:
+            drivers_probe[name] = cls._driver_probe(name)
+
+        # Empfehlung bauen
+        notes: list = []
+        verdict = "OK"
+
+        # Kernel-Check
+        if kt >= cls.KERNEL_88XXAU_MAX:
+            any_88 = any(
+                a.get("driver", "") == "88XXau"
+                for a in adapters if isinstance(a, dict)
+            )
+            if any_88:
+                verdict = "WARN"
+                notes.append(
+                    f"Kernel {kt[0]}.{kt[1]} ist >="
+                    f" {cls.KERNEL_88XXAU_MAX[0]}."
+                    f"{cls.KERNEL_88XXAU_MAX[1]} — 88XXau-DKMS "
+                    "instabil. 5-GHz-Adapter kann ausfallen."
+                )
+                notes.append(
+                    "Empfehlung: Kali-VM mit Kernel < 6.6 nutzen "
+                    "ODER Adapter mit rtw88-Treiber."
+                )
+
+        # Nur-2.4-GHz-Check
+        has_5 = any(
+            (a.get("supports_5ghz") or a.get("supports_6ghz"))
+            for a in adapters if isinstance(a, dict)
+        )
+        if not has_5 and adapters:
+            if verdict == "OK":
+                verdict = "INFO"
+            notes.append(
+                "Kein 5-GHz-faehiger Adapter aktiv. Scans nur auf 2.4 GHz."
+            )
+
+        # Treiber fehlen
+        missing = [n for n, p in drivers_probe.items() if not p["found"]]
+        if len(missing) == len(drivers_probe):
+            if verdict == "OK":
+                verdict = "WARN"
+            notes.append(
+                "Keine der bekannten WLAN-Treiber-Module gefunden. "
+                "modinfo/lsmod pruefen."
+            )
+
+        return {
+            "kernel": kt,
+            "kernel_raw": os.uname().release if hasattr(os, "uname") else "?",
+            "distro": distro,
+            "adapters": adapters,
+            "drivers_probe": drivers_probe,
+            "missing_drivers": missing,
+            "verdict": verdict,
+            "notes": notes,
+        }
+
+    @classmethod
+    def format_report(cls, data=None) -> str:
+        if data is None:
+            data = cls.check()
+
+        lines: list = [
+            "", "=" * 68,
+            "  PLATFORM-COMPATIBILITY-CHECK (P61)",
+            "=" * 68,
+        ]
+        k = data.get("kernel") or (0, 0)
+        d = data.get("distro") or {}
+        lines.append(f"Kernel:   {data.get('kernel_raw', '?')} "
+                     f"({k[0]}.{k[1]})")
+        lines.append(f"Distro:   {d.get('pretty', '?')}")
+        lines.append(f"Python:   {sys.version.split()[0]}")
+
+        ad = data.get("adapters") or []
+        lines.append("")
+        lines.append(f"Adapter ({len(ad)}):")
+        for a in ad:
+            if not isinstance(a, dict):
+                continue
+            name = a.get("iface") or a.get("name") or "?"
+            drv = a.get("driver") or "?"
+            bands = []
+            if a.get("supports_2ghz"):
+                bands.append("2.4")
+            if a.get("supports_5ghz"):
+                bands.append("5")
+            if a.get("supports_6ghz"):
+                bands.append("6")
+            bstr = "/".join(bands) if bands else "?"
+            mon = "mon" if a.get("supports_monitor") else "no-mon"
+            lines.append(f"  [{name}] {drv}  ({bstr} GHz, {mon})")
+
+        lines.append("")
+        lines.append("Treiber-Suche:")
+        for name, probe in (data.get("drivers_probe") or {}).items():
+            mark = "OK  " if probe.get("found") else "MISS"
+            ver = probe.get("version", "") or ""
+            lines.append(f"  [{mark}] {name:14} {ver}")
+
+        notes = data.get("notes") or []
+        verdict = data.get("verdict", "OK")
+        lines.append("")
+        lines.append("=" * 68)
+        lines.append(f"  EMPFEHLUNG (Status: {verdict})")
+        lines.append("=" * 68)
+        if not notes:
+            lines.append("  ✅ Diese Plattform ist geeignet. Kein "
+                         "Handlungsbedarf.")
+        else:
+            for n in notes:
+                lines.append(f"  → {n}")
+        lines.append("")
+        return "\n".join(lines)
+
+
+
+class MonitorPreflight:
+    """v37-R34 P52a: Umfassende Diagnose fuer Monitor-Mode-Aktivierung.
+
+    Erkennt:
+    - Bereits existierende *mon-Interfaces (airmon-ng-Namensschema)
+    - rfkill-Blockaden
+    - NetworkManager/wpa_supplicant-Konflikte
+    - USB-Autosuspend-Zustand
+    - Treiber-Status (88XXau, rtl8187, rtl8xxxu)
+    - Letzte Kernel-Meldungen (dmesg, soweit lesbar)
+
+    Nur lesende Operationen. Kein Schreibzugriff, keine Neukonfiguration.
+    """
+
+    @staticmethod
+    def _run(cmd: list, tag: str, timeout: int = 3):
+        """Fuehrt CommandRunner aus, faellt auf subprocess zurueck."""
+        try:
+            runner = globals().get("CommandRunner")
+            if runner is not None and hasattr(runner, "run"):
+                result = runner.run(
+                    cmd, subsystem="monitor-preflight", tag=tag,
+                    soft_fail=True, timeout=timeout,
+                )
+                if isinstance(result, tuple) and len(result) >= 2:
+                    rc = result[0] if isinstance(result[0], int) else 0
+                    out = result[1] or ""
+                    return rc, str(out)
+        except (OSError, ValueError, RuntimeError, AttributeError):
+            pass
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout,
+                check=False,
+            )
+            return proc.returncode, proc.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            return -1, ""
+
+    @classmethod
+    def _interfaces(cls) -> list:
+        rc, out = cls._run(["ip", "-br", "link"], "ip-link")
+        if rc != 0:
+            return []
+        names = []
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and parts[0].startswith(("wlan", "mon", "phy")):
+                names.append(parts[0])
+        return names
+
+    @classmethod
+    def _monitor_interfaces(cls) -> list:
+        """Findet Interfaces im Monitor-Mode (inkl. airmon-ng *mon)."""
+        monitors = []
+        rc, out = cls._run(["iw", "dev"], "iw-dev")
+        if rc == 0:
+            current = None
+            for line in out.splitlines():
+                s = line.strip()
+                if s.startswith("Interface "):
+                    current = s.split(None, 1)[1] if len(s.split()) > 1 else None
+                elif s.startswith("type monitor") and current:
+                    monitors.append(current)
+                    current = None
+        for name in cls._interfaces():
+            if name.endswith("mon") and name not in monitors:
+                monitors.append(name)
+        return sorted(set(monitors))
+
+    @classmethod
+    def _rfkill(cls) -> list:
+        rc, out = cls._run(["rfkill", "list"], "rfkill")
+        if rc != 0:
+            return []
+        lines = []
+        for line in out.splitlines():
+            s = line.strip()
+            if "Wireless" in s or "WLAN" in s or "Bluetooth" in s:
+                lines.append(s)
+            elif s.startswith(("Soft", "Hard")):
+                lines.append(f"  {s}")
+        return lines
+
+    @classmethod
+    def _usb_wireless(cls) -> list:
+        rc, out = cls._run(["lsusb"], "lsusb")
+        if rc != 0:
+            return []
+        lines = []
+        for line in out.splitlines():
+            low = line.lower()
+            if any(k in low for k in (
+                "wireless", "wlan", "802.11", "realtek", "ralink",
+                "atheros", "8812", "8187", "alfa",
+            )):
+                lines.append(line.strip())
+        return lines
+
+    @classmethod
+    def _drivers(cls) -> dict:
+        out = {}
+        for mod in ("88XXau", "rtl8187", "rtl8xxxu", "rt2800usb"):
+            rc, txt = cls._run(["modinfo", mod], f"modinfo-{mod}")
+            if rc == 0 and txt:
+                version = ""
+                for line in txt.splitlines():
+                    if line.startswith("version:"):
+                        version = line.split(":", 1)[1].strip()
+                        break
+                out[mod] = version or "vorhanden"
+            else:
+                out[mod] = "FEHLT"
+        return out
+
+    @classmethod
+    def _services(cls) -> dict:
+        out = {}
+        for svc in ("NetworkManager", "wpa_supplicant", "systemd-networkd"):
+            rc, txt = cls._run(["systemctl", "is-active", svc], f"svc-{svc}")
+            out[svc] = (txt or "unknown").strip() if rc == 0 else "unknown"
+        return out
+
+    @classmethod
+    def _dmesg_tail(cls, n: int = 15) -> list:
+        rc, out = cls._run(["dmesg"], "dmesg", timeout=2)
+        if rc != 0:
+            return ["(dmesg nicht lesbar - dmesg_restrict=1 oder fehlende Rechte)"]
+        keywords = ("wlan", "usb", "reset", "firmware", "8812", "8187",
+                    "rtl", "error", "fault")
+        hits = []
+        for line in out.splitlines()[-200:]:
+            low = line.lower()
+            if any(k in low for k in keywords):
+                hits.append(line.strip())
+        return hits[-n:] if hits else ["(keine relevanten Meldungen)"]
+
+    @classmethod
+    def collect(cls) -> dict:
+        return {
+            "interfaces": cls._interfaces(),
+            "monitors": cls._monitor_interfaces(),
+            "rfkill": cls._rfkill(),
+            "usb": cls._usb_wireless(),
+            "drivers": cls._drivers(),
+            "services": cls._services(),
+            "dmesg": cls._dmesg_tail(),
+        }
+
+    @classmethod
+    def format_report(cls, diag=None) -> str:
+        if diag is None:
+            diag = cls.collect()
+        lines = ["", "=" * 68, "  MONITOR-PREFLIGHT", "=" * 68, ""]
+
+        ifaces = diag.get("interfaces") or []
+        lines.append(f"Interfaces ({len(ifaces)}):")
+        for name in ifaces:
+            lines.append(f"  - {name}")
+
+        monitors = diag.get("monitors") or []
+        lines.append("")
+        lines.append(f"Monitor-Interfaces ({len(monitors)}):")
+        if monitors:
+            for name in monitors:
+                lines.append(f"  + {name}  [bereits im Monitor-Mode]")
+        else:
+            lines.append("  (keine)")
+
+        rf = diag.get("rfkill") or []
+        lines.append("")
+        lines.append("rfkill:")
+        for line in rf:
+            lines.append(f"  {line}")
+
+        usb = diag.get("usb") or []
+        lines.append("")
+        lines.append("USB-WLAN-Adapter:")
+        for line in usb:
+            lines.append(f"  {line}")
+        if not usb:
+            lines.append("  (keine gefunden)")
+
+        drv = diag.get("drivers") or {}
+        lines.append("")
+        lines.append("Treiber-Status:")
+        for mod, status in drv.items():
+            mark = "OK" if status != "FEHLT" else "!!"
+            lines.append(f"  [{mark}] {mod}: {status}")
+
+        svcs = diag.get("services") or {}
+        lines.append("")
+        lines.append("Konflikt-Dienste:")
+        for svc, state in svcs.items():
+            mark = "!!" if state == "active" else "OK"
+            lines.append(f"  [{mark}] {svc}: {state}")
+
+        dm = diag.get("dmesg") or []
+        lines.append("")
+        lines.append("Kernel-Meldungen (gefiltert):")
+        for line in dm:
+            lines.append(f"  {line}")
+
+        lines.append("")
+        lines.append("=" * 68)
+        lines.append("  EMPFEHLUNGEN")
+        lines.append("=" * 68)
+        if monitors:
+            lines.append(f"  -> Nutze vorhandene Monitor-Interfaces: "
+                         f"{', '.join(monitors)}")
+            lines.append("     (Skript sollte diese erkennen statt wlanX neu "
+                         "zu konfigurieren)")
+        if svcs.get("NetworkManager") == "active":
+            lines.append("  -> NetworkManager aktiv: 'systemctl stop "
+                         "NetworkManager' vor Scan")
+        if svcs.get("wpa_supplicant") == "active":
+            lines.append("  -> wpa_supplicant aktiv: 'sudo airmon-ng check "
+                         "kill' vor Scan")
+        for mod, status in drv.items():
+            if status == "FEHLT":
+                lines.append(f"  -> Treiber {mod} FEHLT: auf Arch 'yay -S "
+                             f"{mod.lower()}-dkms' oder gleichwertig")
+        lines.append("")
+        return "\n".join(lines)
+
+
 class WLANScanner(QThread):
     """
     Qt-Wrapper für die ScanEngine.
@@ -55067,8 +56589,65 @@ class WLANScanner(QThread):
     def _safe_emit_error(self, msg: str) -> None:
         self._safe_emit(self.fehler, str(msg))
 
+    def _sync_live_monitor_ifaces(self) -> int:
+        """v37-R34 P52b: Live-Monitor-Interfaces in InterfaceManager spiegeln.
+
+        Erkennt per MonitorPreflight._monitor_interfaces() welche Interfaces
+        aktuell im Monitor-Mode sind, auch wenn die Map sie noch als managed
+        fuehrt. Aktualisiert aktiver_modus, monitor_mode_active und das
+        _monitor_interfaces-Set. Fehlende WLANInterface-Eintraege werden
+        nachgezogen.
+
+        Rueckgabe: Anzahl synchronisierter Eintraege (0 = nichts zu tun).
+        """
+        try:
+            pf = globals().get("MonitorPreflight")
+            if pf is None:
+                return 0
+            live = pf._monitor_interfaces()
+        except (OSError, ValueError, RuntimeError, AttributeError):
+            return 0
+        if not live:
+            return 0
+        synced = 0
+        mgr = self.interface_manager
+        for name in live:
+            iface = mgr.interfaces.get(name)
+            if iface is None:
+                try:
+                    iface = WLANInterface(name=name)
+                    mgr.interfaces[name] = iface
+                except (OSError, ValueError, RuntimeError, AttributeError):
+                    continue
+            if getattr(iface, "aktiver_modus", "") != "monitor":
+                try:
+                    iface.aktiver_modus = "monitor"
+                except (AttributeError, TypeError):
+                    pass
+            try:
+                mgr.monitor_mode_active[name] = True
+            except (AttributeError, TypeError):
+                pass
+            try:
+                mgr._monitor_interfaces.add(name)
+            except (AttributeError, TypeError):
+                pass
+            synced += 1
+        return synced
+
     def _activate_monitor_mode(self) -> bool:
         """v11.1: monitor_robust - mehrstufige Aktivierung mit Diagnose."""
+        # v37-R34 P52b: Live-Zustand synchronisieren, damit
+        # extern aktivierte Monitor-Interfaces erkannt werden.
+        try:
+            _synced = self._sync_live_monitor_ifaces()
+            if _synced:
+                self.logger.info(
+                    "P52b: %d Live-Monitor-Interface(s) "
+                    "synchronisiert.", _synced,
+                )
+        except (AttributeError, RuntimeError, OSError, ValueError):
+            pass
         any_ok = False
         # 1. RF-Kill entsperren
         try:
@@ -55114,8 +56693,9 @@ class WLANScanner(QThread):
         """v11.1: Versucht Monitor via mehrere Methoden."""
         # Methode 1: iw (Standard)
         methods = []
-        if shutil.which("airmon-ng"):
-            methods.append(("airmon-ng", ["airmon-ng", "start", iface_name]))
+        # v37-R34 P52b: iw-set-type zuerst — airmon-ng wuerde
+        # wlanX in wlanXmon umbenennen und die InterfaceManager-Map
+        # invalidieren.
         methods.append(
             (
                 "iw-set-type",
@@ -55128,6 +56708,8 @@ class WLANScanner(QThread):
                 ],
             )
         )
+        if shutil.which("airmon-ng"):
+            methods.append(("airmon-ng", ["airmon-ng", "start", iface_name]))
         methods.append(
             (
                 "ifconfig-fallback",
@@ -68009,9 +69591,11 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                 llm_host=self.konfig_manager.get(
                     "ai.ollama_host", DEFAULT_OLLAMA_HOST
                 ),
-                model=self.konfig_manager.get(
-                    "ai.ollama_model", DEFAULT_OLLAMA_MODEL
-                ),
+                # v37-R34 P55: model=None -> Router entscheidet
+                # (ai.ollama_model_router.code_audit).
+                # Vorher ueberschrieb der Config-Default (coder-wifi-v3)
+                # den Router.
+                model=None,
                 mode="code_audit",
                 report_text=report_text,
                 timeout=self.konfig_manager.get(
@@ -77353,6 +78937,18 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
         except (AttributeError, RuntimeError):
             pass
 
+        # v37-R34 P55b: Router hat Vorrang, wenn Modus einen Eintrag
+        # in ai.ollama_model_router hat UND der User nicht explizit
+        # im Combo ein anderes Modell gewaehlt hat.
+        try:
+            _cfg_model = self.konfig_manager.get(
+                "ai.ollama_model", DEFAULT_OLLAMA_MODEL
+            )
+            if not model or model == _cfg_model:
+                model = None  # Router entscheidet
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+
         try:
             self.ai_result_text.setPlainText(
                 "Analysiere "
@@ -80764,6 +82360,47 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--monitor-preflight",
+        action="store_true",
+        help="v37-R34 P52a: Monitor-Mode-Diagnose "
+        "(Interfaces, rfkill, USB, Treiber, Konflikte)",
+    )
+    parser.add_argument(
+        "--platform-check",
+        action="store_true",
+        help="v37-R34 P61: Plattform-Kompatibilitaet "
+        "(Kernel, Distro, Adapter, Treiber)",
+    )
+    parser.add_argument(
+        "--anchor-status",
+        action="store_true",
+        help="v37-R34 P54: Anchor-Registry anzeigen",
+    )
+    parser.add_argument(
+        "--anchor-check",
+        metavar="ANCHOR",
+        default=None,
+        help="v37-R34 P54: Anker auf Kollision pruefen",
+    )
+    parser.add_argument(
+        "--anchor-register",
+        metavar="ANCHOR",
+        default=None,
+        help="v37-R34 P54: Anker als USED eintragen",
+    )
+    parser.add_argument(
+        "--anchor-clear",
+        action="store_true",
+        help="v37-R34 P54: Anchor-Registry leeren (mit Rueckfrage)",
+    )
+    parser.add_argument(
+        "--patch",
+        metavar="ID",
+        default=None,
+        help="v37-R34 P54: Patch-ID fuer --anchor-register",
+    )
+
+    parser.add_argument(
         "--hw-compare", metavar="IDS", help="v37-R16: Vergleich mehrerer Adapter"
     )
     parser.add_argument(
@@ -81607,6 +83244,8 @@ def main() -> int:
         ("hw_status", lambda a: _hw_status_cli()),
         ("net_diag", lambda a: _net_diag_cli()),
         ("diag_adapters", lambda a: _diag_adapters_cli()),
+        ("monitor_preflight", lambda a: _monitor_preflight_cli()),
+        ("platform_check", lambda a: _platform_check_cli()),
         ("perf_tune", lambda a: _perf_tune_cli()),
         ("oui_install", lambda a: _oui_install_cli()),
         ("oui_status", lambda a: _oui_status_cli()),
@@ -81633,6 +83272,22 @@ def main() -> int:
             lambda a: _ollama_config_cli(
                 getattr(a, "ollama_config", "") or "show"
             ),
+        ),
+        (
+            "anchor_status",
+            lambda a: _handle_anchor_cli(a),
+        ),
+        (
+            "anchor_check",
+            lambda a: _handle_anchor_cli(a),
+        ),
+        (
+            "anchor_register",
+            lambda a: _handle_anchor_cli(a),
+        ),
+        (
+            "anchor_clear",
+            lambda a: _handle_anchor_cli(a),
         ),
     ]
 
@@ -91526,6 +93181,97 @@ def _hw_advisor_cli(compare_id: str = "") -> int:
     return 0
 
 
+def _monitor_preflight_cli() -> int:
+    """v37-R34 P52a: --monitor-preflight Diagnose."""
+    try:
+        preflight = globals().get("MonitorPreflight")
+        if preflight is None:
+            print("MonitorPreflight nicht verfuegbar", file=sys.stderr)
+            return 1
+        print(preflight.format_report())
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Preflight-Fehler: {exc}", file=sys.stderr)
+        return 1
+
+
+def _platform_check_cli() -> int:
+    """v37-R34 P61: --platform-check Diagnose."""
+    try:
+        pc = globals().get("PlatformCompat")
+        if pc is None:
+            print("PlatformCompat nicht verfuegbar", file=sys.stderr)
+            return 1
+        print(pc.format_report())
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Platform-Check-Fehler: {exc}", file=sys.stderr)
+        return 1
+
+
+
+
+def _handle_anchor_cli(args: Any) -> int:
+    """v37-R34 P54: Anchor-Registry CLI."""
+    reg = get_anchor_registry()
+
+    if getattr(args, "anchor_status", False):
+        entries = reg.all_entries()
+        if not entries:
+            print("Anchor-Registry: (leer)")
+            return 0
+        print(f"{'Patch':<8} {'Zeitstempel':<20} Anker")
+        print("-" * 90)
+        for e in entries:
+            print(
+                f"{e.get('patch', '?'):<8} "
+                f"{e.get('ts', '?'):<20} "
+                f"{e.get('anchor', '?')[:60]}"
+            )
+        return 0
+
+    anchor_check = getattr(args, "anchor_check", None)
+    if anchor_check:
+        status, entry = reg.check(anchor_check)
+        if status == "FRESH":
+            print(f"[FRESH]   {anchor_check[:60]!r}")
+        elif status == "USED":
+            print(
+                f"[USED]    patch {entry.get('patch')} "
+                f"@ {entry.get('ts')}"
+            )
+            print(f"          Anker: {entry.get('anchor')!r}")
+        else:
+            print(
+                f"[SIMILAR] zu patch {entry.get('patch')} "
+                f"({entry.get('ts')})"
+            )
+            print(f"          Bekannt: {entry.get('anchor')!r}")
+            print(f"          Neu:     {anchor_check!r}")
+        return 0
+
+    anchor_register = getattr(args, "anchor_register", None)
+    if anchor_register:
+        patch_id = getattr(args, "patch", None) or "?"
+        reg.register(anchor_register, patch_id)
+        print(f"[OK] registriert: {patch_id} -> {anchor_register[:60]!r}")
+        return 0
+
+    if getattr(args, "anchor_clear", False):
+        n = len(reg.all_entries())
+        if n == 0:
+            print("Registry ist bereits leer.")
+            return 0
+        ans = input(f"Registry mit {n} Eintraegen leeren? [y/N] ").strip().lower()
+        if ans != "y":
+            print("Abgebrochen.")
+            return 1
+        print(f"[OK] {reg.clear()} Eintraege entfernt.")
+        return 0
+
+    return 0
+
+
 def _ollama_config_cli(action: str = "show") -> int:
     """v37-R34 P34b/c: --ollama-config [show|set KEY=VALUE|test [HOST]].
 
@@ -91656,6 +93402,88 @@ def _ollama_config_cli(action: str = "show") -> int:
         )
         print("Router auf Default zurueckgesetzt")
         return 0
+
+    if cmd == "memory_show":
+        mem = globals().get("OllamaMemory")
+        if mem is None:
+            print("OllamaMemory nicht verfuegbar", file=sys.stderr)
+            return 1
+        print("=" * 60)
+        print("  Ollama-Session-Memory")
+        print("=" * 60)
+        print(mem.format_recent(limit=20))
+        return 0
+
+    if cmd == "memory_clear":
+        mem = globals().get("OllamaMemory")
+        if mem is None:
+            print("OllamaMemory nicht verfuegbar", file=sys.stderr)
+            return 1
+        mem.clear()
+        print("Session-Memory geleert.")
+        return 0
+
+    if cmd == "patch_gen_show":
+        try:
+            cache_dir = AppKonstanten.CACHE_DIR / "ollama" / "drafts"
+            if not cache_dir.exists():
+                print("(keine Drafts)")
+                return 0
+            files = sorted(cache_dir.glob("*.json"), reverse=True)
+            if not files:
+                print("(keine Drafts)")
+                return 0
+            for f in files[:10]:
+                print(f"--- {f.name} ---")
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                    print(f"  Model: {data.get('model')}")
+                    print(f"  Patches: {data.get('patch_count')}")
+                    for p in data.get("patches", [])[:5]:
+                        _st = p.get("anchor_status", "?")
+                        _in = p.get("anchor_in_wfile")
+                        _mark = "w" if _in else "x"
+                        print(
+                            f"    [{_st}|{_mark}] "
+                            f"{str(p.get('finding', '?'))[:50]}"
+                        )
+                        print(
+                            f"        anchor: "
+                            f"{str(p.get('anchor', '?'))[:70]}"
+                        )
+                except (OSError, ValueError):
+                    print("  (Fehler beim Lesen)")
+            return 0
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Fehler: {exc}", file=sys.stderr)
+            return 1
+
+    if cmd == "patch_gen_clear":
+        try:
+            cache_dir = AppKonstanten.CACHE_DIR / "ollama" / "drafts"
+            if not cache_dir.exists():
+                print("Keine Drafts vorhanden.")
+                return 0
+            files = list(cache_dir.glob("*.json"))
+            if not files:
+                print("Keine Drafts vorhanden.")
+                return 0
+            ans = input(
+                f"{len(files)} Drafts loeschen? [y/N] "
+            ).strip().lower()
+            if ans != "y":
+                print("Abgebrochen.")
+                return 0
+            for f in files:
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            print(f"{len(files)} Drafts geloescht.")
+            return 0
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(f"Fehler: {exc}", file=sys.stderr)
+            return 1
 
     print(f"Unbekannte Aktion: {cmd}", file=sys.stderr)
     print(
@@ -91844,21 +93672,112 @@ def _hw_kernel_cli(usb_id: str = "") -> int:
     return 0
 
 
+def _scan_once_ensure_monitor(iface: str) -> tuple:
+    """v37-R34 P52d: Stellt sicher, dass iface im Monitor-Mode ist.
+
+    Rueckgabe (ok: bool, msg: str).
+    - Wenn bereits monitor: (True, "bereits monitor")
+    - Wenn Switch klappt: (True, "Mode-Switch OK")
+    - Sonst: (False, <Diagnose>)
+    """
+    if not iface:
+        return (False, "leeres Interface")
+    try:
+        info = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if info.returncode != 0:
+            return (False, f"iw dev {iface} info -> rc={info.returncode}")
+        if "type monitor" in (info.stdout or ""):
+            return (True, "bereits monitor")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (False, f"iw-Aufruf fehlgeschlagen: {exc}")
+
+    try:
+        subprocess.run(
+            ["ip", "link", "set", iface, "down"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        r = subprocess.run(
+            ["iw", "dev", iface, "set", "type", "monitor"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        subprocess.run(
+            ["ip", "link", "set", iface, "up"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            return (False, f"set type monitor -> {err}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (False, f"Mode-Switch fehlgeschlagen: {exc}")
+
+    try:
+        info2 = subprocess.run(
+            ["iw", "dev", iface, "info"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+        if "type monitor" in (info2.stdout or ""):
+            return (True, "Mode-Switch OK")
+        return (False, "Mode-Switch ohne Effekt")
+    except (OSError, subprocess.SubprocessError):
+        return (False, "Verifikation fehlgeschlagen")
+
+
 def _scan_once_pick_iface() -> str:
-    """v38: Erstes WLAN-Interface mit Monitor-Support (sonst erstes WLAN)."""
+    """v38/P52c: WLAN-Interface fuer --scan-once waehlen.
+
+    Prioritaet:
+      1. Live-Monitor + 5-GHz-faehig (Best-Case)
+      2. 5-GHz-faehig (Mode-Switch via P52d)
+      3. Live-Monitor (2.4-GHz-only)
+      4. Monitor-faehig
+      5. irgendein WLAN-Adapter
+    """
     try:
         adapters = HardwareScanner().scan_wlan()
     except (OSError, AttributeError, RuntimeError, ValueError):
         adapters = []
-    for a in adapters:
+    try:
+        _pf = globals().get("MonitorPreflight")
+        live_monitors = set(_pf._monitor_interfaces()) if _pf else set()
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        live_monitors = set()
+
+    def _name(a: dict) -> str:
+        n = a.get("iface") or a.get("name")
+        return str(n) if n else ""
+
+    def _is_mon(a: dict) -> bool:
         if a.get("supports_monitor") or a.get("monitor"):
-            iface = a.get("iface") or a.get("name")
-            if iface:
-                return str(iface)
+            return True
+        return _name(a) in live_monitors
+
+    def _is_5(a: dict) -> bool:
+        return bool(a.get("supports_5ghz"))
+
+    # 1. Live-Monitor + 5 GHz
     for a in adapters:
-        iface = a.get("iface") or a.get("name")
-        if iface:
-            return str(iface)
+        if _name(a) in live_monitors and _is_5(a):
+            return _name(a)
+    # 2. 5 GHz (Mode-Switch via P52d)
+    for a in adapters:
+        if _is_5(a):
+            return _name(a)
+    # 3. Live-Monitor (2.4 only)
+    for a in adapters:
+        if _name(a) in live_monitors:
+            return _name(a)
+    # 4. Monitor-faehig (nicht live)
+    for a in adapters:
+        if _is_mon(a):
+            return _name(a)
+    # 5. irgendeins
+    for a in adapters:
+        n = _name(a)
+        if n:
+            return n
     return ""
 
 
@@ -91882,12 +93801,25 @@ def _scan_multi_pick_ifaces() -> tuple:
     except (OSError, AttributeError, RuntimeError, ValueError):
         return ("", "")
     entries: list = []
+    _seen_names: set = set()
+    # v37-R34 P52b: Live-Monitor-Interfaces voranstellen.
+    try:
+        _pf = globals().get("MonitorPreflight")
+        if _pf is not None:
+            for _nm in _pf._monitor_interfaces():
+                _nm_s = str(_nm)
+                if _nm_s and _nm_s not in _seen_names:
+                    entries.append((_nm_s, True))
+                    _seen_names.add(_nm_s)
+    except (OSError, ValueError, RuntimeError, AttributeError):
+        pass
     for a in adapters or []:
         if not isinstance(a, dict):
             continue
         name = a.get("iface") or a.get("name")
-        if not name:
+        if not name or str(name) in _seen_names:
             continue
+        _seen_names.add(str(name))
         entries.append((
             str(name),
             bool(a.get("supports_monitor") or a.get("monitor")),
@@ -95234,6 +97166,42 @@ def _scan_once_hopper(iface: str, channels: list, dwell: float,
         stop_event.wait(max(0.1, float(dwell)))
 
 
+def _scan_once_default_channels(iface: str) -> list:
+    """v37-R34 P52e: Sinnvolle Default-Kanaele fuer --scan-once.
+
+    Non-overlapping Standard-Kanaele je Band:
+      2.4 GHz:  1, 6, 11
+      5 GHz:    36, 40, 44, 48, 149, 153, 157, 161  (UNII-1 + UNII-3)
+      6 GHz:    1, 5, 9, 13, 17, 21, 25, 29  (20 MHz PSC)
+
+    Band-Auswahl basiert auf HardwareScanner.scan_wlan() (supports_5ghz,
+    supports_6ghz). Fallback: nur 2.4-GHz-Kanaele.
+    """
+    try:
+        adapters = HardwareScanner().scan_wlan()
+    except (OSError, AttributeError, RuntimeError, ValueError):
+        adapters = []
+
+    info = None
+    for a in adapters or []:
+        if not isinstance(a, dict):
+            continue
+        name = a.get("iface") or a.get("name")
+        if name and str(name) == iface:
+            info = a
+            break
+
+    has_5 = bool(info and info.get("supports_5ghz"))
+    has_6 = bool(info and info.get("supports_6ghz"))
+
+    channels: list = [1, 6, 11]
+    if has_5:
+        channels.extend([36, 40, 44, 48, 149, 153, 157, 161])
+    if has_6:
+        channels.extend([1, 5, 9, 13, 17, 21, 25, 29])
+    return channels
+
+
 def _scan_once_cli(iface: str = "", seconds: int = 30,
                    dump_ies: bool = False,
                    channels=None, dwell: float = 0.5,
@@ -95249,8 +97217,8 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
       - decoded_ies via collect_from_packet (DATA-2c-Pfad)
       - Ausgabe: Tabelle oder JSON (--scan-dump-ies)
 
-    Kein Qt, keine ScanEngine, kein Monitor-Mode-Setup.
-    Der User muss iface ggf. vorher selbst in Monitor-Modus setzen.
+    Kein Qt, keine ScanEngine. Monitor-Mode wird via P52d
+    automatisch sichergestellt (iw set type monitor).
     """
     if not SCAPY_VERFÜGBAR:
         _say("Scapy nicht verfuegbar - --scan-once nicht moeglich.",
@@ -95264,6 +97232,36 @@ def _scan_once_cli(iface: str = "", seconds: int = 30,
         _say("Kein WLAN-Interface gefunden. Bitte --scan-iface angeben.",
               file=sys.stderr)
         return 1
+
+    # v37-R34 P52d: Monitor-Mode sicherstellen
+    try:
+        _mon_ok, _mon_msg = _scan_once_ensure_monitor(iface)
+        if _mon_ok:
+            _say(f"[scan-once] {iface}: {_mon_msg}")
+        else:
+            _say(
+                f"[scan-once] Warnung: {iface} nicht im Monitor-Mode "
+                f"({_mon_msg}). Sniffing kann leer bleiben.",
+                file=sys.stderr,
+            )
+    except (OSError, ValueError, RuntimeError) as _exc:
+        _say(f"[scan-once] Monitor-Check fehlgeschlagen: {_exc}",
+             file=sys.stderr)
+
+    # v37-R34 P52e: Default-Kanaele ableiten, wenn keine angegeben.
+    if not channels:
+        try:
+            channels = _scan_once_default_channels(iface)
+            if channels:
+                _say(
+                    f"[scan-once] Default-Kanaele fuer {iface}: "
+                    f"{channels}"
+                )
+        except (OSError, ValueError, RuntimeError) as _exc:
+            _say(
+                f"[scan-once] Default-Kanaele Fehler: {_exc}",
+                file=sys.stderr,
+            )
 
     try:
         seconds = max(0, int(seconds))
