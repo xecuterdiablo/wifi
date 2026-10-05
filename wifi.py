@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# WLAN Security Suite — WLAN Security Pro
-# Version 9.0.0 — Code-Revision v37-R19h
+# WLAN Ultimate Security Suite — Fusion aus WLANdragon + WLAN Security Pro
+# Version 9.0.0 — Code-Revision v37-R34 P63
 # Lizenz: GPL v3
 # Python: 3.12+ (getestet auf 3.14)
 # ──────────────────────────────────────────────────────────────────────
@@ -28,6 +28,13 @@
 #   21. WordlistManager / AdapterController
 #   22. FeatureStatus / SystemSnapshot / Timeline / Pattern / ClientTracker
 #   23. KillChain / ReportGenerator
+#   24. NetworkRecovery (P62) - Diagnose/Snapshot/3-Level-Recovery
+#   25. RecoveryTab / RecoveryMixin (P63) - GUI-Recovery
+#   26. PlatformCompat (P61) - Kernel/Distro/Treiber-Check
+#   27. AnchorRegistry (P54) - Anker-Kollisionsschutz
+#   28. OllamaMemory (P52) - Session-Memory mit Dupletten-Schutz
+#   29. LRV / Enforcer / Completeness (P57-P60) - Selbstheilung
+#   30. patch_gen-Modus (P53) - KI schreibt Patch-Drafts
 # ──────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -1379,6 +1386,57 @@ def apply_arch_fixes() -> None:
 
     print(f"[System] DISPLAY: {os.environ.get('DISPLAY')}")
     print(f"[System] QT_QPA_PLATFORM: {os.environ.get('QT_QPA_PLATFORM')}")
+
+
+# v37-R34 P65a: zentraler GUI-Main-Window-Lookup (vorher 14x dupliziert)
+def _find_gui_main_window():
+    """Sucht die WLANUltimateGUI in der QApplication.
+
+    Nur Top-Level-Widgets mit 'interface_manager'. SelfTestTab
+    behaelt seine eigene _find_gui-Variante.
+    """
+    try:
+        app = QApplication.instance()
+        if not app:
+            return None
+        for w in app.topLevelWidgets():
+            if hasattr(w, "interface_manager"):
+                return w
+    except (AttributeError, RuntimeError):
+        pass
+    return None
+
+
+# v37-R34 P65b: HTML-Basic-Escape (vorher 6x dupliziert)
+def _html_esc_basic(s):
+    """Escaped &, <, > fuer HTML. Laesst " unangetastet.
+
+    Fuer Attributwerte mit " die erweiterte Variante in
+    HtmlReportGenerator._esc nutzen.
+    """
+    return (
+        str(s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+# v37-R34 P65f: Signal-Emit mit Fehlerschutz (vorher 2x dupliziert)
+def _safe_emit_signal(logger, signal, *args) -> None:
+    """signal.emit(*args) mit Debug-Log statt Crash.
+
+    RuntimeError tritt auf, wenn das QObject-Thread-Affinity nicht
+    stimmt; TypeError bei Argument-Mismatch; AttributeError wenn das
+    Signal-Objekt beschaedigt ist. Alles landet im Debug-Log.
+    """
+    try:
+        signal.emit(*args)
+    except (RuntimeError, TypeError, AttributeError) as exc:
+        try:
+            logger.debug(f"Signal-Emit: {exc}")
+        except (AttributeError, RuntimeError):
+            pass
 
 
 class OllamaClient:
@@ -9395,36 +9453,20 @@ class AdapterController:
     def set_channel(
         self, iface: str, channel: int, width: int = 20
     ) -> tuple[bool, str]:
-        """Kanal + Bandbreite setzen."""
+        """Kanal + Bandbreite setzen (V2b: ueber ChannelScheduler)."""
+        sched = get_channel_scheduler()
         try:
-            if width and width > 20:
-                freq = AppKonstanten.get_frequency(int(channel))
-                if freq is None:
-                    return False, f"Kanal {channel} unbekannt"
-                cmd = [
-                    "iw",
-                    "dev",
-                    iface,
-                    "set",
-                    "freq",
-                    str(freq),
-                    f"{width}MHz",
-                ]
-            else:
-                cmd = [
-                    "iw",
-                    "dev",
-                    iface,
-                    "set",
-                    "channel",
-                    str(channel),
-                ]
-            rc, _, err = self._run(cmd, tag="ch")
-            if rc == 0:
+            with sched.acquire(
+                iface, channel,
+                holder="adapter-ctl",
+                priority=ChannelPriority.MANUAL,
+                width=width,
+            ):
                 return True, f"Kanal {channel}"
-            return False, (err or "")[:80]
-        except Exception as e:
-            return False, str(e)
+        except ChannelBusy as exc:
+            return False, f"Kanal {channel} belegt: {exc}"
+        except RuntimeError as exc:
+            return False, str(exc)[:80]
 
     def _read_tx_power_dbm(self, iface: str) -> int | None:
         """Liest die aktuelle TX-Power in dBm (mit Fallback-Chain).
@@ -10997,6 +11039,41 @@ class ReportGenerator:
             return None
 
 
+# ══════════════════════════════════════════════════════════════════
+# V1b — InterfaceStateMachine Singleton-Factory
+# ══════════════════════════════════════════════════════════════════
+# Eine prozessweite SM, geteilt von allen WLANInterface-Instanzen
+# und vom MonitorPreflight (V1c). Der globale Lock der SM sorgt fuer
+# Serialisierung ueber alle Interfaces hinweg.
+#
+# Hinweis: InterfaceStateMachine ist in Datei-Reihenfolge NACH dieser
+# Factory definiert. Das ist ok — 'from __future__ import annotations'
+# macht die Annotation zur String-Referenz, und die Klasse wird erst
+# zur Laufzeit beim ersten Aufruf von get_interface_sm() gebraucht.
+# ══════════════════════════════════════════════════════════════════
+
+_IFACE_SM_INSTANCE: InterfaceStateMachine | None = None
+_IFACE_SM_LOCK = threading.Lock()
+
+
+def get_interface_sm(logger=None, timing=None) -> InterfaceStateMachine:
+    """
+    Liefert die prozessweite InterfaceStateMachine (lazy, thread-safe).
+    logger und timing werden nur beim ersten Aufruf beruecksichtigt.
+    """
+    global _IFACE_SM_INSTANCE
+    with _IFACE_SM_LOCK:
+        if _IFACE_SM_INSTANCE is None:
+            if logger is None:
+                # V1g: unter "wlan_ultimate.*", damit der DebugManager-FileHandler
+                # die [SM]-Transitions in die Log-Datei schreibt.
+                logger = logging.getLogger("wlan_ultimate.iface_sm")
+            _IFACE_SM_INSTANCE = InterfaceStateMachine(
+                logger=logger, timing=timing,
+            )
+        return _IFACE_SM_INSTANCE
+
+
 class WLANInterface:
     """
     Vollständiger Lese-, Schreib- und Analyse-Wrapper für einen WLAN-Adapter.
@@ -11419,6 +11496,12 @@ class WLANInterface:
 
         # Änderungs-Historie: [{timestamp, description}, ...]
         self._change_history: deque = deque(maxlen=100)
+
+        # V1b: Zentrale Interface-Zustandsmaschine (prozessweiter
+        # Singleton). Registriert dieses Interface, damit spaetere
+        # acquire()-Aufrufe (V1c+) sauber serialisiert werden.
+        self._sm = get_interface_sm()
+        self._sm.register(self.name)
 
         # Fehlerzähler (für Diagnose)
         self._error_count: int = 0
@@ -12480,18 +12563,23 @@ class WLANInterface:
             self.logger.warning(f"Kanal {channel} nicht unterstützt.")
             return False
 
+        # V2b: Kanalwechsel ueber ChannelScheduler (serialisiert gegen
+        # andere Kanal-Nutzer auf demselben Interface).
+        sched = get_channel_scheduler()
         try:
-            subprocess.run(
-                ["iw", "dev", self.name, "set", "channel", str(channel)],
-                check=True,
-                timeout=3,
-                capture_output=True,
-            )
-            self.aktiver_kanal = channel
-            self.aktuelle_frequenz_mhz = self.kanal_frequenzen.get(channel, 0.0)
-            self._record_change(f"kanal → {channel}")
-            return True
-        except (subprocess.SubprocessError, OSError) as exc:
+            with sched.acquire(
+                self.name, channel,
+                holder="iface",
+                priority=ChannelPriority.MANUAL,
+            ):
+                self.aktiver_kanal = channel
+                self.aktuelle_frequenz_mhz = self.kanal_frequenzen.get(channel, 0.0)
+                self._record_change(f"kanal → {channel}")
+                return True
+        except ChannelBusy as exc:
+            self.logger.debug(f"Kanal belegt: {exc}")
+            return False
+        except RuntimeError as exc:
             self.logger.debug(f"Kanal-Setzen fehlgeschlagen: {exc}")
             return False
 
@@ -16382,16 +16470,16 @@ class LiveRSSIMeasurer:
         rssi_values: list[int] = []
         noise_values: list[int] = []
 
-        # Optional: Kanal setzen
+        # Optional: Kanal setzen (V2c: ueber ChannelScheduler)
         if channel:
             try:
-                subprocess.run(
-                    ["iw", "dev", interface, "set", "channel", str(channel)],
-                    check=False,
-                    timeout=2,
-                    capture_output=True,
-                )
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                with get_channel_scheduler().acquire(
+                    interface, channel,
+                    holder="rssi-measurer",
+                    priority=ChannelPriority.MANUAL,
+                ):
+                    pass
+            except (ChannelBusy, RuntimeError):
                 pass
 
         # Callback für Scapy
@@ -17933,6 +18021,38 @@ class DatenbankManager:
                 results TEXT
             )
         """)
+
+        # P90b-2: WIDS-Alerts (passive Intrusion Detection).
+        # Persistenz der Alerts aus WIDSMonitor. Kein Foreign-Key —
+        # Alerts koennen auch ohne aktive Session anfallen.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS wids_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_ns INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                severity INTEGER NOT NULL,
+                severity_name TEXT,
+                iface TEXT,
+                bssid TEXT,
+                ssid TEXT,
+                reason TEXT,
+                evidence TEXT,
+                session_id TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wids_alerts_kind "
+            "ON wids_alerts(kind)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wids_alerts_ts "
+            "ON wids_alerts(ts_ns)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_wids_alerts_bssid "
+            "ON wids_alerts(bssid)"
+        )
 
         # Indizes
         cursor.execute(
@@ -20137,30 +20257,21 @@ class InterfaceManager:
                 logger.error(f"Interface {interface_name} nicht gefunden.")
                 return False
 
+            # V1d: Modus-Wechsel laeuft ueber die zentrale
+            # InterfaceStateMachine. Serialisiert gegen
+            # _force_monitor_mode (MonitorPreflight) und alle
+            # weiteren SM-Nutzer. Verifikation via 'iw dev <i> info'
+            # passiert in InterfaceStateMachine._do_transition.
+            sm = get_interface_sm(logger)
             try:
-                # Interface kurz runter
-                subprocess.run(
-                    ["ip", "link", "set", interface_name, "down"],
-                    check=True,
-                    timeout=5,
-                    capture_output=True,
-                )
-                # Typ auf managed setzen
-                subprocess.run(
-                    ["iw", "dev", interface_name, "set", "type", "managed"],
-                    check=True,
-                    timeout=5,
-                    capture_output=True,
-                )
-                # Interface hoch
-                subprocess.run(
-                    ["ip", "link", "set", interface_name, "up"],
-                    check=True,
-                    timeout=5,
-                    capture_output=True,
-                )
+                with sm.acquire(
+                    interface_name,
+                    InterfaceState.MANAGED,
+                    holder="iface-mgr",
+                ):
+                    pass  # Wechsel passiert beim __enter__
 
-                # Status aktualisieren
+                # Status aktualisieren (IM-eigener Zustand, nicht SM)
                 iface.aktiver_modus = "managed"
                 self.monitor_mode_active[interface_name] = False
                 self._monitor_interfaces.discard(interface_name)
@@ -20168,11 +20279,13 @@ class InterfaceManager:
                 logger.info(f"Managed-Modus aktiviert auf {interface_name}.")
                 return True
 
-            except (
-                subprocess.CalledProcessError,
-                subprocess.TimeoutExpired,
-                OSError,
-            ) as exc:
+            except InterfaceBusy as exc:
+                logger.warning(
+                    f"Managed-Modus für {interface_name} blockiert: {exc}"
+                )
+                return False
+
+            except RuntimeError as exc:
                 logger.error(
                     f"Managed-Modus für {interface_name} fehlgeschlagen: {exc}"
                 )
@@ -20184,16 +20297,21 @@ class InterfaceManager:
             iface = self.interfaces.get(interface_name)
             if not iface or iface.aktiver_modus != "monitor":
                 return False
+            # V2b: Kanalwechsel ueber ChannelScheduler. Der IM-Lock
+            # bleibt waehrend des Vorgangs gehalten, damit
+            # setze_managed_mode nicht parallel laeuft (beide nehmen
+            # zuerst IM-Lock, dann SM-/Scheduler-Lock — keine Deadlock-
+            # Gefahr).
+            sched = get_channel_scheduler()
             try:
-                subprocess.run(
-                    ["iw", "dev", interface_name, "set", "channel", str(channel)],
-                    check=True,
-                    timeout=3,
-                    capture_output=True,
-                )
-                iface.aktiver_kanal = channel
-                return True
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                with sched.acquire(
+                    interface_name, channel,
+                    holder="iface-mgr",
+                    priority=ChannelPriority.MANUAL,
+                ):
+                    iface.aktiver_kanal = channel
+                    return True
+            except (ChannelBusy, RuntimeError):
                 return False
 
     # ------------------------------------------------------------
@@ -20319,72 +20437,47 @@ class PlatformUtils:
         if not PlatformUtils.is_root():
             PlatformUtils._logger.error("Monitor-Modus erfordert Root-Rechte.")
             return False
-        # v37-R33: State-Recovery - Interface darf nicht DOWN bleiben
-        _iface_was_down = False
+        # V1e: Modus-Wechsel laeuft ueber die zentrale
+        # InterfaceStateMachine. Serialisiert gegen _force_monitor_mode
+        # (MonitorPreflight) und setze_managed_mode (InterfaceManager).
+        # Die SM verifiziert den neuen Typ via 'iw dev <i> info'.
+        sm = get_interface_sm(PlatformUtils._logger)
         try:
-            subprocess.run(
-                ["ip", "link", "set", iface, "down"],
-                check=True, timeout=5,
+            with sm.acquire(
+                iface, InterfaceState.MONITOR, holder="platform",
+            ):
+                pass  # Wechsel passiert beim __enter__
+        except InterfaceBusy as exc:
+            PlatformUtils._logger.warning(
+                f"Monitor-Modus für {iface} blockiert: {exc}"
             )
-            _iface_was_down = True
+            return False
+        except RuntimeError as exc:
+            PlatformUtils._logger.error(
+                f"Monitor-Modus für {iface} fehlgeschlagen: {exc}"
+            )
+            return False
 
-            # Innerer Block: bei Fehler Interface wieder up
+        # alfa_optimize: Best-Effort-Tuning NACH erfolgreichem Wechsel.
+        # Fehler hier sind unkritisch und brechen den Moduswechsel nicht.
+        if alfa_optimize:
             try:
                 subprocess.run(
-                    ["iw", "dev", iface, "set", "type", "monitor"],
-                    check=True, timeout=5,
+                    ["iwconfig", iface, "power", "off"],
+                    check=False, timeout=3,
                 )
-                if alfa_optimize:
-                    try:
-                        subprocess.run(
-                            ["iwconfig", iface, "power", "off"],
-                            check=False, timeout=3,
-                        )
-                        subprocess.run(
-                            ["iw", "dev", iface, "set", "txpower",
-                             "fixed", "3000"],
-                            check=False, timeout=3,
-                        )
-                    except (subprocess.SubprocessError, OSError):
-                        pass
-            except (subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired, OSError) as _inner:
-                # Recovery: Interface wieder up (Typ bleibt wie vorher)
-                try:
-                    subprocess.run(
-                        ["ip", "link", "set", iface, "up"],
-                        check=False, timeout=5,
-                    )
-                    PlatformUtils._logger.warning(
-                        f"Monitor-Mode fehlgeschlagen, {iface} wieder "
-                        f"hergestellt: {_inner}"
-                    )
-                except (subprocess.SubprocessError, OSError):
-                    pass
-                return False
+                subprocess.run(
+                    ["iw", "dev", iface, "set", "txpower",
+                     "fixed", "3000"],
+                    check=False, timeout=3,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
 
-            subprocess.run(
-                ["ip", "link", "set", iface, "up"],
-                check=True, timeout=5,
-            )
-            _iface_was_down = False
-            PlatformUtils._logger.info(
-                f"Monitor-Modus für {iface} aktiviert."
-            )
-            return True
-        except subprocess.CalledProcessError as e:
-            PlatformUtils._logger.error(
-                f"Fehler beim Aktivieren des Monitor-Modus: {e}"
-            )
-            return False
-        except subprocess.TimeoutExpired as e:
-            PlatformUtils._logger.error(
-                f"Timeout beim Aktivieren des Monitor-Modus: {e}"
-            )
-            return False
-        except OSError as e:
-            PlatformUtils._logger.error(f"OS-Fehler: {e}")
-            return False
+        PlatformUtils._logger.info(
+            f"Monitor-Modus für {iface} aktiviert."
+        )
+        return True
 
     @staticmethod
     def disable_monitor_mode(iface: str) -> bool:
@@ -20393,43 +20486,28 @@ class PlatformUtils:
             return False
         if not PlatformUtils.is_root():
             return False
-        # v37-R33: State-Recovery
+        # V1e: Modus-Wechsel ueber die zentrale InterfaceStateMachine.
+        sm = get_interface_sm(PlatformUtils._logger)
         try:
-            subprocess.run(
-                ["ip", "link", "set", iface, "down"],
-                check=True, timeout=5,
-            )
-            try:
-                subprocess.run(
-                    ["iw", "dev", iface, "set", "type", "managed"],
-                    check=True, timeout=5,
-                )
-            except (subprocess.CalledProcessError,
-                    subprocess.TimeoutExpired, OSError) as _inner:
-                try:
-                    subprocess.run(
-                        ["ip", "link", "set", iface, "up"],
-                        check=False, timeout=5,
-                    )
-                except (subprocess.SubprocessError, OSError):
-                    pass
-                PlatformUtils._logger.error(
-                    f"Managed-Mode fehlgeschlagen: {_inner}"
-                )
-                return False
-            subprocess.run(
-                ["ip", "link", "set", iface, "up"],
-                check=True, timeout=5,
-            )
-            PlatformUtils._logger.info(
-                f"Managed-Modus für {iface} wiederhergestellt."
-            )
-            return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-            PlatformUtils._logger.error(
-                f"Fehler beim Deaktivieren des Monitor-Modus: {e}"
+            with sm.acquire(
+                iface, InterfaceState.MANAGED, holder="platform",
+            ):
+                pass
+        except InterfaceBusy as exc:
+            PlatformUtils._logger.warning(
+                f"Managed-Modus für {iface} blockiert: {exc}"
             )
             return False
+        except RuntimeError as exc:
+            PlatformUtils._logger.error(
+                f"Managed-Modus für {iface} fehlgeschlagen: {exc}"
+            )
+            return False
+
+        PlatformUtils._logger.info(
+            f"Managed-Modus für {iface} wiederhergestellt."
+        )
+        return True
 
     @staticmethod
     def set_tx_power(iface: str, power_dbm: int) -> bool:
@@ -20455,19 +20533,22 @@ class PlatformUtils:
 
     @staticmethod
     def set_channel(iface: str, channel: int) -> bool:
-        """Setzt den Kanal (nur im Monitor-Modus)."""
+        """Setzt den Kanal (nur im Monitor-Modus) — V2b2 via Scheduler."""
         if not PlatformUtils.is_linux():
             return False
+        sched = get_channel_scheduler(PlatformUtils._logger)
         try:
-            subprocess.run(
-                ["iw", "dev", iface, "set", "channel", str(channel)],
-                check=True,
-                timeout=3,
-                capture_output=True,
-            )
-            return True
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
-            PlatformUtils._logger.debug(f"Fehler beim Setzen des Kanals: {e}")
+            with sched.acquire(
+                iface, channel,
+                holder="platform",
+                priority=ChannelPriority.MANUAL,
+            ):
+                return True
+        except ChannelBusy as exc:
+            PlatformUtils._logger.debug(f"Kanal belegt: {exc}")
+            return False
+        except RuntimeError as exc:
+            PlatformUtils._logger.debug(f"Fehler beim Setzen des Kanals: {exc}")
             return False
 
     # ------------------------------------------------------------
@@ -26134,17 +26215,16 @@ class InjectionTester:
             self.last_report = report
             return report
 
-        # 3) Kanal setzen (wichtig!)
+        # 3) Kanal setzen (wichtig!) — V2c via ChannelScheduler
         if channel:
             try:
-                subprocess.run(
-                    ["iw", "dev", iface, "set", "channel", str(channel)],
-                    capture_output=True,
-                    timeout=3,
-                    check=False,
-                )
-                time.sleep(0.3)
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                with get_channel_scheduler().acquire(
+                    iface, channel,
+                    holder="inj-test",
+                    priority=ChannelPriority.CAPTURE,
+                ):
+                    time.sleep(0.3)
+            except (ChannelBusy, RuntimeError):
                 pass
 
         # 4) Broadcast-Test — nur wenn KEIN NAT
@@ -26993,16 +27073,15 @@ class IntelligentHandshakeCapture(QThread):
                 )
                 return
 
-            # Kanal setzen
+            # Kanal setzen — V2c via ChannelScheduler (CAPTURE-Prio)
             try:
-                subprocess.run(
-                    ["iw", "dev", self.iface, "set", "channel", str(self.channel)],
-                    capture_output=True,
-                    timeout=3,
-                    check=False,
-                )
-                time.sleep(0.4)
-            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                with get_channel_scheduler().acquire(
+                    self.iface, self.channel,
+                    holder="handshake-cap",
+                    priority=ChannelPriority.CAPTURE,
+                ):
+                    time.sleep(0.4)
+            except (ChannelBusy, RuntimeError):
                 pass
 
             # Airodump starten
@@ -27908,9 +27987,8 @@ class TopologyExporter:
 
     @staticmethod
     def _esc(s):
-        return (
-            str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        # v37-R34 P65b: delegiert an Modul-Helper
+        return _html_esc_basic(s)
 
     @classmethod
     def _collect(cls, mapper, fp_cache, traffic_cache) -> dict:
@@ -28423,16 +28501,26 @@ class FocusController(QThread):
                 return
             self.status_change.emit(detail, "OK")
 
-            # 2. Kanal locken
+            # 2. Kanal locken — V2c via ChannelScheduler (CAPTURE-Prio).
+            # Hinweis: dies ist ein KURZER Lease; ein dauerhafter
+            # Kanal-Lock (Focus-Modus) braucht V2c-Followup mit
+            # Lease-Lebensdauer bis Thread-Ende.
             self.status_change.emit(
                 f"Locke Kanal {self.channel} auf {self.iface} …", "INFO"
             )
-            r = subprocess.run(
-                ["iw", "dev", self.iface, "set", "channel", str(self.channel)],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
+            _focus_ok = False
+            _focus_err = ""
+            try:
+                with get_channel_scheduler().acquire(
+                    self.iface, self.channel,
+                    holder="focus",
+                    priority=ChannelPriority.CAPTURE,
+                ):
+                    _focus_ok = True
+            except (ChannelBusy, RuntimeError) as exc:
+                _focus_err = str(exc)
+            r = type("_R", (), {"returncode": 0 if _focus_ok else 1,
+                                "stderr": _focus_err})()
             if r.returncode != 0:
                 self.status_change.emit(
                     f"Kanal-Setzen fehlgeschlagen: " f"{(r.stderr or '').strip()[:80]}",
@@ -28839,9 +28927,8 @@ class ClientDetailDialog(QDialog):
 
     @staticmethod
     def _esc(s):
-        return (
-            str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        # v37-R34 P65b: delegiert an Modul-Helper
+        return _html_esc_basic(s)
 
 
 # ----------------------------------------------------------------
@@ -29693,9 +29780,8 @@ class HandshakeFromClientDialog(QDialog):
 
     @staticmethod
     def _esc(s):
-        return (
-            str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        # v37-R34 P65b: delegiert an Modul-Helper
+        return _html_esc_basic(s)
 
 
 # ----------------------------------------------------------------
@@ -29755,15 +29841,15 @@ class MultiClientHandshakeCapture(QThread):
         self._log(f"Starte Sammel-Capture über {len(self.clients)} " f"Clients", "OK")
         total = len(self.clients)
 
-        # Kanal sicherstellen
+        # Kanal sicherstellen — V2c via ChannelScheduler (CAPTURE-Prio)
         try:
-            subprocess.run(
-                ["iw", "dev", self.iface, "set", "channel", str(self.channel)],
-                capture_output=True,
-                timeout=3,
-                check=False,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            with get_channel_scheduler().acquire(
+                self.iface, self.channel,
+                holder="multi-capture",
+                priority=ChannelPriority.CAPTURE,
+            ):
+                pass
+        except (ChannelBusy, RuntimeError):
             pass
 
         # Airodump starten
@@ -29882,16 +29968,8 @@ class ClientDetailDialogV2(QDialog):
         self._build()
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -30530,9 +30608,8 @@ class ClientDetailDialogV2(QDialog):
 
     @staticmethod
     def _esc(s):
-        return (
-            str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        # v37-R34 P65b: delegiert an Modul-Helper
+        return _html_esc_basic(s)
 
 
 # == v9.5: crack-automation ==
@@ -32163,16 +32240,8 @@ class TrendTab(QWidget):
         self._refresh()
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _refresh(self):
         if self._store is None or self._fig is None:
@@ -32287,9 +32356,8 @@ class ReportGeneratorV2:
 
     @staticmethod
     def _esc(s):
-        return (
-            str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        # v37-R34 P65b: delegiert an Modul-Helper
+        return _html_esc_basic(s)
 
     def _html_head(self):
         return """<!DOCTYPE html>
@@ -32673,16 +32741,8 @@ class PresetTab(QWidget):
         layout.addWidget(self.status_label)
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _refresh(self):
         self.list_widget.clear()
@@ -33016,16 +33076,8 @@ class ProjectTab(QWidget):
         layout.addWidget(self.status)
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _refresh_info(self):
         gui = self._find_gui()
@@ -33479,16 +33531,8 @@ class FilterTab(QWidget):
         self._on_apply()
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _on_apply(self):
         gui = self._find_gui()
@@ -35021,16 +35065,8 @@ class HandshakeLibTab(QWidget):
             return None
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _scan_folders(self):
         """Sucht neue Captures und trägt sie ein."""
@@ -35386,9 +35422,8 @@ class APDetailDialog(QDialog):
 
     @staticmethod
     def _esc(s):
-        return (
-            str(s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        )
+        # v37-R34 P65b: delegiert an Modul-Helper
+        return _html_esc_basic(s)
 
     def _build_info_html(self, net):
         h = ["<h2>Details</h2><table cellpadding=4>"]
@@ -35543,16 +35578,8 @@ class APDetailDialog(QDialog):
             )
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
 
 # ----------------------------------------------------------------
@@ -35745,16 +35772,8 @@ class ScheduledScannerTab(QWidget):
         layout.addWidget(self.log, 1)
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _log(self, msg):
         try:
@@ -35964,16 +35983,8 @@ class NetworkDiffTab(QWidget):
         layout.addWidget(self.status_label)
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _take_snapshot(self, which: str):
         gui = self._find_gui()
@@ -36679,16 +36690,8 @@ class MultiTargetTab(QWidget):
         layout.addWidget(self.status_label)
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _pick_wordlist(self):
         fn, _ = QFileDialog.getOpenFileName(
@@ -37056,16 +37059,8 @@ class SecurityTab(QWidget):
         self._filter = None
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def _on_filter(self, key):
         self._filter = key
@@ -37308,16 +37303,8 @@ class RogueAPTab(QWidget):
         self._last_result = []
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def refresh(self):
         gui = self._find_gui()
@@ -37571,16 +37558,8 @@ class ChannelAnalyzerTab(QWidget):
             pass
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     def refresh(self):
         gui = self._find_gui()
@@ -38086,16 +38065,8 @@ class WordlistGenTab(QWidget):
         layout.addWidget(self.preview, 1)
 
     def _find_gui(self):
-        try:
-            app = QApplication.instance()
-            if not app:
-                return None
-            for w in app.topLevelWidgets():
-                if hasattr(w, "interface_manager"):
-                    return w
-        except (AttributeError, RuntimeError):
-            pass
-        return None
+        # v37-R34 P65a: delegiert an Modul-Helper
+        return _find_gui_main_window()
 
     _DEFAULT_PASSWORDS = [
         "admin",
@@ -43300,11 +43271,20 @@ class ScanEngine:
         ai_processor=None,
         discovery_engine=None,
         timing_profile=None,
+        db_manager=None,
     ):
         self.config = config
         self.iface_mgr = interface_manager
         self.event_bus = event_bus
         self.ai_processor = ai_processor
+        # P90b-4a: DB-Referenz fuer WIDS-Alert-Persistenz (optional).
+        self._db_manager = db_manager
+        # P-GUI-1: packet_captured throtteln. Ohne Limit schiebt die
+        # ScanEngine >1000 Qt-Events/s in den Main-Thread-Eventloop,
+        # was die GUI blockiert (z.B. Minimieren/Maximieren kommt
+        # erst nach Scan-Ende durch).
+        self._last_packet_emit_ns: int = 0
+        self._packet_emit_interval_ns: int = 100_000_000  # 10 Hz
 
         self.logger = logging.getLogger("wlan_ultimate.ScanEngine")
         self.logger.propagate = True
@@ -43485,6 +43465,21 @@ class ScanEngine:
         self._last_stats_time = self._start_time
         self._last_packet_time = self._start_time
         self._last_diagnostic_time = self._start_time
+
+        # P90b-4a: WIDS-Registrierung beim ScanStart. Idempotent —
+        # mehrfacher Start ersetzt die Channels. Fehler hier brechen
+        # den Scan nicht ab.
+        try:
+            _names = register_default_wids_channels(
+                logger=self.logger,
+                db_manager=getattr(self, "_db_manager", None),
+                event_bus=self.event_bus,
+            )
+            self.logger.info(
+                f"WIDS-Channels registriert: {_names}"
+            )
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+            self.logger.debug(f"WIDS-Registrierung beim ScanStart: {exc}")
 
         if self._pending_max_duration > 0:
             self._max_duration = self._pending_max_duration
@@ -43698,15 +43693,17 @@ class ScanEngine:
                     return False
 
                 if 6 in channels:
+                    # V2c-2: Kanalwechsel ueber Scheduler. Nur wenn
+                    # kein WIDS/Capture den Kanal haelt, wird Kanal 6
+                    # fuer den Start-Sanity-Check gesetzt.
                     try:
-                        CommandRunner.run(
-                            ["iw", "dev", iface_name, "set", "channel", "6"],
-                            subsystem="scan",
-                            tag=f"startch[{iface_name}]",
-                            timeout=2,
-                            soft_fail=True,
-                        )
-                    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                        with get_channel_scheduler().acquire(
+                            iface_name, 6,
+                            holder="scan-health",
+                            priority=ChannelPriority.SCAN,
+                        ):
+                            pass
+                    except (ChannelBusy, RuntimeError):
                         pass
 
                 def _packet_callback(pkt, _iface=iface_name):
@@ -43875,22 +43872,23 @@ class ScanEngine:
 
             # P10.1: Nur wechseln wenn Kanal sich aendert
             if channel != last_channel:
-                rc, _out, err = CommandRunner.run(
-                    ["iw", "dev", iface_name, "set", "channel",
-                     str(channel)],
-                    subsystem="scan",
-                    tag=f"hopper[{iface_name}]",
-                    soft_fail=True,
-                    timeout=1,
-                )
-                if rc != 0:
+                # V2c-2: Hopper laeuft mit Prio HOP — WIDS/Capture
+                # koennen den Kanal jederzeit uebernehmen. Der Hopper
+                # blockiert dann nur kurz und versucht es spaeter neu.
+                try:
+                    with get_channel_scheduler().acquire(
+                        iface_name, channel,
+                        holder="hopper",
+                        priority=ChannelPriority.HOP,
+                    ):
+                        if settle_time > 0:
+                            self._stop_event.wait(settle_time)
+                except ChannelBusy:
+                    self._stop_event.wait(0.1)
+                except RuntimeError as exc:
                     self.logger.debug(
-                        f"[{iface_name}] Kanal {channel} fehlgeschlagen: "
-                        f"{err.strip() or 'rc=' + str(rc)}"
+                        f"[{iface_name}] Kanal {channel} fehlgeschlagen: {exc}"
                     )
-                elif settle_time > 0:
-                    # Settling: Karte braucht Zeit fuer Kanalwechsel
-                    self._stop_event.wait(settle_time)
 
             with self._lock:
                 self._current_channel = channel
@@ -44125,7 +44123,22 @@ class ScanEngine:
                 f"channel={result.get('channel', '?')!r}"
             )
 
-        self._safe_emit(self._signals.packet_captured, pkt)
+        # P-GUI-1: packet_captured nur mit 10 Hz emittieren.
+        # WICHTIG: erst NACH dem WIDS-Hook? Nein, wir lassen den
+        # WIDS-Hook direkt folgen, damit er ungedrosselt arbeitet
+        # (der Hook ist intern schnell + idempotent).
+        _now_ns = time.monotonic_ns()
+        if (_now_ns - self._last_packet_emit_ns) >= self._packet_emit_interval_ns:
+            self._last_packet_emit_ns = _now_ns
+            self._safe_emit(self._signals.packet_captured, pkt)
+
+        # P90b-2: WIDS-Hook — unabhaengig vom PacketProcessor-Ergebnis
+        # (sieht auch Deauth-Frames, die der Processor evtl. nicht
+        # klassifiziert). Fehler hier duerfen den Scan nicht stoeren.
+        try:
+            self._wids_observe_packet(pkt, result, iface_name, pkt_type)
+        except (RuntimeError, AttributeError, TypeError, ValueError) as exc:
+            self.logger.debug(f"WIDS-Hook: {exc}")
 
         if pkt_type in ("beacon", "probe_response"):
             self._ensure_signal(result, pkt)
@@ -44147,6 +44160,62 @@ class ScanEngine:
                 self.logger.debug(
                     f"[UNKNOWN] {pkt_type!r}, keys={list(result.keys())[:6]}"
                 )
+
+    def _wids_observe_packet(
+        self,
+        pkt: Any,
+        result: dict,
+        iface_name: str,
+        pkt_type: str,
+    ) -> None:
+        """P90b-2: Speist den WIDSMonitor mit Rohereignissen.
+
+        Laeuft unabhaengig vom PacketProcessor, damit auch Frames
+        erfasst werden, die nicht klassifiziert sind (z.B. Deauth-
+        Floods). Ausgabe geht an WIDSMonitor, nicht direkt an DB —
+        die Kanaele werden zentral registriert (P90b-3).
+        """
+        if not SCAPY_VERFÜGBAR:
+            return
+        wids = get_wids_monitor(self.logger)
+
+        # 1) Deauth / Disassoc — direkt aus dem Dot11-Subtyp
+        #    (kein Import von Dot11Deauth noetig; SCAPY-Konstanten
+        #     koennen je nach Version fehlen).
+        try:
+            if pkt.haslayer(Dot11):
+                d11 = pkt[Dot11]
+                dtype = getattr(d11, "type", -1)
+                dsub = getattr(d11, "subtype", -1)
+                # type=0 (Management), subtype=10 (Disassoc) oder
+                # 12 (Deauth)
+                if dtype == 0 and dsub in (10, 12):
+                    src = str(getattr(d11, "addr2", "") or "")
+                    dst = str(getattr(d11, "addr1", "") or "")
+                    bssid = str(getattr(d11, "addr3", "") or src)
+                    wids.observe_deauth(
+                        src, dst, bssid=bssid, iface=iface_name,
+                    )
+                    return
+        except (AttributeError, TypeError, IndexError):
+            pass
+
+        # 2) Beacon / ProbeResp — Fingerprint + Karma
+        if pkt_type in ("beacon", "probe_response"):
+            try:
+                fp = BeaconFingerprint.from_scan_result(result, pkt)
+                if fp is None:
+                    return
+                sig = int(result.get("signal", -100) or -100)
+                wids.observe_beacon(fp, iface=iface_name, signal=sig)
+                if pkt_type == "probe_response":
+                    wids.observe_probe_resp(
+                        str(result.get("bssid", "") or ""),
+                        str(result.get("ssid", "") or ""),
+                        iface=iface_name,
+                    )
+            except (AttributeError, TypeError, ValueError):
+                pass
 
     def _diagnose_packet_type(self, pkt: Any) -> None:
         if not SCAPY_VERFÜGBAR:
@@ -45761,10 +45830,8 @@ class ScanEngine:
         return dict(self._filter_counters)
 
     def _safe_emit(self, signal: Any, *args: Any) -> None:
-        try:
-            signal.emit(*args)
-        except (RuntimeError, TypeError, AttributeError) as exc:
-            self.logger.debug(f"Signal-Emit: {exc}")
+        # v37-R34 P65f: delegiert an Modul-Helper
+        _safe_emit_signal(self.logger, signal, *args)
 
     def _emit_event(self, event_type: str, data: Any) -> None:
         if self.event_bus is None:
@@ -55877,6 +55944,548 @@ class PlatformCompat:
 
 
 
+
+
+class NetworkRecovery:
+    """v37-R34 P62: Netzwerk-Recovery und Zustands-Snapshots.
+
+    Behebt haengende Monitor-Interfaces, gestoppte Backends und
+    unterbrochenes DHCP nach Skript-Absturz. Drei Recovery-Level
+    von soft bis emergency. Nutzt PlatformUtils fuer Mode-Switch.
+    """
+
+    SNAPSHOT_DIR_NAME = "network_state"
+    MAX_SNAPSHOTS = 10
+    BACKENDS = (
+        "NetworkManager", "systemd-networkd", "wpa_supplicant",
+        "connman", "networking", "dhcpcd",
+    )
+
+    # ── Pfade ────────────────────────────────────────────────────
+    @staticmethod
+    def _sudo_user_ids() -> tuple:
+        """v37-R34 P62c: (uid, gid) des SUDO_USER oder (None, None)."""
+        try:
+            sudo_user = os.environ.get("SUDO_USER", "").strip()
+            if not sudo_user or sudo_user == "root":
+                return (None, None)
+            if os.geteuid() != 0:
+                return (None, None)
+            import pwd as _pwd_p62
+            ent = _pwd_p62.getpwnam(sudo_user)
+            return (ent.pw_uid, ent.pw_gid)
+        except (KeyError, ImportError, AttributeError, OSError):
+            return (None, None)
+
+    @staticmethod
+    def _snapshot_dir() -> Path:
+        # v37-R34 P62b/c: SUDO_USER-aware Pfad + Owner.
+        base: Path | None = None
+        try:
+            sudo_user = os.environ.get("SUDO_USER", "").strip()
+            if (sudo_user and sudo_user != "root"
+                    and os.geteuid() == 0):
+                cand = Path(f"/home/{sudo_user}")
+                if cand.is_dir():
+                    base = cand / ".wlan_ultimate"
+        except (AttributeError, OSError):
+            pass
+        if base is None:
+            base = AppKonstanten.CACHE_DIR.parent
+        d = base / "cache" / NetworkRecovery.SNAPSHOT_DIR_NAME
+        d.mkdir(parents=True, exist_ok=True)
+        # v37-R34 P62c: Owner auf SUDO_USER setzen, damit auch
+        # nicht-sudo-Laeufe den Ordner lesen/schreiben koennen.
+        uid, gid = NetworkRecovery._sudo_user_ids()
+        if uid is not None and gid is not None:
+            try:
+                os.chown(d, uid, gid)
+                os.chmod(d, 0o700)
+            except (OSError, PermissionError):
+                pass
+        return d
+
+    # ── Basis-Helper ─────────────────────────────────────────────
+    @staticmethod
+    def _run(cmd: list, timeout: int = 5) -> tuple:
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        except (OSError, subprocess.SubprocessError):
+            return -1, ""
+
+    @staticmethod
+    def _is_root() -> bool:
+        try:
+            pu = globals().get("PlatformUtils")
+            if pu is not None and hasattr(pu, "is_root"):
+                return bool(pu.is_root())
+            return os.geteuid() == 0
+        except (AttributeError, OSError):
+            return False
+
+    @staticmethod
+    def _is_linux() -> bool:
+        try:
+            pu = globals().get("PlatformUtils")
+            if pu is not None and hasattr(pu, "is_linux"):
+                return bool(pu.is_linux())
+            return sys.platform.startswith("linux")
+        except (AttributeError, OSError):
+            return sys.platform.startswith("linux")
+
+    # ── Interfaces ───────────────────────────────────────────────
+    @classmethod
+    def _list_wlan_ifaces(cls) -> list:
+        rc, out = cls._run(["iw", "dev"])
+        if rc != 0:
+            return []
+        names: list = []
+        for line in out.splitlines():
+            s = line.strip()
+            if s.startswith("Interface "):
+                parts = s.split()
+                if len(parts) >= 2:
+                    names.append(parts[1])
+        return names
+
+    @classmethod
+    def _iface_info(cls, name: str) -> dict:
+        info = {"name": name, "type": "unknown", "up": False,
+                "has_ip": False, "ip": ""}
+        # v37-R34 P62b: iw kann bei Race kurz leer liefern — 2 Versuche.
+        for attempt in (0, 1):
+            rc, out = cls._run(["iw", "dev", name, "info"])
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    s = line.strip()
+                    if s.startswith("type "):
+                        parts = s.split(None, 1)
+                        if len(parts) > 1:
+                            info["type"] = parts[1].strip()
+                            break
+            if info["type"] != "unknown":
+                break
+            if attempt == 0:
+                time.sleep(0.15)
+        # ip-Addr
+        rc, out = cls._run(["ip", "-br", "addr", "show", name])
+        if rc == 0 and out.strip():
+            parts = out.split()
+            if len(parts) >= 2:
+                info["up"] = parts[1].upper() in ("UP", "UNKNOWN")
+            for p in parts[2:]:
+                if "/" in p and ":" not in p:
+                    info["has_ip"] = True
+                    info["ip"] = p
+                    break
+        return info
+
+    @classmethod
+    def _iface_has_ip(cls, name: str) -> bool:
+        """v37-R34 P62d: nur IPv4 — IPv6-Link-Local zaehlt nicht.
+
+        DHCP (dhclient) arbeitet ausschliesslich mit IPv4. Eine
+        vorhandene fe80::/64-Adresse ist kein Grund fuer einen
+        DHCP-Renew. Konsistent mit _iface_info (has_ip).
+        """
+        rc, out = cls._run(["ip", "-br", "addr", "show", name])
+        if rc != 0 or not out:
+            return False
+        # Format: "wlan0 UP 192.168.1.42/24 ..."
+        return any(
+            "/" in token and ":" not in token.split("/")[0]
+            for token in out.split()
+        )
+
+    @classmethod
+    def _all_ifaces(cls) -> list:
+        try:
+            d = Path("/sys/class/net")
+            return sorted([p.name for p in d.iterdir() if p.is_dir()])
+        except (OSError, AttributeError):
+            return []
+
+    # ── Backends ─────────────────────────────────────────────────
+    @classmethod
+    def _svc_state(cls, svc: str) -> str:
+        rc, txt = cls._run(
+            ["systemctl", "is-active", svc], timeout=3,
+        )
+        return (txt or "").strip() if rc == 0 else "inactive"
+
+    @classmethod
+    def _backends(cls) -> dict:
+        return {svc: cls._svc_state(svc) for svc in cls.BACKENDS}
+
+    @classmethod
+    def _dhcp_client(cls) -> str:
+        for c in ("dhclient", "dhcpcd", "udhcpc"):
+            if shutil.which(c):
+                return c
+        return "none"
+
+    @classmethod
+    def _rfkill_state(cls) -> dict:
+        out = {"wifi": "unknown", "bt": "unknown", "wwan": "unknown"}
+        rc, txt = cls._run(["rfkill", "list"], timeout=3)
+        if rc != 0:
+            return out
+        current = None
+        for line in txt.splitlines():
+            s = line.strip()
+            low = s.lower()
+            if "wireless lan" in low or "wlan" in low:
+                current = "wifi"
+            elif "bluetooth" in low:
+                current = "bt"
+            elif "wireless wan" in low or "wwan" in low:
+                current = "wwan"
+            elif s.startswith(("Soft", "Hard")) and current:
+                if low.endswith("yes"):
+                    out[current] = "blocked"
+                elif out[current] == "unknown":
+                    out[current] = "unblocked"
+        return out
+
+    # ── Diagnose ─────────────────────────────────────────────────
+    @classmethod
+    def diagnose(cls) -> dict:
+        wlan = cls._list_wlan_ifaces()
+        iface_info = {n: cls._iface_info(n) for n in wlan}
+        return {
+            "timestamp": time.time(),
+            "is_root": cls._is_root(),
+            "is_linux": cls._is_linux(),
+            "backends": cls._backends(),
+            "dhcp_client": cls._dhcp_client(),
+            "rfkill": cls._rfkill_state(),
+            "wlan_ifaces": wlan,
+            "all_ifaces": cls._all_ifaces(),
+            "iface_info": iface_info,
+        }
+
+    # ── Snapshots ────────────────────────────────────────────────
+    @classmethod
+    def snapshot_state(cls, tag: str = "pre_scan") -> str:
+        try:
+            data = cls.diagnose()
+            data["tag"] = tag
+            d = cls._snapshot_dir()
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = d / f"{tag}_{ts}.json"
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            # v37-R34 P62c: Datei-Owner auf SUDO_USER setzen.
+            uid, gid = cls._sudo_user_ids()
+            if uid is not None and gid is not None:
+                try:
+                    os.chown(path, uid, gid)
+                    os.chmod(path, 0o600)
+                except (OSError, PermissionError):
+                    pass
+            try:
+                files = sorted(d.glob("*.json"))
+                for old in files[:-cls.MAX_SNAPSHOTS]:
+                    old.unlink()
+            except (OSError, ValueError):
+                pass
+            return str(path)
+        except (OSError, ValueError, TypeError):
+            return ""
+
+    @classmethod
+    def list_snapshots(cls) -> list:
+        try:
+            return [str(f) for f in
+                    sorted(cls._snapshot_dir().glob("*.json"),
+                           reverse=True)]
+        except (OSError, ValueError):
+            return []
+
+    # ── Recovery ─────────────────────────────────────────────────
+    @classmethod
+    def _act(cls, result: dict, desc: str, cmd: list,
+             timeout: int = 5, dry_run: bool = False) -> None:
+        if dry_run:
+            result["actions"].append({
+                "desc": desc, "cmd": " ".join(cmd),
+                "status": "dry-run",
+            })
+            result["skipped_count"] += 1
+            return
+        rc, out = cls._run(cmd, timeout=timeout)
+        ok = rc == 0
+        result["actions"].append({
+            "desc": desc, "cmd": " ".join(cmd),
+            "status": "ok" if ok else f"fail(rc={rc})",
+            "output": "" if ok else out[:200],
+        })
+        if ok:
+            result["ok_count"] += 1
+        else:
+            result["fail_count"] += 1
+
+    @classmethod
+    def _act_pu(cls, result: dict, desc: str, method_name: str,
+                *args, dry_run: bool = False) -> None:
+        """Ruft PlatformUtils-Methode auf (enable/disable_monitor_mode)."""
+        if dry_run:
+            result["actions"].append({
+                "desc": desc, "cmd": f"PlatformUtils.{method_name}",
+                "status": "dry-run",
+            })
+            result["skipped_count"] += 1
+            return
+        try:
+            pu = globals().get("PlatformUtils")
+            if pu is None or not hasattr(pu, method_name):
+                result["actions"].append({
+                    "desc": desc, "status": "fail",
+                    "output": "PlatformUtils nicht verfuegbar",
+                })
+                result["fail_count"] += 1
+                return
+            ok = bool(getattr(pu, method_name)(*args))
+            result["actions"].append({
+                "desc": desc,
+                "cmd": f"PlatformUtils.{method_name}({args})",
+                "status": "ok" if ok else "fail",
+            })
+            if ok:
+                result["ok_count"] += 1
+            else:
+                result["fail_count"] += 1
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            result["actions"].append({
+                "desc": desc, "status": f"fail: {exc}",
+            })
+            result["fail_count"] += 1
+
+    @classmethod
+    def recover(cls, level: int = 1, dry_run: bool = False) -> dict:
+        try:
+            level = max(1, min(3, int(level)))
+        except (ValueError, TypeError):
+            level = 1
+        result: dict = {
+            "level": level, "dry_run": dry_run,
+            "is_root": cls._is_root(),
+            "actions": [], "ok_count": 0,
+            "fail_count": 0, "skipped_count": 0,
+        }
+
+        if not cls._is_linux():
+            result["actions"].append({
+                "desc": "Plattform", "status": "fail",
+                "output": "NetworkRecovery nur fuer Linux.",
+            })
+            result["fail_count"] += 1
+            return result
+
+        if not cls._is_root() and not dry_run:
+            result["actions"].append({
+                "desc": "Root-Pflicht", "status": "fail",
+                "output": "Recovery benoetigt root.",
+            })
+            result["fail_count"] += 1
+            return result
+
+        # ── Level 1 ──────────────────────────────────────────────
+        cls._act(result, "rfkill unblock all",
+                 ["rfkill", "unblock", "all"], dry_run=dry_run)
+
+        for name in cls._list_wlan_ifaces():
+            info = cls._iface_info(name)
+            if info.get("type") in (
+                "monitor", "ap", "ibss", "ocb", "mesh point",
+                "p2p-device",
+            ):
+                cls._act_pu(result, f"{name}: {info['type']} -> managed",
+                            "disable_monitor_mode", name,
+                            dry_run=dry_run)
+            cls._act(result, f"{name}: ip link up",
+                     ["ip", "link", "set", name, "up"], dry_run=dry_run)
+
+        dhcp = cls._dhcp_client()
+        if dhcp == "dhclient":
+            for name in cls._list_wlan_ifaces():
+                # v37-R34 P63c: Nur renew wenn Adapter eine IP hatte
+                # (sonst ERR bei nicht-verbundenem WLAN).
+                had_ip = cls._iface_has_ip(name)
+                if had_ip:
+                    cls._act(result, f"{name}: dhclient -r",
+                             ["dhclient", "-r", name], timeout=5,
+                             dry_run=dry_run)
+                    cls._act(result, f"{name}: dhclient renew",
+                             ["dhclient", name], timeout=15,
+                             dry_run=dry_run)
+                else:
+                    result["actions"].append({
+                        "desc": f"{name}: kein DHCP-Renew "
+                                f"(Adapter ohne Verbindung)",
+                        "status": "skip",
+                    })
+                    result["skipped_count"] += 1
+        elif dhcp == "dhcpcd":
+            cls._act(result, "dhcpcd renew", ["dhcpcd", "-n"],
+                     timeout=10, dry_run=dry_run)
+
+        # ── Level 2 ──────────────────────────────────────────────
+        if level >= 2:
+            for svc in cls.BACKENDS:
+                if cls._svc_state(svc) == "active":
+                    cls._act(result, f"restart {svc}",
+                             ["systemctl", "restart", svc],
+                             timeout=20, dry_run=dry_run)
+
+        # ── Level 3 ──────────────────────────────────────────────
+        if level >= 3:
+            cls._act(result, "iptables -F", ["iptables", "-F"],
+                     dry_run=dry_run)
+            cls._act(result, "iptables -t nat -F",
+                     ["iptables", "-t", "nat", "-F"], dry_run=dry_run)
+            if dry_run:
+                result["actions"].append({
+                    "desc": "resolv.conf auf 1.1.1.1/8.8.8.8",
+                    "status": "dry-run",
+                })
+                result["skipped_count"] += 1
+            else:
+                try:
+                    Path("/etc/resolv.conf").write_text(
+                        "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+                        encoding="utf-8",
+                    )
+                    result["actions"].append({
+                        "desc": "resolv.conf auf 1.1.1.1/8.8.8.8",
+                        "status": "ok",
+                    })
+                    result["ok_count"] += 1
+                except (OSError, PermissionError) as exc:
+                    result["actions"].append({
+                        "desc": "resolv.conf schreiben",
+                        "status": f"fail: {exc}",
+                    })
+                    result["fail_count"] += 1
+
+        # v37-R34 P62d: Post-Recovery-Verifikation
+        if not dry_run and level >= 1:
+            for name in cls._list_wlan_ifaces():
+                final_type = cls._iface_info(name).get("type")
+                if final_type not in ("managed", "unknown"):
+                    result["actions"].append({
+                        "desc": f"{name}: NICHT wiederhergestellt "
+                                f"(type={final_type})",
+                        "status": "warn",
+                    })
+                    result["fail_count"] += 1
+
+        # v37-R34 P62c: Ordner-Owner nach recover korrigieren.
+        if not dry_run:
+            uid, gid = cls._sudo_user_ids()
+            if uid is not None and gid is not None:
+                try:
+                    d = cls._snapshot_dir()
+                    for f in d.glob("*"):
+                        os.chown(f, uid, gid)
+                    os.chown(d, uid, gid)
+                except (OSError, PermissionError, ValueError):
+                    pass
+
+        return result
+
+    @classmethod
+    def auto_recovery_if_dirty(cls) -> dict:
+        try:
+            monitors: list = []
+            for name in cls._list_wlan_ifaces():
+                if cls._iface_info(name).get("type") == "monitor":
+                    monitors.append(name)
+            if not monitors:
+                return {"skipped": True,
+                        "reason": "kein Monitor-Interface"}
+            if os.environ.get(
+                "WLAN_ULTIMATE_NO_AUTO_RECOVER", ""
+            ) == "1":
+                return {"skipped": True, "reason": "env disabled"}
+            if not cls._is_root():
+                return {"skipped": True, "reason": "kein root"}
+            return cls.recover(level=1, dry_run=False)
+        except (OSError, ValueError, RuntimeError) as exc:
+            return {"skipped": True, "reason": str(exc)}
+
+    # ── Format ───────────────────────────────────────────────────
+    @classmethod
+    def format_diagnose(cls, data: dict = None) -> str:
+        if data is None:
+            data = cls.diagnose()
+        lines: list = [
+            "", "=" * 68,
+            "  NETZWERK-RECOVERY - DIAGNOSE (P62)",
+            "=" * 68,
+            f"Root:       {'ja' if data.get('is_root') else 'NEIN'}",
+            f"Plattform:  {'linux' if data.get('is_linux') else '?'}",
+            f"DHCP:       {data.get('dhcp_client')}",
+            "",
+            "Backends:",
+        ]
+        for svc, state in (data.get("backends") or {}).items():
+            mark = "OK " if state == "active" else "---"
+            lines.append(f"  [{mark}] {svc}: {state}")
+        lines.append("")
+        lines.append("rfkill:")
+        for k, v in (data.get("rfkill") or {}).items():
+            lines.append(f"  {k}: {v}")
+        lines.append("")
+        lines.append(
+            f"WLAN-Interfaces ({len(data.get('wlan_ifaces') or [])}):"
+        )
+        for name, info in (data.get("iface_info") or {}).items():
+            ip = info.get("ip") or "(keine IP)"
+            lines.append(
+                f"  [{name}] type={info.get('type', '?')}, "
+                f"up={info.get('up', False)}, ip={ip}"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    @classmethod
+    def format_recovery(cls, result: dict) -> str:
+        lines: list = [
+            "", "=" * 68,
+            f"  NETZWERK-RECOVERY (Level {result.get('level', 1)}"
+            f"{' - DRY-RUN' if result.get('dry_run') else ''})",
+            "=" * 68,
+        ]
+        for a in result.get("actions") or []:
+            st = a.get("status", "")
+            mark = "OK " if st == "ok" else (
+                "DRY" if st == "dry-run" else (
+                    "SKP" if st == "skip" else (
+                        "WRN" if st == "warn" else "ERR"
+                    )
+                )
+            )
+            lines.append(f"  [{mark}] {a.get('desc', '?')}")
+            if a.get("output"):
+                lines.append(f"      {a['output'][:120]}")
+        lines.append("")
+        lines.append(
+            f"  Ergebnis: {result.get('ok_count', 0)} OK, "
+            f"{result.get('fail_count', 0)} Fehler, "
+            f"{result.get('skipped_count', 0)} uebersprungen"
+        )
+        lines.append("")
+        return "\n".join(lines)
+
+
+
 class MonitorPreflight:
     """v37-R34 P52a: Umfassende Diagnose fuer Monitor-Mode-Aktivierung.
 
@@ -55977,19 +56586,34 @@ class MonitorPreflight:
         return lines
 
     @classmethod
-    def _drivers(cls) -> dict:
-        out = {}
-        for mod in ("88XXau", "rtl8187", "rtl8xxxu", "rt2800usb"):
-            rc, txt = cls._run(["modinfo", mod], f"modinfo-{mod}")
+    def _modinfo_any(cls, mod: str) -> str:
+        """v37-R34 P52f: case-insensitive modinfo + lsmod-Fallback."""
+        candidates = (mod, mod.lower(), mod.upper())
+        for c in candidates:
+            rc, txt = cls._run(["modinfo", c], f"modinfo-{c}")
             if rc == 0 and txt:
                 version = ""
                 for line in txt.splitlines():
                     if line.startswith("version:"):
                         version = line.split(":", 1)[1].strip()
                         break
-                out[mod] = version or "vorhanden"
-            else:
-                out[mod] = "FEHLT"
+                return version or "vorhanden"
+        # lsmod-Fallback (auch case-insensitiv)
+        rc, txt = cls._run(["lsmod"], "lsmod")
+        if rc == 0:
+            low = mod.lower()
+            for line in txt.splitlines():
+                parts = line.split()
+                if parts and parts[0].lower() == low:
+                    return "geladen (lsmod)"
+        return ""
+
+    @classmethod
+    def _drivers(cls) -> dict:
+        out = {}
+        for mod in ("88XXau", "rtl8187", "rtl8xxxu", "rt2800usb"):
+            v = cls._modinfo_any(mod)
+            out[mod] = v if v else "FEHLT"
         return out
 
     @classmethod
@@ -56167,19 +56791,26 @@ class WLANScanner(QThread):
         interface_manager: Any,
         ai_processor: Any | None = None,
         parent: QObject | None = None,
+        db_manager: Any | None = None,
     ):
         """
         :param interface_manager: InterfaceManager-Instanz
         :param ai_processor: Optionaler AIMLProcessor
         :param parent: Optionales QObject
+        :param db_manager: Optionaler DatenbankManager (P90b-4b:
+            fuer WIDS-Alert-Persistenz durchgereicht).
         """
         super().__init__(parent)
         self.interface_manager = interface_manager
         self.ai_processor = ai_processor
+        # P90b-4b: DB-Referenz vom GUI durchgereicht an ScanEngine.
+        self.db_manager = db_manager
 
         self.scan_engine: ScanEngine | None = None
         self.scanning: bool = False
         self.paused: bool = False
+        # P-GUI-2: Guard gegen Doppel-Emission von scan_abgeschlossen.
+        self._scan_finished_emitted: bool = False
         try:
             _dm_level = DebugManager.get_level()
             self.debug_sniffer = _dm_level <= 10
@@ -56334,6 +56965,14 @@ class WLANScanner(QThread):
             return
 
         _dbg("Aktiviere Monitor-Modus")
+        # v37-R34 P63: Snapshot vor Monitor-Switch
+        try:
+            _rec_p63 = globals().get("NetworkRecovery")
+            if _rec_p63 is not None:
+                _rec_p63.snapshot_state("pre_scan")
+                _dbg("Network-Snapshot angelegt")
+        except (OSError, ValueError, RuntimeError, AttributeError):
+            pass
         monitor_ready = self._activate_monitor_mode()
         if not monitor_ready:
             _dbg("FEHLER: Monitor-Modus fehlgeschlagen")
@@ -56350,6 +56989,7 @@ class WLANScanner(QThread):
                 interface_manager=self.interface_manager,
                 event_bus=None,
                 ai_processor=self.ai_processor,
+                db_manager=getattr(self, "db_manager", None),
             )
             # v22: persistente Tracker durchreichen
             try:
@@ -56516,8 +57156,39 @@ class WLANScanner(QThread):
             _dbg(f"Warte-Schleife beendet: {exc}")
 
         _dbg(f"Warte-Schleife fertig nach {poll_count} Polls")
+
+        # P-GUI-2fix: Netzwerke VOR Cleanup snapshotten. Cleanup
+        # kann _seen_networks intern leeren oder Referenzen trennen,
+        # danach liefert get_seen_networks() leer zurueck.
+        _pre_cleanup_networks = []
+        if not self._scan_finished_emitted:
+            try:
+                if self.scan_engine is not None:
+                    _pre_cleanup_networks = list(
+                        self.scan_engine.get_seen_networks() or []
+                    )
+            except (AttributeError, RuntimeError):
+                _pre_cleanup_networks = []
+
         _dbg("Cleanup")
         self._cleanup_after_scan()
+
+        # P-GUI-2: scan_abgeschlossen defensiv am Ende emittieren.
+        # Grund: ScanEngine.signals.scan_finished wird in stop()
+        # emittiert, aber der WLANScanner (QThread ohne Event-Loop
+        # in run()) empfaengt queued Signals aus anderen Threads
+        # nicht zuverlaessig. Ohne diesen Fallback bleibt der
+        # GUI-Status auf "100% / Kanal N" haengen.
+        if not self._scan_finished_emitted:
+            self._scan_finished_emitted = True
+            self._safe_emit(
+                self.scan_abgeschlossen, _pre_cleanup_networks
+            )
+            _dbg(
+                f"scan_abgeschlossen emittiert: "
+                f"{len(_pre_cleanup_networks)} Netzwerke"
+            )
+
         _dbg("run() ENDE")
 
     def stop(self) -> None:
@@ -56575,16 +57246,19 @@ class WLANScanner(QThread):
         self._safe_emit(self.scan_ergebnis, data)
 
     def _on_scan_finished(self, networks: list) -> None:
+        # P-GUI-2: Idempotent — verhindert Doppel-Emission, wenn
+        # run()-Fallback und Qt-Signal beide feuern.
+        if self._scan_finished_emitted:
+            return
+        self._scan_finished_emitted = True
         self._safe_emit(self.scan_abgeschlossen, networks)
 
     def _on_error(self, msg: str) -> None:
         self._safe_emit_error(msg)
 
     def _safe_emit(self, signal: Any, *args: Any) -> None:
-        try:
-            signal.emit(*args)
-        except (RuntimeError, TypeError, AttributeError) as exc:
-            self.logger.debug(f"Signal-Emit: {exc}")
+        # v37-R34 P65f: delegiert an Modul-Helper
+        _safe_emit_signal(self.logger, signal, *args)
 
     def _safe_emit_error(self, msg: str) -> None:
         self._safe_emit(self.fehler, str(msg))
@@ -56690,24 +57364,47 @@ class WLANScanner(QThread):
         return any_ok
 
     def _force_monitor_mode(self, iface_name: str) -> bool:
-        """v11.1: Versucht Monitor via mehrere Methoden."""
-        # Methode 1: iw (Standard)
-        methods = []
-        # v37-R34 P52b: iw-set-type zuerst — airmon-ng wuerde
-        # wlanX in wlanXmon umbenennen und die InterfaceManager-Map
-        # invalidieren.
-        methods.append(
-            (
-                "iw-set-type",
-                [
-                    "sh",
-                    "-c",
-                    f"ip link set {iface_name} down 2>/dev/null; "
-                    f"iw dev {iface_name} set type monitor 2>&1; "
-                    f"ip link set {iface_name} up 2>/dev/null",
-                ],
+        """V1c: nutzt die zentrale InterfaceStateMachine.
+
+        Serialisiert alle Modus-Wechsel pro Interface. Der iw-Pfad
+        (down -> set type monitor -> up) laeuft ueber die SM; nur
+        wenn dieser fehlschlaegt, greifen die klassischen Fallbacks
+        airmon-ng und ifconfig/iwconfig.
+        """
+        sm = get_interface_sm(self.logger)
+        try:
+            with sm.acquire(
+                iface_name, InterfaceState.MONITOR, holder="preflight",
+            ):
+                self.logger.info(
+                    f"  -> SM iw-set-type auf {iface_name} erfolgreich"
+                )
+                try:
+                    iface_obj = self.interface_manager.interfaces.get(
+                        iface_name
+                    )
+                    if iface_obj:
+                        iface_obj.aktiver_modus = "monitor"
+                except (AttributeError, TypeError):
+                    pass
+                return True
+        except InterfaceBusy as exc:
+            self.logger.warning(f"  -> SM blockiert: {exc}")
+            return False
+        except RuntimeError as exc:
+            self.logger.debug(
+                f"  -> SM iw-set-type fehlgeschlagen: {exc} "
+                "— Fallback"
             )
-        )
+            return self._force_monitor_mode_fallback(iface_name)
+
+    def _force_monitor_mode_fallback(self, iface_name: str) -> bool:
+        """V1c: Fallback-Kette (airmon-ng, ifconfig/iwconfig).
+
+        Wird nur genutzt, wenn die InterfaceStateMachine den
+        iw-Pfad nicht durchbringt.
+        """
+        methods = []
         if shutil.which("airmon-ng"):
             methods.append(("airmon-ng", ["airmon-ng", "start", iface_name]))
         methods.append(
@@ -59078,6 +59775,1360 @@ class WPSHardwareAdvisor:
         L.append("    (Erwartet: kein 'failed to arm interface')")
         L.append("=" * 66)
         return chr(10).join(L)
+
+
+# ══════════════════════════════════════════════════════════════════
+# V1a — InterfaceStateMachine
+# ══════════════════════════════════════════════════════════════════
+# Serialisiert Modus-Wechsel pro WLAN-Interface. Verhindert -16 EBUSY
+# (Monitor-Mode-Race). Holder: "scanner", "wids", "pentest",
+# "recovery", "manual".
+# ══════════════════════════════════════════════════════════════════
+
+
+class InterfaceState(Enum):
+    """Ziel-Modi eines WLAN-Interfaces (Linux)."""
+
+    UNKNOWN = "unknown"
+    DOWN = "down"
+    MANAGED = "managed"
+    MONITOR = "monitor"
+    INJECTION = "injection"
+    RECOVERING = "recovering"
+
+
+class InterfaceBusy(RuntimeError):
+    """Interface ist von einem anderen Holder belegt."""
+
+    def __init__(self, iface, want, has):
+        super().__init__(
+            f"{iface}: Holder={has!r} blockiert Wechsel nach {want!r}"
+        )
+        self.iface = iface
+        self.want = want
+        self.has = has
+
+
+@dataclass
+class InterfaceStateSnapshot:
+    """Letzter bekannter Zustand eines Interfaces."""
+
+    iface: str
+    state: InterfaceState = InterfaceState.UNKNOWN
+    locked_by: str | None = None
+    last_transition_ns: int = 0
+    history: deque = field(default_factory=lambda: deque(maxlen=32))
+
+
+_IFACE_VALID_TRANSITIONS = {
+    InterfaceState.UNKNOWN: {
+        InterfaceState.DOWN, InterfaceState.MANAGED,
+        InterfaceState.MONITOR, InterfaceState.RECOVERING,
+    },
+    InterfaceState.DOWN: {
+        InterfaceState.MANAGED, InterfaceState.MONITOR,
+        InterfaceState.RECOVERING,
+    },
+    InterfaceState.MANAGED: {
+        InterfaceState.DOWN, InterfaceState.MONITOR,
+        InterfaceState.RECOVERING,
+    },
+    InterfaceState.MONITOR: {
+        InterfaceState.DOWN, InterfaceState.MANAGED,
+        InterfaceState.INJECTION, InterfaceState.RECOVERING,
+    },
+    InterfaceState.INJECTION: {
+        InterfaceState.MONITOR, InterfaceState.DOWN,
+        InterfaceState.RECOVERING,
+    },
+    InterfaceState.RECOVERING: {
+        InterfaceState.DOWN, InterfaceState.MANAGED,
+        InterfaceState.MONITOR,
+    },
+}
+
+
+class InterfaceStateMachine:
+    """
+    Thread-sichere Zustandsmaschine fuer WLAN-Interface-Modi.
+
+    Wechsel-Reihenfolge identisch zu _force_monitor_mode:
+        ip link set <iface> down
+        iw dev <iface> set type <target>
+        ip link set <iface> up
+    plus Verifikation via 'iw dev <iface> info'.
+    Bei Fehler: Zustand -> RECOVERING, RuntimeError.
+    """
+
+    _GLOBAL_LOCK = threading.RLock()
+    _PER_IFACE: dict[str, threading.RLock] = {}
+
+    def __init__(self, logger, timing=None):
+        self._logger = logger
+        self._timing = timing
+        self._states: dict[str, InterfaceStateSnapshot] = {}
+        self._states_lock = threading.RLock()
+
+    def register(self, iface, initial=InterfaceState.UNKNOWN):
+        with self._states_lock:
+            snap = self._states.get(iface)
+            if snap is None:
+                snap = InterfaceStateSnapshot(iface=iface, state=initial)
+                self._states[iface] = snap
+            return snap
+
+    def snapshot(self, iface):
+        with self._states_lock:
+            return self._states.get(iface)
+
+    def all_snapshots(self):
+        with self._states_lock:
+            return list(self._states.values())
+
+    @classmethod
+    def _iface_lock(cls, iface):
+        with cls._GLOBAL_LOCK:
+            lock = cls._PER_IFACE.get(iface)
+            if lock is None:
+                lock = threading.RLock()
+                cls._PER_IFACE[iface] = lock
+            return lock
+
+    @contextmanager
+    def acquire(self, iface, target, holder):
+        lock = self._iface_lock(iface)
+        lock.acquire()
+        snap = None
+        try:
+            snap = self.register(iface)
+            if snap.locked_by and snap.locked_by != holder:
+                raise InterfaceBusy(iface, target.value, snap.locked_by)
+            snap.locked_by = holder
+            self._transition(snap, target, holder)
+            yield snap
+        finally:
+            if snap is not None:
+                snap.locked_by = None
+            lock.release()
+
+    def _transition(self, snap, target, holder):
+        if snap.state == target:
+            return
+        valid = _IFACE_VALID_TRANSITIONS.get(snap.state, set())
+        if target not in valid and snap.state != InterfaceState.UNKNOWN:
+            self._logger.warning(
+                f"[SM] {snap.iface}: unerwarteter Uebergang "
+                f"{snap.state.value} -> {target.value} "
+                f"(holder={holder})"
+            )
+        if not self._do_transition(snap.iface, target):
+            snap.state = InterfaceState.RECOVERING
+            snap.last_transition_ns = time.monotonic_ns()
+            snap.history.append(
+                (InterfaceState.RECOVERING.value, snap.last_transition_ns)
+            )
+            raise RuntimeError(
+                f"[SM] {snap.iface}: Wechsel nach {target.value} "
+                f"fehlgeschlagen (holder={holder})"
+            )
+        snap.state = target
+        snap.last_transition_ns = time.monotonic_ns()
+        snap.history.append((target.value, snap.last_transition_ns))
+        self._logger.info(
+            f"[SM] {snap.iface}: -> {target.value} (holder={holder})"
+        )
+
+    def _do_transition(self, iface, target):
+        timeout = 10.0
+        if self._timing is not None:
+            try:
+                timeout = float(self._timing.monitor_timeout)
+            except (AttributeError, TypeError, ValueError):
+                pass
+
+        if target == InterfaceState.DOWN:
+            rc, _o, _e = CommandRunner.run(
+                ["ip", "link", "set", iface, "down"],
+                subsystem="driver",
+                tag=f"sm-down-{iface}",
+                soft_fail=True,
+                timeout=timeout,
+            )
+            return rc == 0
+
+        if target in (InterfaceState.MONITOR, InterfaceState.INJECTION):
+            iw_type = "monitor"
+        elif target == InterfaceState.MANAGED:
+            iw_type = "managed"
+        else:
+            return True
+
+        cmd = [
+            "sh", "-c",
+            f"ip link set {iface} down 2>/dev/null; "
+            f"iw dev {iface} set type {iw_type} 2>&1; "
+            f"ip link set {iface} up 2>/dev/null",
+        ]
+        CommandRunner.run(
+            cmd,
+            subsystem="driver",
+            tag=f"sm-{iw_type}-{iface}",
+            soft_fail=True,
+            timeout=timeout,
+        )
+        rc2, check, _e2 = CommandRunner.run(
+            ["iw", "dev", iface, "info"],
+            subsystem="driver",
+            tag=f"sm-verify-{iface}",
+            soft_fail=True,
+            timeout=3,
+        )
+        if rc2 != 0:
+            return False
+        return f"type {iw_type}" in check.lower()
+
+
+# ══════════════════════════════════════════════════════════════════
+# V2a — ChannelScheduler
+# ══════════════════════════════════════════════════════════════════
+# Serialisiert Kanalwechsel pro WLAN-Interface. Hoehere Prioritaet
+# gewinnt. Nutzt denselben per-Interface-Lock wie die
+# InterfaceStateMachine, damit 'set channel' und 'set type' sich
+# gegenseitig serialisieren.
+#
+# Nutzung:
+#     sched = get_channel_scheduler()
+#     with sched.acquire("wlan1", 6, "scan", ChannelPriority.HOP):
+#         ...  # Kanal 6 garantiert, andere Holder blockiert
+# ══════════════════════════════════════════════════════════════════
+
+
+class ChannelPriority(IntEnum):
+    """Prioritaeten fuer Kanalwechsel. Hoeher = gewinnt."""
+
+    MANUAL = 20
+    HOP = 40
+    SCAN = 60
+    CAPTURE = 80
+    WIDS = 100
+
+
+class ChannelBusy(RuntimeError):
+    """Kanal wird von gleich-/hoeher-priorisiertem Holder belegt."""
+
+    def __init__(self, iface, want, holder, current):
+        super().__init__(
+            f"{iface}: Kanal {want} verweigert — Holder={holder!r} "
+            f"haelt Kanal {current.channel} mit "
+            f"Prio={current.priority.name}"
+        )
+        self.iface = iface
+        self.want = want
+        self.holder = holder
+        self.current = current
+
+
+@dataclass
+class ChannelLease:
+    """Aktive Kanal-Belegung eines Interfaces."""
+
+    iface: str
+    channel: int
+    holder: str
+    priority: ChannelPriority
+    width: int = 20
+    acquired_ns: int = 0
+
+
+class ChannelScheduler:
+    """
+    Thread-sicherer Kanal-Scheduler pro Interface.
+
+    Regeln:
+      * Nur ein Holder pro Interface gleichzeitig.
+      * Neuer Holder mit hoeherer Prio verdraengt niedrigeren.
+      * Neuer Holder mit gleich/niedriger Prio blockiert am
+        per-iface-Lock, bis der aktuelle Holder freigibt.
+    """
+
+    _GLOBAL_LOCK = threading.RLock()
+    _LEASES: dict[str, ChannelLease] = {}
+
+    def __init__(self, logger, sm=None):
+        self._logger = logger
+        self._sm = sm if sm is not None else get_interface_sm(logger)
+
+    def current(self, iface):
+        with self._GLOBAL_LOCK:
+            return self._LEASES.get(iface)
+
+    def all_leases(self):
+        with self._GLOBAL_LOCK:
+            return dict(self._LEASES)
+
+    @contextmanager
+    def acquire(self, iface, channel, holder,
+                priority=ChannelPriority.MANUAL, width=20):
+        lock = InterfaceStateMachine._iface_lock(iface)
+        lock.acquire()
+        lease = None
+        prev = None
+        try:
+            with self._GLOBAL_LOCK:
+                prev = self._LEASES.get(iface)
+                if prev is not None and prev.priority > priority:
+                    raise ChannelBusy(iface, channel, holder, prev)
+                lease = ChannelLease(
+                    iface=iface,
+                    channel=channel,
+                    holder=holder,
+                    priority=priority,
+                    width=width,
+                    acquired_ns=time.monotonic_ns(),
+                )
+                self._LEASES[iface] = lease
+            if not self._apply_channel(iface, channel, width):
+                with self._GLOBAL_LOCK:
+                    if self._LEASES.get(iface) is lease:
+                        self._LEASES.pop(iface, None)
+                raise RuntimeError(
+                    f"[Chan] {iface}: Kanal {channel} konnte nicht "
+                    f"gesetzt werden (holder={holder})"
+                )
+            self._logger.info(
+                f"[Chan] {iface}: Kanal {channel} "
+                f"(holder={holder}, prio={priority.name})"
+            )
+            yield lease
+        finally:
+            if lease is not None:
+                with self._GLOBAL_LOCK:
+                    if self._LEASES.get(iface) is lease:
+                        if prev is not None:
+                            self._LEASES[iface] = prev
+                        else:
+                            self._LEASES.pop(iface, None)
+            lock.release()
+
+    def _apply_channel(self, iface, channel, width):
+        if width and width > 20:
+            try:
+                freq = AppKonstanten.get_frequency(int(channel))
+            except (AttributeError, ValueError, TypeError):
+                freq = None
+            if freq is None:
+                return False
+            cmd = ["iw", "dev", iface, "set", "freq",
+                   str(freq), f"{width}MHz"]
+        else:
+            cmd = ["iw", "dev", iface, "set", "channel", str(channel)]
+        rc, _o, _e = CommandRunner.run(
+            cmd,
+            subsystem="scan",
+            tag=f"chan-{iface}",
+            soft_fail=True,
+            timeout=2,
+        )
+        return rc == 0
+
+
+_CHANNEL_SCHEDULER: ChannelScheduler | None = None
+_CHANNEL_SCHEDULER_LOCK = threading.Lock()
+
+
+def get_channel_scheduler(logger=None):
+    """Liefert die prozessweite ChannelScheduler-Instanz (lazy)."""
+    global _CHANNEL_SCHEDULER
+    with _CHANNEL_SCHEDULER_LOCK:
+        if _CHANNEL_SCHEDULER is None:
+            if logger is None:
+                logger = logging.getLogger("wlan_ultimate.channel")
+            _CHANNEL_SCHEDULER = ChannelScheduler(logger)
+        return _CHANNEL_SCHEDULER
+
+
+# ══════════════════════════════════════════════════════════════════
+# P90a — BeaconFingerprint
+# ══════════════════════════════════════════════════════════════════
+# Fingerprint eines Beacon/ProbeResp. Wird von WIDS (Evil-Twin-
+# Detektor) UND vom bestehenden EvilTwinController gemeinsam genutzt.
+#
+# Baut auf SecurityProfile/CryptoParser auf — die liefern akm,
+# pairwise, group und PMF-Flags. Ergaenzt:
+#   * raw_ie_hash   — Hash der gesamten IE-Kette (Reihenfolge
+#                     normalisiert, damit Vendor-Reihenfolge egal ist)
+#   * vendor_ie_set — sortierte (OUI, Type)-Paare aus IE-ID 221
+#   * normalisierte SSID (NFC, Homoglyphen-Kollaps)
+#
+# Vergleichsmethode:
+#   fp_a.suspicious_twin_of(fp_b) -> (bool, reason_str)
+# ══════════════════════════════════════════════════════════════════
+
+_BEACON_FP_VERSION = 1
+
+# P90b-6fix: Von der ScanEngine gesetzte Platzhalter fuer
+# versteckte SSIDs. Diese Strings bedeuten "keine SSID bekannt"
+# und duerfen NICHT als "gleiche SSID" verglichen werden.
+_HIDDEN_SSID_PLACEHOLDERS = frozenset((
+    "<hidden>", "<versteckt>", "<hidden_ssid>", "<unknown>",
+))
+
+
+def normalize_ssid(ssid):
+    """NFC + Nullbyte-Strip. Homoglyphen werden auf ASCII reduziert."""
+    if not ssid:
+        return ""
+    s = ssid.replace("\x00", "").strip()
+    try:
+        import unicodedata as _ud
+        s = _ud.normalize("NFC", s)
+        homoglyphs = {
+            "\u0430": "a", "\u0435": "e", "\u043e": "o",
+            "\u0441": "c", "\u0440": "p", "\u0445": "x",
+            "\u0443": "y", "\u0456": "i", "\u0455": "s",
+            "\u03b1": "a", "\u03b5": "e", "\u03bf": "o",
+            "\u03c1": "p", "\u03c7": "x",
+        }
+        s = "".join(homoglyphs.get(ch, ch) for ch in s)
+    except ImportError:
+        pass
+    return s.casefold()
+
+
+@dataclass(frozen=True)
+class BeaconFingerprint:
+    """Unveraenderlicher Fingerprint eines WLAN-Beacons."""
+
+    ssid: str
+    bssid: str
+    ssid_norm: str
+    raw_ie_hash: str
+    vendor_ie_set: tuple
+    akm_sig: tuple
+    pairwise_sig: tuple
+    group_sig: str
+    pmf_capable: bool
+    pmf_required: bool
+    encryption: str
+    beacon_interval: int
+    version: int = _BEACON_FP_VERSION
+
+    @classmethod
+    def from_beacon(cls, pkt, bssid="", ssid="") -> BeaconFingerprint | None:
+        """Baut Fingerprint direkt aus einem Scapy-Paket."""
+        if not SCAPY_VERFÜGBAR:
+            return None
+        try:
+            if not (pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp)):
+                return None
+            if not bssid:
+                bssid = (getattr(pkt, "addr2", "") or
+                         getattr(pkt, "addr3", "") or "")
+            if not ssid:
+                ssid = cls._extract_ssid(pkt) or ""
+            return cls._build(pkt, bssid, ssid)
+        except (AttributeError, TypeError, IndexError, ValueError):
+            return None
+
+    @classmethod
+    def from_scan_result(cls, result: dict, pkt) -> BeaconFingerprint | None:
+        """Baut Fingerprint aus dem _process_packet-result + Paket."""
+        if pkt is None:
+            return None
+        return cls.from_beacon(
+            pkt,
+            bssid=str(result.get("bssid", "") or ""),
+            ssid=str(result.get("ssid", "") or ""),
+        )
+
+    @staticmethod
+    def _extract_ssid(pkt):
+        try:
+            layers = pkt.getlayer(Dot11Elt)
+            while isinstance(layers, scapy.Dot11Elt):
+                if layers.ID == 0:
+                    try:
+                        return layers.info.decode("utf-8", errors="ignore")
+                    except UnicodeDecodeError:
+                        return str(layers.info)
+                layers = layers.payload
+        except (AttributeError, TypeError, IndexError):
+            return None
+        return None
+
+    @classmethod
+    def _build(cls, pkt, bssid: str, ssid: str) -> BeaconFingerprint:
+        ie_items: list = []
+        vendor_set: list = []
+        try:
+            layers = pkt.getlayer(Dot11Elt)
+            seen: set = set()
+            while layers is not None and id(layers) not in seen:
+                seen.add(id(layers))
+                ie_id = getattr(layers, "ID", None)
+                info = getattr(layers, "info", b"")
+                if not isinstance(info, bytes):
+                    try:
+                        info = bytes(info)
+                    except (TypeError, ValueError):
+                        info = b""
+                if isinstance(ie_id, int):
+                    ie_items.append((ie_id, len(info), info))
+                    if ie_id == 221 and len(info) >= 4:
+                        vendor_set.append((info[:3].hex(), info[3]))
+                layers = getattr(layers, "payload", None)
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+        h = hashlib.sha256()
+        norm_items = []
+        for ie_id, ln, info in ie_items:
+            body_hash = hashlib.sha256(info).hexdigest()[:16]
+            norm_items.append((ie_id, ln, body_hash))
+        for item in sorted(norm_items):
+            h.update(f"{item[0]}:{item[1]}:{item[2]}|".encode())
+        raw_ie_hash = h.hexdigest()[:16]
+
+        akm_sig: tuple = ()
+        pairwise_sig: tuple = ()
+        group_sig = ""
+        pmf_capable = False
+        pmf_required = False
+        encryption = "UNKNOWN"
+        try:
+            prof = CryptoParser.parse(pkt)
+            akm_sig = tuple(sorted(prof.akm or ()))
+            pairwise_sig = tuple(sorted(prof.pairwise or ()))
+            group_sig = prof.group or ""
+            pmf_capable = bool(prof.pmf_capable)
+            pmf_required = bool(prof.pmf_required)
+            encryption = prof.protocol or "UNKNOWN"
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+        beacon_interval = 0
+        try:
+            if pkt.haslayer(Dot11Beacon):
+                beacon_interval = int(
+                    getattr(pkt[Dot11Beacon], "beacon_interval", 0) or 0
+                )
+        except (AttributeError, TypeError, ValueError):
+            beacon_interval = 0
+
+        return cls(
+            ssid=ssid,
+            bssid=(bssid or "").lower(),
+            ssid_norm=normalize_ssid(ssid),
+            raw_ie_hash=raw_ie_hash,
+            vendor_ie_set=tuple(sorted(vendor_set)),
+            akm_sig=akm_sig,
+            pairwise_sig=pairwise_sig,
+            group_sig=group_sig,
+            pmf_capable=pmf_capable,
+            pmf_required=pmf_required,
+            encryption=encryption,
+            beacon_interval=beacon_interval,
+        )
+
+    def is_likely_same_ap(self, other: BeaconFingerprint) -> bool:
+        """Multi-BSSID-Heuristik: gleiches Geraet, verschiedene Radios.
+
+        Ein AP mit 2,4 GHz + 5 GHz + Mesh hat mehrere BSSIDs, die
+        sich nur in den letzten 1-3 Oktetten unterscheiden. Die ersten
+        5 Oktette sind bei denselben Radios gleich, bei Multi-Band
+        zumindest die OUI (erste 3).
+        """
+        if not isinstance(other, BeaconFingerprint):
+            return False
+        b1 = (self.bssid or "").split(":")
+        b2 = (other.bssid or "").split(":")
+        if len(b1) != 6 or len(b2) != 6:
+            return False
+        # 1) Gleiche ersten 5 Oktette -> definitiv gleiche Hardware
+        if b1[:5] == b2[:5]:
+            return True
+        # 2) Gleiche OUI UND gleiche SSID -> sehr wahrscheinlich
+        #    derselbe AP mit unterschiedlichen Radios
+        if b1[:3] == b2[:3]:
+            return True
+        return False
+
+    def is_transition_variant(self, other: BeaconFingerprint) -> bool:
+        """WPA2 vs WPA3-Transition ist derselbe AP, kein Twin.
+
+        Bei einem WPA3-Transition-AP sendet ein Radio nur PSK,
+        ein anderes PSK+SAE. Die AKM-Sets sind Teilmengen
+        voneinander.
+        """
+        if not isinstance(other, BeaconFingerprint):
+            return False
+        a1 = set(self.akm_sig or ())
+        a2 = set(other.akm_sig or ())
+        if not a1 or not a2:
+            return False
+        # Teilmenge in einer Richtung -> Transition-Mode
+        if a1.issubset(a2) or a2.issubset(a1):
+            # Zusätzliche Plausibilitätsprüfung: keine
+            # kryptografisch widersprüchlichen Suiten
+            # (z.B. nicht PSK-only vs Enterprise-only).
+            if a1 == a2:
+                return False
+            # Wenn eine Seite Enterprise ist und die andere
+            # nur PSK, ist es verdächtiger (Downgrade).
+            ent1 = any("802.1X" in x or "ENTERPRISE" in x.upper()
+                       for x in a1)
+            ent2 = any("802.1X" in x or "ENTERPRISE" in x.upper()
+                       for x in a2)
+            if ent1 != ent2:
+                return False
+            return True
+        return False
+
+    def suspicious_twin_of(self, other: BeaconFingerprint) -> tuple:
+        """(bool, reason). True wenn other ein verdaechtiger Twin ist."""
+        if not isinstance(other, BeaconFingerprint):
+            return False, "kein Fingerprint"
+        if not self.ssid_norm or self.ssid_norm != other.ssid_norm:
+            return False, "SSID unterschiedlich"
+        if self.bssid == other.bssid:
+            return False, "gleiche BSSID"
+        reasons = []
+        if self.raw_ie_hash != other.raw_ie_hash:
+            reasons.append("IE-Kette abweichend")
+        if self.akm_sig != other.akm_sig:
+            reasons.append(
+                f"AKM abweichend ({self.akm_sig} vs {other.akm_sig})"
+            )
+        if self.encryption != other.encryption:
+            reasons.append(
+                f"Verschluesselung {self.encryption} vs {other.encryption}"
+            )
+        if self.pmf_required != other.pmf_required:
+            reasons.append("PMF-Required abweichend")
+        if self.vendor_ie_set != other.vendor_ie_set:
+            reasons.append("Vendor-IEs abweichend")
+        if not reasons:
+            return False, "gleiche SSID, identischer Fingerprint (Roaming)"
+        return True, "; ".join(reasons)
+
+    def to_dict(self) -> dict:
+        return {
+            "ssid": self.ssid,
+            "bssid": self.bssid,
+            "ssid_norm": self.ssid_norm,
+            "raw_ie_hash": self.raw_ie_hash,
+            "vendor_ie_set": list(self.vendor_ie_set),
+            "akm_sig": list(self.akm_sig),
+            "pairwise_sig": list(self.pairwise_sig),
+            "group_sig": self.group_sig,
+            "pmf_capable": self.pmf_capable,
+            "pmf_required": self.pmf_required,
+            "encryption": self.encryption,
+            "beacon_interval": self.beacon_interval,
+            "version": self.version,
+        }
+
+
+def get_beacon_fingerprint(pkt, bssid="", ssid=""):
+    """Kurzhilfe — auch fuer EvilTwinController nutzbar."""
+    return BeaconFingerprint.from_beacon(pkt, bssid=bssid, ssid=ssid)
+
+
+# ══════════════════════════════════════════════════════════════════
+# P90b-1 — WIDSMonitor
+# ══════════════════════════════════════════════════════════════════
+# Passives WIDS (Wireless Intrusion Detection System).
+#
+# Vier Detektoren:
+#   * Evil-Twin      — gleiche SSID, abweichender Fingerprint
+#   * Karma          — AP antwortet auf >N verschiedene SSIDs
+#   * Captive-Portal — HTTP-Redirect auf unbekannte Domain
+#   * Deauth-Flood   — Rate-Limit-Erkennung pro BSSID
+#
+# Alarm-Kanaele: Syslog (UDP), Webhook (HTTP POST), Callback.
+# Alle in-memory, thread-safe. Kein DB-Zugriff — den macht P90b-2.
+# ══════════════════════════════════════════════════════════════════
+
+
+class WIDSAlertKind(Enum):
+    EVIL_TWIN = "evil_twin"
+    KARMA = "karma"
+    CAPTIVE_PORTAL = "captive_portal"
+    DEAUTH_FLOOD = "deauth_flood"
+
+
+class WIDSAlertSeverity(IntEnum):
+    INFO = 10
+    LOW = 20
+    MEDIUM = 30
+    HIGH = 40
+    CRITICAL = 50
+
+
+@dataclass
+class WIDSAlert:
+    kind: WIDSAlertKind
+    severity: WIDSAlertSeverity
+    iface: str
+    bssid: str
+    ssid: str
+    reason: str
+    evidence: dict
+    ts_ns: int
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind.value,
+            "severity": int(self.severity),
+            "severity_name": self.severity.name,
+            "iface": self.iface,
+            "bssid": self.bssid,
+            "ssid": self.ssid,
+            "reason": self.reason,
+            "evidence": dict(self.evidence),
+            "ts_ns": self.ts_ns,
+        }
+
+
+# ── Alarm-Kanaele ───────────────────────────────────────────────
+
+
+class WIDSChannel:
+    """Basisklasse fuer Alarm-Kanaele."""
+
+    name: str = "base"
+
+    def send(self, alert: WIDSAlert) -> bool:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return None
+
+
+class WIDSLogChannel(WIDSChannel):
+    """Schreibt Alerts ins uebergebene logging.Logger-Objekt."""
+
+    name = "log"
+
+    def __init__(self, logger):
+        self._logger = logger
+
+    def send(self, alert: WIDSAlert) -> bool:
+        try:
+            self._logger.warning(
+                f"[WIDS] {alert.severity.name} "
+                f"{alert.kind.value} bssid={alert.bssid} "
+                f"ssid={alert.ssid!r}: {alert.reason}"
+            )
+            return True
+        except (AttributeError, TypeError, ValueError):
+            return False
+
+
+class WIDSSyslogChannel(WIDSChannel):
+    """RFC-5424-Syslog via UDP (fire-and-forget)."""
+
+    name = "syslog"
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 514,
+                 facility: int = 16, app_name: str = "wlan-ultimate"):
+        self._host = host
+        self._port = port
+        self._facility = facility
+        self._app_name = app_name
+        self._sock = None
+
+    def _ensure_socket(self):
+        if self._sock is not None:
+            return self._sock
+        import socket as _s
+        self._sock = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+        return self._sock
+
+    def send(self, alert: WIDSAlert) -> bool:
+        try:
+            sev_map = {
+                WIDSAlertSeverity.INFO: 6,
+                WIDSAlertSeverity.LOW: 5,
+                WIDSAlertSeverity.MEDIUM: 4,
+                WIDSAlertSeverity.HIGH: 3,
+                WIDSAlertSeverity.CRITICAL: 2,
+            }
+            pri = self._facility * 8 + sev_map.get(alert.severity, 4)
+            msg = (
+                f"<{pri}>1 - {self._app_name} - - - "
+                f"WIDS {alert.kind.value} iface={alert.iface} "
+                f"bssid={alert.bssid} ssid={alert.ssid!r} "
+                f"reason={alert.reason}"
+            )
+            sock = self._ensure_socket()
+            sock.sendto(msg.encode("utf-8"), (self._host, self._port))
+            return True
+        except (OSError, AttributeError, TypeError, ValueError):
+            return False
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+
+class WIDSWebhookChannel(WIDSChannel):
+    """HTTP-POST-JSON-Webhook (fire-and-forget, kleiner Timeout).
+
+    Sicherheit: nur http:// und https:// werden akzeptiert. Andere
+    Schemes (file:, ftp:, custom) werden im Konstruktor abgewiesen,
+    damit kein SSRF/File-Read moeglich ist.
+    """
+
+    name = "webhook"
+
+    def __init__(self, url: str, timeout: float = 2.0):
+        if not isinstance(url, str):
+            raise TypeError("Webhook-URL muss ein String sein")
+        u = url.strip().lower()
+        if not (u.startswith("http://") or u.startswith("https://")):
+            raise ValueError(
+                f"Webhook-URL muss http(s) sein, nicht: {url[:32]!r}"
+            )
+        self._url = url
+        self._timeout = timeout
+
+    def send(self, alert: WIDSAlert) -> bool:
+        try:
+            import json as _json
+            import urllib.request as _ur
+            data = _json.dumps(alert.to_dict()).encode("utf-8")
+            req = _ur.Request(  # noqa: S310 — Scheme in __init__ validiert
+                self._url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ur.urlopen(  # noqa: S310
+                req, timeout=self._timeout
+            ) as resp:
+                return 200 <= getattr(resp, "status", 0) < 300
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
+
+class WIDSCallbackChannel(WIDSChannel):
+    """Ruft eine Python-Callback-Funktion auf (fuer GUI, Tests, EventBus)."""
+
+    name = "callback"
+
+    def __init__(self, callback):
+        self._cb = callback
+
+    def send(self, alert: WIDSAlert) -> bool:
+        try:
+            self._cb(alert)
+            return True
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return False
+
+
+class WIDSDbChannel(WIDSChannel):
+    """Schreibt Alerts in die DB-Tabelle 'wids_alerts' (P90b-3)."""
+
+    name = "db"
+
+    def __init__(self, db_manager):
+        self._db = db_manager
+
+    def send(self, alert: WIDSAlert) -> bool:
+        if self._db is None:
+            return False
+        try:
+            conn = self._db.verbinde()
+            lock = getattr(self._db, "_lock", None)
+            evidence_json = None
+            try:
+                import json as _json
+                evidence_json = _json.dumps(
+                    alert.evidence or {}, ensure_ascii=False,
+                )
+            except (ValueError, TypeError):
+                evidence_json = "{}"
+
+            def _write():
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO wids_alerts "
+                    "(ts_ns, kind, severity, severity_name, iface, "
+                    " bssid, ssid, reason, evidence) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        int(alert.ts_ns),
+                        alert.kind.value,
+                        int(alert.severity),
+                        alert.severity.name,
+                        alert.iface or "",
+                        alert.bssid or "",
+                        alert.ssid or "",
+                        alert.reason or "",
+                        evidence_json,
+                    ),
+                )
+                conn.commit()
+
+            if lock is not None:
+                with lock:
+                    _write()
+            else:
+                _write()
+            return True
+        except (AttributeError, TypeError, ValueError, OSError):
+            return False
+
+
+class WIDSEventBusChannel(WIDSChannel):
+    """Publisht Alerts als 'wids.alert'-Event (P90b-3)."""
+
+    name = "eventbus"
+
+    def __init__(self, event_bus):
+        self._bus = event_bus
+
+    def send(self, alert: WIDSAlert) -> bool:
+        if self._bus is None:
+            return False
+        try:
+            self._bus.emit("wids.alert", alert.to_dict())
+            return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+
+
+def register_default_wids_channels(
+    logger=None, db_manager=None, event_bus=None,
+) -> list:
+    """Registriert Standard-WIDS-Channels (idempotent).
+
+    Entfernt zuvor alle Channels mit den Namen 'log', 'db', 'eventbus'
+    und fuegt sie neu hinzu. Rueckgabe: Liste der aktiv registrierten
+    Channel-Namen.
+    """
+    wids = get_wids_monitor(logger)
+    for name in ("log", "db", "eventbus"):
+        wids.remove_channel(name)
+    # P90b-6: WIDS-eigener Logger statt ScanEngine-Logger. Vermeidet
+    # doppelte Log-Zeilen durch propagate-Kette, wenn der Aufrufer
+    # einen Logger mit eigenen Handlern uebergibt.
+    wids.add_channel(WIDSLogChannel(wids._logger))
+    if db_manager is not None:
+        wids.add_channel(WIDSDbChannel(db_manager))
+    if event_bus is not None:
+        wids.add_channel(WIDSEventBusChannel(event_bus))
+    with wids._lock:
+        return [c.name for c in wids._channels]
+
+
+# ── Monitor ─────────────────────────────────────────────────────
+
+
+class WIDSMonitor:
+    """
+    Passiver WIDS-Kern. Thread-safe.
+
+    Nutzung:
+        wids = get_wids_monitor()
+        wids.add_channel(WIDSLogChannel(logger))
+        wids.add_channel(WIDSCallbackChannel(my_gui_slot))
+        fp = get_beacon_fingerprint(pkt, bssid, ssid)
+        wids.observe_beacon(fp, iface="wlan1")
+    """
+
+    def __init__(self, logger=None,
+                 karma_min_ssids: int = 3,
+                 karma_window_sec: float = 10.0,
+                 deauth_threshold: int = 20,
+                 deauth_window_sec: float = 5.0,
+                 learn_sec: float = 30.0):
+        self._logger = logger or logging.getLogger(
+            "wlan_ultimate.wids"
+        )
+        self._lock = threading.RLock()
+        self._channels: list = []
+        self._alerts: deque = deque(maxlen=500)
+
+        self._baselines: dict = {}
+        self._karma_ssids: dict = {}
+        self._deauth_window: dict = {}
+        self._dns_seen: dict = {}
+        self._dns_suspicious: dict = {}
+
+        # P90b-5: Baseline-Haertung
+        #   * Lernphase: erste learn_sec Sekunden nur Baselines.
+        #   * Whitelist: nur BSSIDs aus dem Set duerfen Baseline
+        #     werden (leeres Set = alle erlaubt). Schuetzt vor
+        #     "Angreifer sendet zuerst".
+        self._learn_sec = float(learn_sec)
+        # P90b-5fix: Timer startet bei Monitor-Erstellung, nicht beim
+        # ersten Beacon. Sonst laeuft die Lernphase ewig, wenn nie
+        # ein Beacon eintrifft (z.B. in einem stillen Spektrum).
+        self._monitor_start_ns: int = time.monotonic_ns()
+        self._whitelist_bssids: set = set()
+
+        # P90b-6: Dedup doppelter Alerts (zwei Adapter sehen
+        # dasselbe Beacon). Key: (kind, bssid, ssid).
+        self._alert_dedup: dict = {}
+        self._dedup_window_sec: float = 60.0
+
+        self._karma_min_ssids = int(karma_min_ssids)
+        self._karma_window_sec = float(karma_window_sec)
+        self._deauth_threshold = int(deauth_threshold)
+        self._deauth_window_sec = float(deauth_window_sec)
+
+    def add_channel(self, ch: WIDSChannel) -> None:
+        with self._lock:
+            self._channels.append(ch)
+
+    def remove_channel(self, name: str) -> int:
+        with self._lock:
+            before = len(self._channels)
+            self._channels = [c for c in self._channels if c.name != name]
+            return before - len(self._channels)
+
+    def clear_channels(self) -> None:
+        with self._lock:
+            self._channels.clear()
+
+    def _dispatch(self, alert: WIDSAlert) -> None:
+        # P90b-6: Dedup pro (kind, bssid, ssid) innerhalb
+        # _dedup_window_sec. Verhindert, dass zwei Adapter, die
+        # dasselbe Beacon sehen, denselben Alert zweimal werfen.
+        now = time.monotonic()
+        key = (alert.kind.value, alert.bssid, alert.ssid)
+        with self._lock:
+            last = self._alert_dedup.get(key)
+            if last is not None and (now - last) < self._dedup_window_sec:
+                return
+            self._alert_dedup[key] = now
+            # Gelegentliches Aufraeumen alter Keys
+            if len(self._alert_dedup) > 1000:
+                cutoff = now - self._dedup_window_sec * 5
+                self._alert_dedup = {
+                    k: v for k, v in self._alert_dedup.items()
+                    if v >= cutoff
+                }
+            self._alerts.append(alert)
+            channels = list(self._channels)
+        for ch in channels:
+            try:
+                ch.send(alert)
+            except (OSError, RuntimeError, ValueError, TypeError):
+                continue
+
+    def get_alerts(self, limit: int = 100) -> list:
+        with self._lock:
+            return [a.to_dict() for a in list(self._alerts)[-limit:]]
+
+    def clear_alerts(self) -> int:
+        with self._lock:
+            n = len(self._alerts)
+            self._alerts.clear()
+            return n
+
+    # ── P90b-5: Baseline-Haertung ──────────────────────────────
+    def is_learning(self) -> bool:
+        """True solange die Lernphase laeuft (keine Twin-Alerts)."""
+        if self._learn_sec <= 0:
+            return False
+        if self._monitor_start_ns is None:
+            return True  # noch kein Beacon gesehen
+        elapsed_ns = time.monotonic_ns() - self._monitor_start_ns
+        return elapsed_ns < int(self._learn_sec * 1e9)
+
+    def learning_remaining_sec(self) -> float:
+        """Verbleibende Lernzeit in Sekunden (0 wenn fertig)."""
+        if not self.is_learning():
+            return 0.0
+        if self._monitor_start_ns is None:
+            return self._learn_sec
+        elapsed_ns = time.monotonic_ns() - self._monitor_start_ns
+        return max(0.0, self._learn_sec - elapsed_ns / 1e9)
+
+    def restart_learning(self) -> None:
+        """Setzt die Lernphase neu (z.B. nach Standortwechsel)."""
+        with self._lock:
+            self._monitor_start_ns = None
+            self._baselines.clear()
+
+    def add_to_whitelist(self, bssid: str) -> None:
+        b = (bssid or "").lower().strip()
+        if not b:
+            return
+        with self._lock:
+            self._whitelist_bssids.add(b)
+
+    def remove_from_whitelist(self, bssid: str) -> bool:
+        b = (bssid or "").lower().strip()
+        with self._lock:
+            if b in self._whitelist_bssids:
+                self._whitelist_bssids.discard(b)
+                return True
+            return False
+
+    def clear_whitelist(self) -> int:
+        with self._lock:
+            n = len(self._whitelist_bssids)
+            self._whitelist_bssids.clear()
+            return n
+
+    def get_whitelist(self) -> list:
+        with self._lock:
+            return sorted(self._whitelist_bssids)
+
+    def observe_beacon(self, fp, iface: str = "",
+                       signal: int = -100):
+        """Beacon-Fingerprint an den Evil-Twin-Detektor."""
+        if not isinstance(fp, BeaconFingerprint):
+            return None
+        if not fp.ssid_norm:
+            return None
+        # P90b-6fix: Hidden-SSID-Platzhalter ausschliessen. Sonst
+        # kollidieren alle versteckten Netze auf denselben ssid_norm.
+        if fp.ssid_norm in _HIDDEN_SSID_PLACEHOLDERS:
+            return None
+
+        with self._lock:
+            # P90b-5: Startzeitpunkt der Lernphase setzen.
+            if self._monitor_start_ns is None:
+                self._monitor_start_ns = time.monotonic_ns()
+
+            baseline = self._baselines.get(fp.ssid_norm)
+            if baseline is None:
+                # Nur BSSIDs aus der Whitelist duerfen Baseline
+                # werden (falls Whitelist nicht leer ist).
+                if (self._whitelist_bssids
+                        and fp.bssid not in self._whitelist_bssids):
+                    return None
+                self._baselines[fp.ssid_norm] = fp
+                return None
+
+            # Waehrend der Lernphase: keine Twin-Alerts. Beobachtung
+            # aktualisiert nur die Baseline nicht — wir lassen sie
+            # beim Erstsichtungs-Stand.
+            if self._learn_sec > 0:
+                elapsed_ns = time.monotonic_ns() - self._monitor_start_ns
+                if elapsed_ns < int(self._learn_sec * 1e9):
+                    return None
+
+            # P90b-6: Filter gegen False Positives.
+            # 1) Gleiches Geraet, verschiedene BSSIDs (Multi-Band/Mesh)
+            if baseline.is_likely_same_ap(fp):
+                return None
+            # 2) WPA2/WPA3-Transition-Mode (harmlos)
+            if baseline.is_transition_variant(fp):
+                return None
+
+            is_twin, reason = baseline.suspicious_twin_of(fp)
+            if not is_twin:
+                return None
+
+            sev = WIDSAlertSeverity.HIGH
+            if (baseline.encryption != fp.encryption
+                    or baseline.pmf_required != fp.pmf_required):
+                sev = WIDSAlertSeverity.CRITICAL
+            alert = WIDSAlert(
+                kind=WIDSAlertKind.EVIL_TWIN,
+                severity=sev,
+                iface=iface,
+                bssid=fp.bssid,
+                ssid=fp.ssid,
+                reason=reason,
+                evidence={
+                    "baseline_bssid": baseline.bssid,
+                    "baseline_ie_hash": baseline.raw_ie_hash,
+                    "current_ie_hash": fp.raw_ie_hash,
+                    "baseline_akm": list(baseline.akm_sig),
+                    "current_akm": list(fp.akm_sig),
+                    "signal": signal,
+                },
+                ts_ns=time.monotonic_ns(),
+            )
+        self._dispatch(alert)
+        return alert
+
+    def set_baseline(self, ssid: str, fp) -> bool:
+        if not isinstance(fp, BeaconFingerprint):
+            return False
+        with self._lock:
+            self._baselines[normalize_ssid(ssid)] = fp
+            return True
+
+    def clear_baselines(self) -> int:
+        with self._lock:
+            n = len(self._baselines)
+            self._baselines.clear()
+            return n
+
+    def observe_probe_resp(self, bssid: str, ssid: str,
+                           iface: str = ""):
+        """AP antwortet auf eine Probe — Karma wenn zu viele SSIDs."""
+        bssid = (bssid or "").lower()
+        if not bssid or not ssid:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            window = self._karma_ssids.setdefault(bssid, deque(maxlen=64))
+            window.append((ssid, now))
+            cutoff = now - self._karma_window_sec
+            while window and window[0][1] < cutoff:
+                window.popleft()
+            uniq = {s for s, _ in window}
+            if len(uniq) < self._karma_min_ssids:
+                return None
+            alert = WIDSAlert(
+                kind=WIDSAlertKind.KARMA,
+                severity=WIDSAlertSeverity.HIGH,
+                iface=iface,
+                bssid=bssid,
+                ssid=ssid,
+                reason=(f"AP antwortet auf {len(uniq)} verschiedene "
+                        f"SSIDs in {self._karma_window_sec:.1f}s"),
+                evidence={
+                    "ssid_count": len(uniq),
+                    "ssids_sample": sorted(uniq)[:10],
+                    "window_sec": self._karma_window_sec,
+                },
+                ts_ns=time.monotonic_ns(),
+            )
+            window.clear()
+        self._dispatch(alert)
+        return alert
+
+    def observe_dns_query(self, src: str, qname: str,
+                          iface: str = ""):
+        """DNS-Anfrage protokollieren — Baseline gegen Phishing."""
+        q = (qname or "").strip().lower().rstrip(".")
+        if not q or not iface:
+            return None
+        with self._lock:
+            self._dns_seen.setdefault(iface, set()).add(q)
+        return None
+
+    def observe_http_redirect(self, src: str, from_host: str,
+                              to_url: str,
+                              iface: str = ""):
+        """HTTP-Redirect auf unbekannte Domain = Captive-Portal-Indikator."""
+        try:
+            from urllib.parse import urlparse as _up
+            to_host = (_up(to_url).hostname or "").lower()
+        except (ValueError, AttributeError):
+            to_host = ""
+        if not to_host:
+            return None
+
+        known = {
+            "connectivitycheck.gstatic.com",
+            "captive.apple.com",
+            "www.msftconnecttest.com",
+            "detectportal.firefox.com",
+            "www.msftncsi.com",
+        }
+        if to_host in known:
+            return None
+
+        with self._lock:
+            seen = self._dns_seen.get(iface, set())
+            if to_host in seen:
+                return None
+            self._dns_suspicious.setdefault(iface, set()).add(to_host)
+            alert = WIDSAlert(
+                kind=WIDSAlertKind.CAPTIVE_PORTAL,
+                severity=WIDSAlertSeverity.MEDIUM,
+                iface=iface,
+                bssid="",
+                ssid="",
+                reason=(f"HTTP-Redirect von {from_host} auf "
+                        f"unaufgeloeste Domain {to_host}"),
+                evidence={
+                    "src": src,
+                    "from_host": from_host,
+                    "to_url": to_url,
+                    "to_host": to_host,
+                },
+                ts_ns=time.monotonic_ns(),
+            )
+        self._dispatch(alert)
+        return alert
+
+    def observe_deauth(self, src: str, dst: str, bssid: str = "",
+                       iface: str = ""):
+        """Deauth-Frame an den Rate-Limiter."""
+        b = (bssid or src or "").lower()
+        if not b:
+            return None
+        now = time.monotonic()
+        with self._lock:
+            window = self._deauth_window.setdefault(
+                (iface, b), deque(maxlen=256)
+            )
+            window.append(now)
+            cutoff = now - self._deauth_window_sec
+            while window and window[0] < cutoff:
+                window.popleft()
+            count = len(window)
+            if count < self._deauth_threshold:
+                return None
+            alert = WIDSAlert(
+                kind=WIDSAlertKind.DEAUTH_FLOOD,
+                severity=WIDSAlertSeverity.HIGH,
+                iface=iface,
+                bssid=b,
+                ssid="",
+                reason=(f"{count} Deauths in "
+                        f"{self._deauth_window_sec:.1f}s"),
+                evidence={
+                    "src": src,
+                    "dst": dst,
+                    "count": count,
+                    "window_sec": self._deauth_window_sec,
+                },
+                ts_ns=time.monotonic_ns(),
+            )
+            window.clear()
+        self._dispatch(alert)
+        return alert
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "alerts_total": len(self._alerts),
+                "channels": [c.name for c in self._channels],
+                "baselines": len(self._baselines),
+                "karma_tracked_bssids": len(self._karma_ssids),
+                "deauth_tracked_bssids": len(self._deauth_window),
+                "dns_seen_ifaces": list(self._dns_seen.keys()),
+                "dns_suspicious_total": sum(
+                    len(v) for v in self._dns_suspicious.values()
+                ),
+                # P90b-5
+                "learning": self.is_learning(),
+                "learning_remaining_sec": round(
+                    self.learning_remaining_sec(), 2
+                ),
+                "whitelist_size": len(self._whitelist_bssids),
+            }
+
+
+_WIDS_MONITOR = None
+_WIDS_MONITOR_LOCK = threading.Lock()
+
+
+def get_wids_monitor(logger=None):
+    """Liefert die prozessweite WIDSMonitor-Instanz (lazy)."""
+    global _WIDS_MONITOR
+    with _WIDS_MONITOR_LOCK:
+        if _WIDS_MONITOR is None:
+            _WIDS_MONITOR = WIDSMonitor(logger=logger)
+        return _WIDS_MONITOR
 
 
 @dataclass
@@ -67505,6 +69556,208 @@ class IEEE80211IEParser:
 
 
 
+
+
+class RecoveryTab(QWidget):
+    """v37-R34 P63: Notfall-Recovery fuer Netzwerk-Zustand.
+
+    Zeigt Live-Diagnose (Backends, Interfaces, rfkill) und bietet
+    Level 1-3 Recovery per Button. Nutzt NetworkRecovery aus P62.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(760, 560)
+        self._build_ui()
+        QTimer.singleShot(200, self._refresh_diagnose)
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+
+        header = QLabel("\u26a0\ufe0f  NETZWERK-RECOVERY")
+        header.setStyleSheet(
+            "font-size:16px;font-weight:bold;color:#e74c3c;padding:4px;"
+        )
+        layout.addWidget(header)
+
+        info = QLabel(
+            "Stellt Netzwerk wieder her nach Monitor-Mode-Chaos, "
+            "Skript-Absturz oder rfkill-Block. Nutzt NetworkRecovery."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(
+            "background:#2d2d2d;color:#bdc3c7;padding:8px;"
+            "border-radius:4px;font-size:9pt;"
+        )
+        layout.addWidget(info)
+
+        # Diagnose-Anzeige (scrollbar)
+        self.diag_view = QTextEdit()
+        self.diag_view.setReadOnly(True)
+        self.diag_view.setStyleSheet(
+            "font-family:monospace;background:#1a1a1a;color:#bdc3c7;"
+        )
+        self.diag_view.setMinimumHeight(180)
+        layout.addWidget(self.diag_view)
+
+        # Aktionen
+        btn_row = QHBoxLayout()
+        self.btn_refresh = QPushButton("\U0001f504 Aktualisieren")
+        self.btn_refresh.clicked.connect(self._refresh_diagnose)
+        btn_row.addWidget(self.btn_refresh)
+
+        self.btn_snap = QPushButton("\U0001f4be Snapshot nehmen")
+        self.btn_snap.clicked.connect(self._take_snapshot)
+        btn_row.addWidget(self.btn_snap)
+
+        self.btn_dry = QPushButton("\U0001f50d Dry-Run")
+        self.btn_dry.clicked.connect(lambda: self._run_recover(0))
+        btn_row.addWidget(self.btn_dry)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        act_row = QHBoxLayout()
+
+        self.btn_l1 = QPushButton("\U0001f7e2 Soft (Level 1)")
+        self.btn_l1.setStyleSheet(
+            "background:#27ae60;color:#fff;font-weight:bold;padding:8px;"
+        )
+        self.btn_l1.clicked.connect(lambda: self._run_recover(1))
+        act_row.addWidget(self.btn_l1)
+
+        self.btn_l2 = QPushButton("\U0001f7e1 Backend (Level 2)")
+        self.btn_l2.setStyleSheet(
+            "background:#f39c12;color:#fff;font-weight:bold;padding:8px;"
+        )
+        self.btn_l2.clicked.connect(lambda: self._run_recover(2))
+        act_row.addWidget(self.btn_l2)
+
+        self.btn_l3 = QPushButton("\U0001f534 Emergency (Level 3)")
+        self.btn_l3.setStyleSheet(
+            "background:#c0392b;color:#fff;font-weight:bold;padding:8px;"
+        )
+        self.btn_l3.clicked.connect(lambda: self._run_recover(3))
+        act_row.addWidget(self.btn_l3)
+
+        layout.addLayout(act_row)
+
+        # Log
+        lbl = QLabel("Log:")
+        lbl.setStyleSheet("font-weight:bold;color:#bdc3c7;")
+        layout.addWidget(lbl)
+
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setStyleSheet(
+            "font-family:monospace;background:#0d0d0d;color:#ecf0f1;"
+        )
+        layout.addWidget(self.log_view)
+
+    # ── Interne Helfer ───────────────────────────────────────────
+    def _log(self, msg: str, level: str = "INFO") -> None:
+        ts = time.strftime("%H:%M:%S")
+        colors = {
+            "OK": "#27ae60", "WARN": "#f39c12", "ERR": "#e74c3c",
+            "INFO": "#7f8c8d",
+        }
+        c = colors.get(level, "#bdc3c7")
+        try:
+            self.log_view.append(
+                f"<span style='color:#7f8c8d;'>[{ts}]</span> "
+                f"<span style='color:{c};'>{msg}</span>"
+            )
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _rec(self):
+        return globals().get("NetworkRecovery")
+
+    # ── Actions ──────────────────────────────────────────────────
+    def _refresh_diagnose(self) -> None:
+        try:
+            rec = self._rec()
+            if rec is None:
+                self.diag_view.setPlainText(
+                    "NetworkRecovery nicht verfuegbar."
+                )
+                return
+            data = rec.diagnose()
+            self.diag_view.setPlainText(rec.format_diagnose(data))
+            self._log("Diagnose aktualisiert", "INFO")
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            self._log(f"Diagnose-Fehler: {exc}", "ERR")
+
+    def _take_snapshot(self) -> None:
+        try:
+            rec = self._rec()
+            if rec is None:
+                self._log("NetworkRecovery fehlt", "ERR")
+                return
+            path = rec.snapshot_state("manual_gui")
+            if path:
+                self._log(f"Snapshot: {Path(path).name}", "OK")
+            else:
+                self._log("Snapshot fehlgeschlagen", "ERR")
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            self._log(f"Snapshot-Fehler: {exc}", "ERR")
+
+    def _run_recover(self, level: int) -> None:
+        try:
+            rec = self._rec()
+            if rec is None:
+                self._log("NetworkRecovery fehlt", "ERR")
+                return
+            dry = (level == 0)
+            lvl = 2 if dry else max(1, min(3, level))
+            self._log(
+                f"Starte {'Dry-Run' if dry else f'Level {lvl}'}...",
+                "WARN",
+            )
+            res = rec.recover(level=lvl, dry_run=dry)
+            fmt = rec.format_recovery(res)
+            for line in fmt.splitlines():
+                if line.strip():
+                    self._log(line, "INFO")
+            if res.get("fail_count", 0) == 0 and not dry:
+                self._log(
+                    f"Recovery OK ({res.get('ok_count', 0)} Aktionen)",
+                    "OK",
+                )
+            elif dry:
+                self._log(
+                    f"Dry-Run: {res.get('skipped_count', 0)} wuerden laufen",
+                    "INFO",
+                )
+            else:
+                self._log(
+                    f"Recovery mit {res.get('fail_count', 0)} Fehler(n)",
+                    "ERR",
+                )
+            QTimer.singleShot(300, self._refresh_diagnose)
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            self._log(f"Recovery-Fehler: {exc}", "ERR")
+
+
+
+
+class RecoveryMixin:
+    """v37-R34 P63: Mixin fuer System-Recovery-Tab.
+
+    Erwartet self.tab_widget und self.logger.
+    """
+
+    def create_recovery_tab(self):
+        """Erzeugt den Recovery-Tab."""
+        tab = RecoveryTab(parent=self)
+        try:
+            self._recovery_widget = tab
+        except (AttributeError, RuntimeError):
+            pass
+        self.tab_widget.addTab(tab, "\U0001f6a8 Recovery")
+
+
 class MultiAdapterMixin:
     """P5.1: Multi-Adapter-Tab, aus WLANUltimateGUI extrahiert.
 
@@ -68529,7 +70782,7 @@ class WatchlistMixin:
             pass
 
 
-class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixin, CustomCmdMixin, WatchlistMixin, QMainWindow):
+class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixin, CustomCmdMixin, WatchlistMixin, RecoveryMixin, QMainWindow):
     """
     Hauptfenster der WLAN Ultimate Security Suite.
 
@@ -68840,11 +71093,15 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
                     self.ai_processor,
                     client_tracker=getattr(self, "_client_tracker", None),
                     timeline_tracker=getattr(self, "_timeline_tracker", None),
+                    db_manager=getattr(self, "db_manager", None),
                 )
                 self.logger.debug("WLANScanner mit Tracker-Params erstellt")
             except TypeError as _te:
                 self.logger.debug(f"WLANScanner ohne Tracker-Params ({_te}) — Fallback")
-                self.scanner = WLANScanner(self.interface_manager, self.ai_processor)
+                self.scanner = WLANScanner(
+                    self.interface_manager, self.ai_processor,
+                    db_manager=getattr(self, "db_manager", None),
+                )
             # Tracker-Refs am Scanner hinterlegen (Fallback-Weg)
             try:
                 self.scanner._shared_client_tracker = getattr(
@@ -69500,6 +71757,7 @@ class WLANUltimateGUI(MultiAdapterMixin, VisualizationMixin, BpfMixin, NotesMixi
             ("ble_enhanced", self.create_ble_enhanced_tab),
             ("live_graph", self.create_live_graph_tab),
             ("notes", self.create_notes_tab),
+            ("recovery", self.create_recovery_tab),
         ]
         for name, creator in tab_creators:
             try:
@@ -82372,6 +84630,19 @@ def main() -> int:
         "(Kernel, Distro, Adapter, Treiber)",
     )
     parser.add_argument(
+        "--recover-network",
+        metavar="ACTION",
+        nargs="?",
+        const="auto",
+        default="",
+        help=(
+            "v37-R34 P62: Netzwerk-Recovery nach Crash oder "
+            "Monitor-Mode-Chaos. "
+            "auto | diagnose | dry-run | level1 | level2 | "
+            "level3 | snapshot-list | snapshot-take"
+        ),
+    )
+    parser.add_argument(
         "--anchor-status",
         action="store_true",
         help="v37-R34 P54: Anchor-Registry anzeigen",
@@ -83246,6 +85517,9 @@ def main() -> int:
         ("diag_adapters", lambda a: _diag_adapters_cli()),
         ("monitor_preflight", lambda a: _monitor_preflight_cli()),
         ("platform_check", lambda a: _platform_check_cli()),
+        ("recover_network", lambda a: _recover_network_cli(
+            getattr(a, "recover_network", "") or ""
+        )),
         ("perf_tune", lambda a: _perf_tune_cli()),
         ("oui_install", lambda a: _oui_install_cli()),
         ("oui_status", lambda a: _oui_status_cli()),
@@ -93195,6 +95469,61 @@ def _monitor_preflight_cli() -> int:
         return 1
 
 
+
+
+def _recover_network_cli(action: str = "auto") -> int:
+    """v37-R34 P62: --recover-network CLI."""
+    try:
+        rec = globals().get("NetworkRecovery")
+        if rec is None:
+            print("NetworkRecovery nicht verfuegbar", file=sys.stderr)
+            return 1
+        action = (action or "auto").strip().lower()
+        if action in ("", "auto", "1", "level1"):
+            res = rec.recover(level=1, dry_run=False)
+            print(rec.format_recovery(res))
+            return 0 if res.get("fail_count", 0) == 0 else 1
+        if action in ("2", "level2"):
+            res = rec.recover(level=2, dry_run=False)
+            print(rec.format_recovery(res))
+            return 0 if res.get("fail_count", 0) == 0 else 1
+        if action in ("3", "level3"):
+            res = rec.recover(level=3, dry_run=False)
+            print(rec.format_recovery(res))
+            return 0 if res.get("fail_count", 0) == 0 else 1
+        if action in ("diagnose", "diag", "show"):
+            print(rec.format_diagnose(rec.diagnose()))
+            return 0
+        if action in ("dry-run", "dryrun", "dry"):
+            print(rec.format_recovery(rec.recover(level=2, dry_run=True)))
+            return 0
+        if action in ("snapshot-list", "snapshot_list", "snapshots"):
+            snaps = rec.list_snapshots()
+            if not snaps:
+                print("(keine Snapshots)")
+                return 0
+            for s in snaps:
+                print(f"  {Path(s).name}")
+            return 0
+        if action in ("snapshot-take", "snapshot_take", "snap"):
+            p = rec.snapshot_state("manual")
+            if p:
+                print(f"Snapshot: {p}")
+                return 0
+            print("Snapshot fehlgeschlagen", file=sys.stderr)
+            return 1
+        print(f"Unbekannte Aktion: {action}", file=sys.stderr)
+        print(
+            "Aktionen: auto | diagnose | dry-run | level1 | level2 "
+            "| level3 | snapshot-list | snapshot-take",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f"Recovery-Fehler: {exc}", file=sys.stderr)
+        return 1
+
+
 def _platform_check_cli() -> int:
     """v37-R34 P61: --platform-check Diagnose."""
     try:
@@ -100335,6 +102664,20 @@ if __name__ == "__main__":
         print(
             "⚠️ Sie sind nicht als root angemeldet. Einige Funktionen (Monitor-Modus, Packet Injection) werden nicht verfügbar sein."
         )
+
+    # v37-R34 P62: Auto-Recovery bei Skript-Ende
+    try:
+        import atexit as _atexit_p62
+        _p62_rec = globals().get("NetworkRecovery")
+        if _p62_rec is not None:
+            def _p62_atexit_recovery():
+                try:
+                    _p62_rec.auto_recovery_if_dirty()
+                except Exception:
+                    pass
+            _atexit_p62.register(_p62_atexit_recovery)
+    except (ImportError, AttributeError, ValueError):
+        pass
 
     try:
         main()
